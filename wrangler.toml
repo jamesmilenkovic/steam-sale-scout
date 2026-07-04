@@ -1,0 +1,9 @@
+name = "steam-sale-scout"
+main = "src/worker.js"
+compatibility_date = "2025-06-01"
+
+# Static single-page frontend. Requests that don't match a file in ./public
+# fall through to the Worker's fetch handler (e.g. /api/*).
+[assets]
+directory = "./public"
+binding = "ASSETS"

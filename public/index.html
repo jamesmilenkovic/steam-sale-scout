@@ -1,0 +1,238 @@
+<!doctype html>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Steam Sale Scout</title>
+<style>
+  body {
+    font-family: system-ui, sans-serif;
+    max-width: 900px;
+    margin: 2rem auto;
+    padding: 0 1rem;
+    color: #1a1a1a;
+  }
+  h1 { margin-bottom: 0.25rem; }
+  .subtitle { color: #666; margin-top: 0; }
+  .controls {
+    display: flex;
+    align-items: center;
+    gap: 1.5rem;
+    flex-wrap: wrap;
+    margin: 1rem 0;
+    padding: 0.75rem;
+    background: #f4f4f4;
+    border-radius: 6px;
+  }
+  .controls label { display: flex; align-items: center; gap: 0.4rem; }
+  .controls input[type="number"] { width: 4rem; }
+  .totals { margin: 0.75rem 0; color: #333; font-size: 0.95rem; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 0.35rem 0.5rem; border-bottom: 1px solid #e0e0e0; }
+  th { position: sticky; top: 0; background: #fff; cursor: default; }
+  img.icon { width: 32px; height: 32px; vertical-align: middle; }
+  .weight-bar-track {
+    background: #e0e0e0;
+    border-radius: 3px;
+    height: 14px;
+    width: 160px;
+    overflow: hidden;
+  }
+  .weight-bar-fill {
+    background: #2a6df5;
+    height: 100%;
+  }
+  .status { color: #666; font-style: italic; }
+  .error {
+    color: #900;
+    background: #fdeaea;
+    border: 1px solid #f0b8b8;
+    padding: 0.75rem;
+    border-radius: 6px;
+  }
+  button { cursor: pointer; }
+</style>
+
+<h1>Steam Sale Scout</h1>
+<p class="subtitle">Your library, ranked by what you actually play (hours × recency).</p>
+
+<div class="controls">
+  <label>
+    Recency window (months):
+    <input type="number" id="window-months" min="1" step="1" />
+  </label>
+  <label>
+    <input type="checkbox" id="sort-hours" />
+    Sort by raw hours instead of weight
+  </label>
+  <button id="refresh-btn" type="button">Refresh from Steam</button>
+</div>
+
+<div id="status" class="status">Loading…</div>
+<div id="totals" class="totals"></div>
+<table id="table" hidden>
+  <thead>
+    <tr>
+      <th>#</th>
+      <th></th>
+      <th>Name</th>
+      <th>Hours</th>
+      <th>Last played</th>
+      <th>Weight</th>
+    </tr>
+  </thead>
+  <tbody id="table-body"></tbody>
+</table>
+
+<script type="module">
+  import { weight } from "./weight.js";
+
+  const STORAGE_KEY = "steam-sale-scout.windowMonths";
+  const DEFAULT_WINDOW_MONTHS = 12;
+
+  const statusEl = document.getElementById("status");
+  const totalsEl = document.getElementById("totals");
+  const tableEl = document.getElementById("table");
+  const tableBodyEl = document.getElementById("table-body");
+  const windowInput = document.getElementById("window-months");
+  const sortHoursCheckbox = document.getElementById("sort-hours");
+  const refreshBtn = document.getElementById("refresh-btn");
+
+  let games = [];
+
+  function loadWindowMonths() {
+    const stored = Number(localStorage.getItem(STORAGE_KEY));
+    return stored > 0 ? stored : DEFAULT_WINDOW_MONTHS;
+  }
+
+  windowInput.value = loadWindowMonths();
+
+  function iconUrl(game) {
+    if (!game.img_icon_url) return "";
+    return `https://media.steampowered.com/steamcommunity/public/images/apps/${game.appid}/${game.img_icon_url}.jpg`;
+  }
+
+  function formatHours(game) {
+    return ((game.playtime_forever || 0) / 60).toFixed(1);
+  }
+
+  function formatLastPlayed(game, now = Date.now()) {
+    const rtime = game.rtime_last_played;
+    if (!rtime) return "never";
+    const elapsedMs = now - rtime * 1000;
+    const days = elapsedMs / (24 * 60 * 60 * 1000);
+    if (days < 1) return "today";
+    if (days < 2) return "yesterday";
+    if (days < 30) {
+      const d = Math.round(days);
+      return `${d} day${d === 1 ? "" : "s"} ago`;
+    }
+    const months = Math.round(days / 30.44);
+    if (months < 12) {
+      return `${months} month${months === 1 ? "" : "s"} ago`;
+    }
+    const years = Math.round(months / 12);
+    return `${years} year${years === 1 ? "" : "s"} ago`;
+  }
+
+  function render() {
+    const windowMonths = Number(windowInput.value) || DEFAULT_WINDOW_MONTHS;
+    const sortByHours = sortHoursCheckbox.checked;
+
+    const rows = games.map((game) => ({
+      game,
+      weight: weight(game, windowMonths),
+    }));
+
+    rows.sort((a, b) => {
+      if (sortByHours) {
+        return (b.game.playtime_forever || 0) - (a.game.playtime_forever || 0);
+      }
+      return b.weight - a.weight;
+    });
+
+    const maxWeight = rows.reduce((max, r) => Math.max(max, r.weight), 0) || 1;
+
+    tableBodyEl.innerHTML = "";
+    rows.forEach((row, index) => {
+      const tr = document.createElement("tr");
+
+      const rankTd = document.createElement("td");
+      rankTd.textContent = index + 1;
+      tr.appendChild(rankTd);
+
+      const iconTd = document.createElement("td");
+      const url = iconUrl(row.game);
+      if (url) {
+        const img = document.createElement("img");
+        img.className = "icon";
+        img.src = url;
+        img.alt = "";
+        iconTd.appendChild(img);
+      }
+      tr.appendChild(iconTd);
+
+      const nameTd = document.createElement("td");
+      nameTd.textContent = row.game.name || `App ${row.game.appid}`;
+      tr.appendChild(nameTd);
+
+      const hoursTd = document.createElement("td");
+      hoursTd.textContent = formatHours(row.game);
+      tr.appendChild(hoursTd);
+
+      const lastPlayedTd = document.createElement("td");
+      lastPlayedTd.textContent = formatLastPlayed(row.game);
+      tr.appendChild(lastPlayedTd);
+
+      const weightTd = document.createElement("td");
+      const track = document.createElement("div");
+      track.className = "weight-bar-track";
+      const fill = document.createElement("div");
+      fill.className = "weight-bar-fill";
+      fill.style.width = `${(row.weight / maxWeight) * 100}%`;
+      track.appendChild(fill);
+      weightTd.appendChild(track);
+      tr.appendChild(weightTd);
+
+      tableBodyEl.appendChild(tr);
+    });
+
+    const neverPlayed = games.filter((g) => !g.rtime_last_played).length;
+    totalsEl.textContent = `${games.length} games · ${neverPlayed} never played`;
+
+    tableEl.hidden = false;
+  }
+
+  async function loadLibrary(refresh = false) {
+    statusEl.textContent = "Loading…";
+    statusEl.hidden = false;
+    tableEl.hidden = true;
+    statusEl.className = "status";
+
+    try {
+      const res = await fetch(refresh ? "/api/library?refresh=1" : "/api/library");
+      const body = await res.json();
+      if (!res.ok) {
+        throw new Error(body.error || `Request failed with status ${res.status}`);
+      }
+      games = body.games || [];
+      statusEl.hidden = true;
+      render();
+    } catch (err) {
+      statusEl.textContent = err.message;
+      statusEl.className = "status error";
+    }
+  }
+
+  windowInput.addEventListener("input", () => {
+    const raw = Number(windowInput.value);
+    const value = raw > 0 ? raw : DEFAULT_WINDOW_MONTHS;
+    windowInput.value = value;
+    localStorage.setItem(STORAGE_KEY, String(value));
+    render();
+  });
+
+  sortHoursCheckbox.addEventListener("change", render);
+
+  refreshBtn.addEventListener("click", () => loadLibrary(true));
+
+  loadLibrary();
+</script>

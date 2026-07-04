@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Edit",
+      "Read",
+      "Bash(node *.mjs)",
+      "Bash(node --test *)",
+      "Bash(node -e ' *)",
+      "Bash(npm test:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git add:*)",
+      "Bash(git checkout -b *)",
+      "Bash(git branch:*)"
+    ],
+    "ask": [
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(git merge:*)"
+    ]
+  }
+}

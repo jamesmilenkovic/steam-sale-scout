@@ -1,0 +1,15 @@
+{
+  "name": "steam-sale-scout",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Steam library ranked by what I actually play (hours x recency). Increment 1.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "wrangler": "^4.107.0"
+  }
+}
