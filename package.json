@@ -6,7 +6,7 @@
   "description": "Steam library ranked by what I actually play (hours x recency). Increment 1.",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
+    "deploy": "echo 'Deploy deferred to Phase 3 — Steam Sale Scout is local-only through Phase 1 (see SPEC.md). Run: npm run dev' && exit 1",
     "test": "node --test"
   },
   "devDependencies": {

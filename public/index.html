@@ -49,38 +49,108 @@
     border-radius: 6px;
   }
   button { cursor: pointer; }
+  .tabs {
+    display: flex;
+    gap: 0.5rem;
+    margin: 1rem 0 0;
+    border-bottom: 1px solid #ddd;
+  }
+  .tab-btn {
+    background: none;
+    border: none;
+    padding: 0.5rem 1rem;
+    font-size: 1rem;
+    color: #666;
+    border-bottom: 2px solid transparent;
+  }
+  .tab-btn[aria-selected="true"] {
+    color: #1a1a1a;
+    font-weight: 600;
+    border-bottom-color: #2a6df5;
+  }
+  .tab-panel { margin-top: 1rem; }
+  s.regular-price { color: #999; }
+  .badge {
+    display: inline-block;
+    padding: 0.1rem 0.45rem;
+    border-radius: 3px;
+    font-size: 0.8rem;
+    font-weight: 600;
+  }
+  .badge-cut { background: #2a6df5; color: #fff; }
+  .badge-low { background: #1a8a3c; color: #fff; margin-left: 0.4rem; }
 </style>
 
 <h1>Steam Sale Scout</h1>
 <p class="subtitle">Your library, ranked by what you actually play (hours × recency).</p>
 
-<div class="controls">
-  <label>
-    Recency window (months):
-    <input type="number" id="window-months" min="1" step="1" />
-  </label>
-  <label>
-    <input type="checkbox" id="sort-hours" />
-    Sort by raw hours instead of weight
-  </label>
-  <button id="refresh-btn" type="button">Refresh from Steam</button>
-</div>
+<nav class="tabs">
+  <button type="button" class="tab-btn" data-tab="library" aria-selected="true">Library</button>
+  <button type="button" class="tab-btn" data-tab="deals" aria-selected="false">Deals</button>
+</nav>
 
-<div id="status" class="status">Loading…</div>
-<div id="totals" class="totals"></div>
-<table id="table" hidden>
-  <thead>
-    <tr>
-      <th>#</th>
-      <th></th>
-      <th>Name</th>
-      <th>Hours</th>
-      <th>Last played</th>
-      <th>Weight</th>
-    </tr>
-  </thead>
-  <tbody id="table-body"></tbody>
-</table>
+<section id="tab-library" class="tab-panel">
+  <div class="controls">
+    <label>
+      Recency window (months):
+      <input type="number" id="window-months" min="1" step="1" />
+    </label>
+    <label>
+      <input type="checkbox" id="sort-hours" />
+      Sort by raw hours instead of weight
+    </label>
+    <button id="refresh-btn" type="button">Refresh from Steam</button>
+  </div>
+
+  <div id="status" class="status">Loading…</div>
+  <div id="totals" class="totals"></div>
+  <table id="table" hidden>
+    <thead>
+      <tr>
+        <th>#</th>
+        <th></th>
+        <th>Name</th>
+        <th>Hours</th>
+        <th>Last played</th>
+        <th>Weight</th>
+      </tr>
+    </thead>
+    <tbody id="table-body"></tbody>
+  </table>
+</section>
+
+<section id="tab-deals" class="tab-panel" hidden>
+  <div class="controls">
+    <label>
+      Minimum discount (%):
+      <input type="number" id="min-cut" min="40" max="90" step="1" />
+    </label>
+    <label>
+      Sort by:
+      <select id="deals-sort">
+        <option value="cut">% off</option>
+        <option value="price">Price</option>
+        <option value="title">Title</option>
+      </select>
+    </label>
+    <button id="deals-refresh-btn" type="button">Refresh from ITAD</button>
+  </div>
+
+  <div id="deals-status" class="status">Loading…</div>
+  <div id="deals-totals" class="totals"></div>
+  <table id="deals-table" hidden>
+    <thead>
+      <tr>
+        <th>Name</th>
+        <th>Price (AUD)</th>
+        <th>Regular</th>
+        <th>% off</th>
+        <th>Store</th>
+      </tr>
+    </thead>
+    <tbody id="deals-table-body"></tbody>
+  </table>
+</section>
 
 <script type="module">
   import { weight } from "./weight.js";
@@ -235,4 +305,157 @@
   refreshBtn.addEventListener("click", () => loadLibrary(true));
 
   loadLibrary();
+
+  // --- Tabs ---------------------------------------------------------------
+
+  const tabButtons = document.querySelectorAll(".tab-btn");
+  const tabPanels = {
+    library: document.getElementById("tab-library"),
+    deals: document.getElementById("tab-deals"),
+  };
+  let dealsLoaded = false;
+
+  tabButtons.forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const tab = btn.dataset.tab;
+      tabButtons.forEach((b) => b.setAttribute("aria-selected", String(b === btn)));
+      Object.entries(tabPanels).forEach(([name, panel]) => {
+        panel.hidden = name !== tab;
+      });
+      if (tab === "deals" && !dealsLoaded) {
+        dealsLoaded = true;
+        loadDeals();
+      }
+    });
+  });
+
+  // --- Deals (Increment 2) -------------------------------------------------
+
+  const MIN_CUT_STORAGE_KEY = "steam-sale-scout.minCut";
+  const DEFAULT_MIN_CUT = 60;
+  const MIN_CUT_MIN = 40;
+  const MIN_CUT_MAX = 90;
+
+  const dealsStatusEl = document.getElementById("deals-status");
+  const dealsTotalsEl = document.getElementById("deals-totals");
+  const dealsTableEl = document.getElementById("deals-table");
+  const dealsTableBodyEl = document.getElementById("deals-table-body");
+  const minCutInput = document.getElementById("min-cut");
+  const dealsSortSelect = document.getElementById("deals-sort");
+  const dealsRefreshBtn = document.getElementById("deals-refresh-btn");
+
+  let deals = [];
+
+  function loadMinCut() {
+    const stored = Number(localStorage.getItem(MIN_CUT_STORAGE_KEY));
+    if (stored >= MIN_CUT_MIN && stored <= MIN_CUT_MAX) return stored;
+    return DEFAULT_MIN_CUT;
+  }
+
+  minCutInput.value = loadMinCut();
+
+  function renderDeals() {
+    const sortBy = dealsSortSelect.value;
+    const sorted = [...deals];
+    if (sortBy === "price") {
+      sorted.sort((a, b) => (a.price ?? Infinity) - (b.price ?? Infinity));
+    } else if (sortBy === "title") {
+      sorted.sort((a, b) => (a.title || "").localeCompare(b.title || ""));
+    } else {
+      sorted.sort((a, b) => (b.cut ?? 0) - (a.cut ?? 0));
+    }
+
+    dealsTableBodyEl.innerHTML = "";
+    sorted.forEach((deal) => {
+      const tr = document.createElement("tr");
+
+      const nameTd = document.createElement("td");
+      nameTd.textContent = deal.title || "(untitled)";
+      tr.appendChild(nameTd);
+
+      const priceTd = document.createElement("td");
+      priceTd.textContent = deal.price != null ? `$${deal.price.toFixed(2)}` : "—";
+      tr.appendChild(priceTd);
+
+      const regularTd = document.createElement("td");
+      if (deal.regular != null) {
+        const s = document.createElement("s");
+        s.className = "regular-price";
+        s.textContent = `$${deal.regular.toFixed(2)}`;
+        regularTd.appendChild(s);
+      }
+      tr.appendChild(regularTd);
+
+      const cutTd = document.createElement("td");
+      const cutBadge = document.createElement("span");
+      cutBadge.className = "badge badge-cut";
+      cutBadge.textContent = `-${deal.cut}%`;
+      cutTd.appendChild(cutBadge);
+      if (deal.atHistoricalLow) {
+        const lowBadge = document.createElement("span");
+        lowBadge.className = "badge badge-low";
+        lowBadge.textContent = "HISTORICAL LOW";
+        if (deal.historicalLow != null) {
+          lowBadge.title = `Recorded low: $${deal.historicalLow.toFixed(2)}`;
+        }
+        cutTd.appendChild(lowBadge);
+      }
+      tr.appendChild(cutTd);
+
+      const storeTd = document.createElement("td");
+      if (deal.appid) {
+        const a = document.createElement("a");
+        a.href = `https://store.steampowered.com/app/${deal.appid}`;
+        a.target = "_blank";
+        a.rel = "noopener";
+        a.textContent = "Steam";
+        storeTd.appendChild(a);
+      }
+      tr.appendChild(storeTd);
+
+      dealsTableBodyEl.appendChild(tr);
+    });
+
+    const atLowCount = deals.filter((d) => d.atHistoricalLow).length;
+    dealsTotalsEl.textContent = `${deals.length} deals at ≥${minCutInput.value}% off · ${atLowCount} at historical low`;
+
+    dealsTableEl.hidden = false;
+  }
+
+  async function loadDeals(refresh = false) {
+    dealsStatusEl.textContent = "Loading…";
+    dealsStatusEl.hidden = false;
+    dealsTableEl.hidden = true;
+    dealsStatusEl.className = "status";
+
+    const minCut = loadMinCut();
+    const params = new URLSearchParams({ minCut: String(minCut) });
+    if (refresh) params.set("refresh", "1");
+
+    try {
+      const res = await fetch(`/api/deals?${params}`);
+      const body = await res.json();
+      if (!res.ok) {
+        throw new Error(body.error || `Request failed with status ${res.status}`);
+      }
+      deals = body.deals || [];
+      dealsStatusEl.hidden = true;
+      renderDeals();
+    } catch (err) {
+      dealsStatusEl.textContent = err.message;
+      dealsStatusEl.className = "status error";
+    }
+  }
+
+  minCutInput.addEventListener("change", () => {
+    let value = Number(minCutInput.value);
+    if (!(value >= MIN_CUT_MIN && value <= MIN_CUT_MAX)) value = DEFAULT_MIN_CUT;
+    minCutInput.value = value;
+    localStorage.setItem(MIN_CUT_STORAGE_KEY, String(value));
+    loadDeals();
+  });
+
+  dealsSortSelect.addEventListener("change", renderDeals);
+
+  dealsRefreshBtn.addEventListener("click", () => loadDeals(true));
 </script>

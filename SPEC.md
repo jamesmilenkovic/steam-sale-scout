@@ -1,77 +1,69 @@
-# Increment 1 — Library in, ranked by "what I actually play"
+# Increment 2 — Steam deep-sale feed (AUD)
 
-**Project:** Steam Sale Scout · **Phase 1, slice 1 of 3**
+**Project:** Steam Sale Scout · **Phase 1, slice 2 of 3**
 **PRD:** `PRDs/2-in-progress/2026-07-04-steam-sale-recommender.md`
-**Status:** Build-ready (scoped 2026-07-04)
+**Status:** Build-ready (scoped 2026-07-04, after inc-1 acceptance)
 
 ## Goal
 
-Prove the plumbing and the weighting inputs end-to-end: Worker proxy + Steam
-Web API + a frontend that shows James's library ranked by a first-pass
-taste weight (hours × recency). **Success = James looks at his top-20 and says
-"yes, that's my taste, in order."**
+A working "all current Steam discounts ≥ X%, in AUD" view with owned games
+excluded and historical-low flags. Standalone-useful as a sale browser, and it
+becomes the candidate pool the increment-3 engine scores.
 
-No deals, no recommendations, no SteamSpy yet. Just library → weight → ranked list.
+## Decision carried in from James (2026-07-04): local-only
 
-## Stack (fixed for the project)
+**No deploy.** The app runs via `wrangler dev` on `localhost` — the Worker is
+purely a CORS/keys proxy, not hosting. Remove/skip any deploy steps; acceptance
+happens on the local URL. Deploying is a Phase 3 question (other devices,
+scheduled digest), not before.
 
-1. **Cloudflare Worker** serving both the API proxy routes and the static
-   frontend (Workers static assets). One `wrangler deploy`, free tier,
-   workers.dev URL. Local dev via `wrangler dev`.
-2. **Frontend: vanilla HTML/JS/CSS, single page** (house style — same as
-   metronome/drum-trainer). No framework unless the loop argues for one later.
-3. **Secrets:** `STEAM_API_KEY` and `STEAM_ID` (SteamID64) as Worker secrets;
-   locally in `.dev.vars` (gitignored). **Never in the repo, never in client JS.**
+## Prerequisite (James, ~5 min)
+
+Register a free ITAD app at **isthereanydeal.com/apps/my/** → API key →
+`ITAD_API_KEY` in `.dev.vars`. Optional courtesy email to ITAD re private
+personal use (their ToS asks private apps to get in touch; local single-user
+usage is the definition of low-impact, but the email is polite insurance).
 
 ## Build
 
-### 1. Worker route `GET /api/library`
+### 1. Worker route `GET /api/deals?minCut=60`
 
-- Calls `https://api.steampowered.com/IPlayerService/GetOwnedGames/v1/` with
-  `key`, `steamid`, `include_appinfo=1`, `include_played_free_games=1`.
-- Returns trimmed JSON per game: `appid`, `name`, `img_icon_url`,
-  `playtime_forever` (min), `playtime_2weeks` (min, may be absent),
-  `rtime_last_played` (unix; present because own key + own account).
-- **Cache the upstream response 24h** (Worker Cache API or KV). Add
-  `?refresh=1` to bypass.
-- Errors surfaced clearly: missing secrets, private-profile/empty response
-  (privacy hint in the message), upstream non-200.
+- ITAD **`GET /deals/v2`** with `country=AU`, `shops=61` (Steam), `sort=-cut`,
+  `limit=200`, paginate `offset` until exhausted (cap ~1,000 deals), server-side
+  filter `minCut` (default 60; accept 40–90).
+- Per deal, extract: title, ITAD game id, **Steam appid** (parse from the deal's
+  Steam store URL — deals on shop 61 carry it), price (AUD), regular price,
+  `cut` %, deal flags/expiry if present.
+- **Historical low:** batch the filtered set through **`POST /games/historylow/v1`**
+  (`country=AU`, ≤200 ids/call). Flag `atHistoricalLow` (deal price ≤ recorded
+  low + a few cents tolerance) and include the low for display.
+- **Exclude owned:** reuse the cached library (inc 1) by appid before returning.
+- **Cache 6h** (deals) / 7 days (history lows), `?refresh=1` bypass. Respect
+  ITAD's 1,000 req/5min limit trivially via the cache.
+- Clear errors: missing `ITAD_API_KEY`, upstream 429 (surface Retry-After).
 
-### 2. Weight function (shared module, unit-tested)
+### 2. UI — "Deals" section alongside the inc-1 library view
 
-`weight = log2(1 + hours) × recencyMultiplier`
-
-- `hours = playtime_forever / 60`.
-- `recencyMultiplier`, given `windowMonths` (setting, default 12) and months
-  since `rtime_last_played`:
-  - played in last 2 weeks (`playtime_2weeks` > 0): **×3**
-  - within `windowMonths/4`: **×2**
-  - within `windowMonths`: **×1.5**
-  - within `2 × windowMonths`: **×1**
-  - older / never (`rtime_last_played` 0 or missing): **×0.5**
-- Pure function in its own module (`weight.js`) — increment 3 replaces log-hours
-  with median-playtime normalisation, so keep the seam clean.
-
-### 3. UI
-
-- Single page: header, **recency-window setting** (months; default 12,
-  persisted to localStorage), ranked table.
-- Table: rank, icon, name, hours (1 dp), last played ("3 months ago" style),
-  weight bar. Sorted by weight desc. Toggle to sort by raw hours for
-  comparison ("did the recency weighting actually change the order?").
-- Show totals: game count, games never played.
-- No styling ambitions beyond readable — this page is diagnostic, not the product.
+- Simple two-tab nav: **Library** (inc 1) · **Deals** (new).
+- Controls: **minimum discount** (default 60%, range 40–90, persisted to
+  localStorage like the recency setting) · sort by **% off / price / title**.
+- Table: name, AUD price, regular price (struck through), % off badge,
+  **HISTORICAL LOW** badge where flagged, link out to the Steam store page
+  (`store.steampowered.com/app/<appid>`).
+- Totals: deal count at current threshold, count at historical lows.
+- Still diagnostic-grade styling; the product UI comes after the Phase 1 gate.
 
 ## Out of scope (this increment)
 
-Deals/ITAD, SteamSpy tags, wishlist, filters, similarity, any recommendation.
-Also: no accounts, SteamID stays a secret-config value.
+Recommendations/similarity (inc 3), SteamSpy, wishlist, genre/price/similarity
+filters (Phase 2 — minCut is the only control now), any deploy.
 
 ## Testing
 
-- Unit tests (node `--test`): weight function across all recency bands, edge
-  cases (0 minutes, missing `rtime_last_played`, `playtime_2weeks` present),
-  window-setting variations (e.g. 3-month window reshuffles vs 12).
-- Worker route test with a mocked upstream response (trimming + cache headers).
-- Manual acceptance (James): `wrangler dev` with real key → top-20 sanity check;
-  then `wrangler deploy` → same on the workers.dev URL.
+- Unit: appid parsing from deal URLs, minCut filtering, owned-exclusion,
+  historical-low flagging (incl. tolerance), pagination assembly — all against
+  mocked ITAD fixtures shaped from the real v2 responses.
+- Worker route test: mocked ITAD upstream, cache behaviour, 429 handling.
+- Manual acceptance (James): localhost → Deals tab at 60% shows a plausible
+  sale list in AUD, owned games absent, spot-check 2–3 prices against the
+  Steam store, historical-low badges sane.
