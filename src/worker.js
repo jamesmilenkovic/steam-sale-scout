@@ -1,8 +1,10 @@
 // Steam Sale Scout — Cloudflare Worker.
 // Implements /api/library: GetOwnedGames proxy, trimmed response, 24h cache,
 // ?refresh=1 bypass, clear errors. /api/deals (Increment 2): ITAD deals feed,
-// filtered/enriched/owned-excluded. Non-asset requests reach here; static
-// files are served from ./public.
+// filtered/enriched/owned-excluded. /api/recs (Increment 3): taste-profile
+// scoring engine over the deals feed, backed by a SteamSpy tag cache (KV)
+// and a strict-1req/sec background fetch queue. Non-asset requests reach
+// here; static files are served from ./public.
 
 import {
   BATCH_SIZE,
@@ -18,6 +20,10 @@ import {
   normalizeDeal,
   parseSteamAppId,
 } from "./deals.js";
+import { TOP_OWNED_GAMES, buildProfile, selectTopOwnedGames } from "./profile.js";
+import { scoreCandidates } from "./score.js";
+import { buildWhy } from "./why.js";
+import { getCachedSpy, enqueueSpyFetch } from "./spyQueue.js";
 
 const STEAM_API_URL =
   "https://api.steampowered.com/IPlayerService/GetOwnedGames/v1/";
@@ -440,6 +446,160 @@ async function handleDeals(request, env, ctx) {
   return response;
 }
 
+// ---------------------------------------------------------------------------
+// /api/recs (Increment 3)
+// ---------------------------------------------------------------------------
+
+/** Load the trimmed library for /api/recs, reusing /api/library's cache key
+ * and TTL. Throws (with `.status`) on upstream failure — recs must refuse to
+ * run rather than risk recommending an owned game it couldn't exclude. */
+async function loadLibraryForRecs(env, ctx, refresh) {
+  const cache = caches.default;
+  const cacheKey = libraryCacheKey(env);
+
+  if (!refresh) {
+    const cached = await cache.match(cacheKey);
+    if (cached) {
+      const body = await cached.clone().json();
+      return body.games;
+    }
+  }
+
+  const trimmed = await fetchOwnedGames(env);
+  const response = new Response(JSON.stringify({ games: trimmed }), {
+    status: 200,
+    headers: {
+      "content-type": "application/json",
+      "cache-control": `public, max-age=${CACHE_TTL_SECONDS}`,
+    },
+  });
+  // Await (not waitUntil) so the library is in cache before loadDealsForRecs ->
+  // buildDealsFeed -> getOwnedAppIds reads the same key below; otherwise a
+  // cold-cold cache re-fetches the Steam library a second time for exclusion.
+  await cache.put(cacheKey, response.clone());
+  return trimmed;
+}
+
+/** Load the assembled deals feed for /api/recs, reusing /api/deals' own
+ * cache key/TTL for the given minCut so the two routes share one fetch. */
+async function loadDealsForRecs(env, ctx, minCut, refresh) {
+  const cache = caches.default;
+  const cacheKey = dealsCacheKey(minCut);
+
+  if (!refresh) {
+    const cached = await cache.match(cacheKey);
+    if (cached) {
+      const body = await cached.clone().json();
+      return body.deals;
+    }
+  }
+
+  const deals = await buildDealsFeed(env, ctx, minCut, refresh);
+  const response = new Response(JSON.stringify({ deals, minCut }), {
+    status: 200,
+    headers: {
+      "content-type": "application/json",
+      "cache-control": `public, max-age=${DEALS_CACHE_TTL_SECONDS}`,
+    },
+  });
+  ctx.waitUntil(cache.put(cacheKey, response.clone()));
+  return deals;
+}
+
+async function handleRecs(request, env, ctx) {
+  if (!env.STEAM_API_KEY || !env.STEAM_ID) {
+    return jsonError(
+      "Recommendations need your Steam library to exclude owned games — missing STEAM_API_KEY or STEAM_ID (see .dev.vars locally). Refusing to run rather than risk recommending something you already own.",
+      500,
+    );
+  }
+  if (!env.ITAD_API_KEY) {
+    return jsonError(
+      "Missing ITAD_API_KEY — recs are computed over the deals feed, which needs it (see .dev.vars locally).",
+      500,
+    );
+  }
+
+  const url = new URL(request.url);
+  const refresh = url.searchParams.get("refresh") === "1";
+  const minCut = clampMinCut(url.searchParams.get("minCut"));
+  const windowMonthsParam = Number(url.searchParams.get("windowMonths"));
+  const windowMonths = windowMonthsParam > 0 ? windowMonthsParam : 12;
+
+  let libraryGames;
+  try {
+    libraryGames = await loadLibraryForRecs(env, ctx, refresh);
+  } catch (err) {
+    return jsonError(
+      `Recommendations need your Steam library to exclude owned games, but the Steam fetch failed (${err.message}). Refusing to run rather than risk recommending something you already own.`,
+      err.status || 502,
+    );
+  }
+
+  let deals;
+  try {
+    deals = await loadDealsForRecs(env, ctx, minCut, refresh);
+  } catch (err) {
+    return upstreamErrorResponse(err);
+  }
+
+  const now = Date.now();
+  const ownedAppids = selectTopOwnedGames(libraryGames, windowMonths, now, TOP_OWNED_GAMES).map(
+    (g) => g.appid,
+  );
+  const dealAppids = deals.filter((d) => d.appid != null).map((d) => d.appid);
+  const neededAppids = Array.from(new Set([...ownedAppids, ...dealAppids]));
+
+  const tagByAppid = new Map();
+  await Promise.all(
+    neededAppids.map(async (appid) => {
+      tagByAppid.set(appid, await getCachedSpy(env, appid));
+    }),
+  );
+
+  const missing = neededAppids.filter((appid) => !tagByAppid.get(appid).cached);
+  if (missing.length > 0) enqueueSpyFetch(env, ctx, missing);
+
+  const spyDataByAppid = new Map(
+    neededAppids.map((appid) => {
+      const entry = tagByAppid.get(appid);
+      return [appid, entry.cached ? entry.data : undefined];
+    }),
+  );
+
+  const { profile, contributions } = buildProfile(libraryGames, spyDataByAppid, windowMonths, now);
+
+  const candidates = deals.map((deal) => {
+    const spy = deal.appid != null ? spyDataByAppid.get(deal.appid) : undefined;
+    return {
+      ...deal,
+      tags: spy?.tags || {},
+      reviews: spy?.reviews || {},
+    };
+  });
+
+  const { recs: scoredRecs, excludedCount } = scoreCandidates(profile, candidates);
+
+  const recs = scoredRecs.map((rec) => {
+    const why = buildWhy(profile, rec.tagVector, contributions);
+    const { tags, tagVector, reviews, ...rest } = rec;
+    return { ...rest, why };
+  });
+
+  const fetched = neededAppids.length - missing.length;
+
+  return new Response(
+    JSON.stringify({
+      ready: fetched >= neededAppids.length,
+      fetched,
+      total: neededAppids.length,
+      excludedCount,
+      recs,
+    }),
+    { status: 200, headers: { "content-type": "application/json" } },
+  );
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -448,6 +608,9 @@ export default {
     }
     if (url.pathname === "/api/deals") {
       return handleDeals(request, env, ctx);
+    }
+    if (url.pathname === "/api/recs") {
+      return handleRecs(request, env, ctx);
     }
     if (url.pathname.startsWith("/api/")) {
       return jsonError("not implemented", 501);

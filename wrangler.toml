@@ -7,3 +7,12 @@ compatibility_date = "2025-06-01"
 [assets]
 directory = "./public"
 binding = "ASSETS"
+
+# SteamSpy tag/median/review cache (Increment 3), keyed by appid, 30d/24h TTL
+# (see src/worker.js). `id` is a placeholder — `wrangler dev` simulates KV
+# entirely locally and doesn't validate it against a real Cloudflare account.
+# This project is local-only through Phase 1 (see SPEC.md); a real namespace
+# would need to be created with `wrangler kv namespace create` before deploy.
+[[kv_namespaces]]
+binding = "TAG_CACHE"
+id = "local-dev-tag-cache-placeholder"

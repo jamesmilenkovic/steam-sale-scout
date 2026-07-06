@@ -79,6 +79,17 @@
   }
   .badge-cut { background: #2a6df5; color: #fff; }
   .badge-low { background: #1a8a3c; color: #fff; margin-left: 0.4rem; }
+  .progress-track {
+    background: #e0e0e0;
+    border-radius: 4px;
+    height: 10px;
+    width: 100%;
+    max-width: 320px;
+    overflow: hidden;
+  }
+  .progress-fill { background: #2a6df5; height: 100%; }
+  .progress-label { color: #666; font-size: 0.85rem; margin-top: 0.25rem; }
+  .why-line { color: #444; font-size: 0.85rem; }
 </style>
 
 <h1>Steam Sale Scout</h1>
@@ -87,6 +98,7 @@
 <nav class="tabs">
   <button type="button" class="tab-btn" data-tab="library" aria-selected="true">Library</button>
   <button type="button" class="tab-btn" data-tab="deals" aria-selected="false">Deals</button>
+  <button type="button" class="tab-btn" data-tab="recs" aria-selected="false">Recs</button>
 </nav>
 
 <section id="tab-library" class="tab-panel">
@@ -149,6 +161,43 @@
       </tr>
     </thead>
     <tbody id="deals-table-body"></tbody>
+  </table>
+</section>
+
+<section id="tab-recs" class="tab-panel" hidden>
+  <div class="controls">
+    <label>
+      Minimum discount (%):
+      <input type="number" id="recs-min-cut" min="40" max="90" step="1" />
+    </label>
+    <label>
+      Recency window (months):
+      <input type="number" id="recs-window-months" min="1" step="1" />
+    </label>
+    <button id="recs-refresh-btn" type="button">Refresh library + deals</button>
+  </div>
+
+  <div id="recs-status" class="status">Loading…</div>
+  <div id="recs-progress-wrap" hidden>
+    <div class="progress-track">
+      <div id="recs-progress-fill" class="progress-fill" style="width: 0%"></div>
+    </div>
+    <div id="recs-progress-label" class="progress-label"></div>
+  </div>
+  <div id="recs-totals" class="totals"></div>
+  <table id="recs-table" hidden>
+    <thead>
+      <tr>
+        <th>Name</th>
+        <th>Similarity</th>
+        <th>Price (AUD)</th>
+        <th>Regular</th>
+        <th>% off</th>
+        <th>Why</th>
+        <th>Store</th>
+      </tr>
+    </thead>
+    <tbody id="recs-table-body"></tbody>
   </table>
 </section>
 
@@ -312,8 +361,10 @@
   const tabPanels = {
     library: document.getElementById("tab-library"),
     deals: document.getElementById("tab-deals"),
+    recs: document.getElementById("tab-recs"),
   };
   let dealsLoaded = false;
+  let recsLoaded = false;
 
   tabButtons.forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -325,6 +376,10 @@
       if (tab === "deals" && !dealsLoaded) {
         dealsLoaded = true;
         loadDeals();
+      }
+      if (tab === "recs" && !recsLoaded) {
+        recsLoaded = true;
+        loadRecs();
       }
     });
   });
@@ -458,4 +513,156 @@
   dealsSortSelect.addEventListener("change", renderDeals);
 
   dealsRefreshBtn.addEventListener("click", () => loadDeals(true));
+
+  // --- Recs (Increment 3) --------------------------------------------------
+  // Reuses the same min-discount control/storage as the Deals tab, and the
+  // same recency-window control/storage as the Library tab — changing
+  // either here recomputes the profile server-side via a fresh /api/recs
+  // request. Polls while the SteamSpy tag cache is still building
+  // (ready:false), stops once ready.
+
+  const RECS_POLL_MS = 2000;
+
+  const recsStatusEl = document.getElementById("recs-status");
+  const recsProgressWrapEl = document.getElementById("recs-progress-wrap");
+  const recsProgressFillEl = document.getElementById("recs-progress-fill");
+  const recsProgressLabelEl = document.getElementById("recs-progress-label");
+  const recsTotalsEl = document.getElementById("recs-totals");
+  const recsTableEl = document.getElementById("recs-table");
+  const recsTableBodyEl = document.getElementById("recs-table-body");
+  const recsMinCutInput = document.getElementById("recs-min-cut");
+  const recsWindowInput = document.getElementById("recs-window-months");
+  const recsRefreshBtn = document.getElementById("recs-refresh-btn");
+
+  recsMinCutInput.value = loadMinCut();
+  recsWindowInput.value = loadWindowMonths();
+
+  let recsPollTimer = null;
+
+  function renderRecs(body) {
+    const recs = body.recs || [];
+
+    recsTableBodyEl.innerHTML = "";
+    recs.forEach((rec) => {
+      const tr = document.createElement("tr");
+
+      const nameTd = document.createElement("td");
+      nameTd.textContent = rec.title || "(untitled)";
+      tr.appendChild(nameTd);
+
+      const simTd = document.createElement("td");
+      simTd.textContent = `${Math.round((rec.similarity || 0) * 100)}%`;
+      tr.appendChild(simTd);
+
+      const priceTd = document.createElement("td");
+      priceTd.textContent = rec.price != null ? `$${rec.price.toFixed(2)}` : "—";
+      tr.appendChild(priceTd);
+
+      const regularTd = document.createElement("td");
+      if (rec.regular != null) {
+        const s = document.createElement("s");
+        s.className = "regular-price";
+        s.textContent = `$${rec.regular.toFixed(2)}`;
+        regularTd.appendChild(s);
+      }
+      tr.appendChild(regularTd);
+
+      const cutTd = document.createElement("td");
+      const cutBadge = document.createElement("span");
+      cutBadge.className = "badge badge-cut";
+      cutBadge.textContent = `-${rec.cut}%`;
+      cutTd.appendChild(cutBadge);
+      if (rec.atHistoricalLow) {
+        const lowBadge = document.createElement("span");
+        lowBadge.className = "badge badge-low";
+        lowBadge.textContent = "HISTORICAL LOW";
+        cutTd.appendChild(lowBadge);
+      }
+      tr.appendChild(cutTd);
+
+      const whyTd = document.createElement("td");
+      whyTd.className = "why-line";
+      whyTd.textContent = rec.why || "—";
+      tr.appendChild(whyTd);
+
+      const storeTd = document.createElement("td");
+      if (rec.appid) {
+        const a = document.createElement("a");
+        a.href = `https://store.steampowered.com/app/${rec.appid}`;
+        a.target = "_blank";
+        a.rel = "noopener";
+        a.textContent = "Steam";
+        storeTd.appendChild(a);
+      }
+      tr.appendChild(storeTd);
+
+      recsTableBodyEl.appendChild(tr);
+    });
+
+    recsTotalsEl.textContent = `${recs.length} recs · ${body.excludedCount ?? 0} excluded (no appid or no tags)`;
+    recsTableEl.hidden = false;
+
+    if (body.ready) {
+      recsProgressWrapEl.hidden = true;
+    } else {
+      recsProgressWrapEl.hidden = false;
+      const pct = body.total > 0 ? Math.round((body.fetched / body.total) * 100) : 0;
+      recsProgressFillEl.style.width = `${pct}%`;
+      recsProgressLabelEl.textContent = `Building tag cache: ${body.fetched}/${body.total} games (${pct}%) — recs fill in as it goes`;
+    }
+  }
+
+  function stopRecsPoll() {
+    if (recsPollTimer) {
+      clearTimeout(recsPollTimer);
+      recsPollTimer = null;
+    }
+  }
+
+  async function loadRecs(refresh = false) {
+    stopRecsPoll();
+    recsStatusEl.textContent = "Loading…";
+    recsStatusEl.hidden = false;
+    recsStatusEl.className = "status";
+
+    const minCut = loadMinCut();
+    const windowMonths = loadWindowMonths();
+    const params = new URLSearchParams({ minCut: String(minCut), windowMonths: String(windowMonths) });
+    if (refresh) params.set("refresh", "1");
+
+    try {
+      const res = await fetch(`/api/recs?${params}`);
+      const body = await res.json();
+      if (!res.ok) {
+        throw new Error(body.error || `Request failed with status ${res.status}`);
+      }
+      recsStatusEl.hidden = true;
+      renderRecs(body);
+      if (!body.ready) {
+        recsPollTimer = setTimeout(() => loadRecs(false), RECS_POLL_MS);
+      }
+    } catch (err) {
+      recsStatusEl.textContent = err.message;
+      recsStatusEl.className = "status error";
+      recsProgressWrapEl.hidden = true;
+    }
+  }
+
+  recsMinCutInput.addEventListener("change", () => {
+    let value = Number(recsMinCutInput.value);
+    if (!(value >= MIN_CUT_MIN && value <= MIN_CUT_MAX)) value = DEFAULT_MIN_CUT;
+    recsMinCutInput.value = value;
+    localStorage.setItem(MIN_CUT_STORAGE_KEY, String(value));
+    loadRecs();
+  });
+
+  recsWindowInput.addEventListener("change", () => {
+    const raw = Number(recsWindowInput.value);
+    const value = raw > 0 ? raw : DEFAULT_WINDOW_MONTHS;
+    recsWindowInput.value = value;
+    localStorage.setItem(STORAGE_KEY, String(value));
+    loadRecs();
+  });
+
+  recsRefreshBtn.addEventListener("click", () => loadRecs(true));
 </script>

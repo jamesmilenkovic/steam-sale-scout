@@ -1,69 +1,106 @@
-# Increment 2 — Steam deep-sale feed (AUD)
+# Increment 3 — Taste profile + scoring engine v1 + ranked recs
 
-**Project:** Steam Sale Scout · **Phase 1, slice 2 of 3**
+**Project:** Steam Sale Scout · **Phase 1, slice 3 of 3 — THE CORE INCREMENT**
 **PRD:** `PRDs/2-in-progress/2026-07-04-steam-sale-recommender.md`
-**Status:** Build-ready (scoped 2026-07-04, after inc-1 acceptance)
+**Base:** `main` @ `e842ca8` (inc 2) · **Status:** Build-ready (scoped 2026-07-06)
+**Inc-2 handoff consumed:** `session-2026-07-06-increment-2-built.md` — its three
+flags (null appids, degraded-mode exclusion, stale library cache) are handled below.
 
 ## Goal
 
-A working "all current Steam discounts ≥ X%, in AUD" view with owned games
-excluded and historical-low flags. Standalone-useful as a sale browser, and it
-becomes the candidate pool the increment-3 engine scores.
+Rank every on-sale unowned game by "how much would James actually like this",
+with a *why* per pick. **This increment ends at the ⛩ Phase 1 gate:** James runs
+it against a real sale week and judges the top 20. Nothing in Phase 2 gets built
+until the recs feel right.
 
-## Decision carried in from James (2026-07-04): local-only
+## Data: SteamSpy per-app fetch + persistent tag cache
 
-**No deploy.** The app runs via `wrangler dev` on `localhost` — the Worker is
-purely a CORS/keys proxy, not hosting. Remove/skip any deploy steps; acceptance
-happens on the local URL. Deploying is a Phase 3 question (other devices,
-scheduled digest), not before.
+One SteamSpy `appdetails` call per appid supplies everything the engine needs:
+`tags` (with votes), `median_forever`, `positive`/`negative`. 1 req/sec limit →
+the design problem is the **cold-start fetch**, not the maths.
 
-## Prerequisite (James, ~5 min)
+1. **Tag cache:** KV (local via `wrangler dev`), key = appid, TTL 30 days
+   (tags/medians are near-static). Store the trimmed trio: tags, median, review
+   counts. Failed/empty responses cached 24h as `null` (DLC/bundles often have
+   no tags — they simply never get scored).
+2. **Fetch queue in the Worker:** strict 1 req/sec, needed appids =
+   **top 200 owned games by inc-1 weight** (the tail is noise) + all candidate
+   appids from `/api/deals` (cut ≥ current threshold). Cold start at Summer-Sale
+   scale ≈ ~1,200 appids ≈ ~20 min — hence:
+3. **Progressive results:** `/api/recs` never blocks. Response:
+   `{ready, fetched, total, recs:[...]}` — recs computed from whatever is cached
+   so far; UI polls, shows a progress bar, and the list fills in/re-ranks live.
+   Warm runs are instant.
 
-Register a free ITAD app at **isthereanydeal.com/apps/my/** → API key →
-`ITAD_API_KEY` in `.dev.vars`. Optional courtesy email to ITAD re private
-personal use (their ToS asks private apps to get in touch; local single-user
-usage is the definition of low-impact, but the email is polite insurance).
+## Engine (pure modules, unit-tested)
 
-## Build
+### `profile.js` — build the taste vector
 
-### 1. Worker route `GET /api/deals?minCut=60`
+1. Per owned game (top 200 by inc-1 weight, skip < 30 min played):
+   `gameWeight = playtimeNorm × recencyMult` where
+   `playtimeNorm = clamp(playtime_forever / median_forever, 0.1, 4)` (median
+   from SteamSpy; if median missing/0, fall back to inc-1's log-hours term) and
+   `recencyMult` = the existing banded multiplier from `weight.js`
+   (windowMonths setting, default 12). **This replaces the log-hours seam
+   flagged in `weight.js`.**
+2. Per-game tag vector: top 15 tags by votes, values = votes normalised to sum
+   to 1 for that game, minus the **stoplist** (configurable constant; defaults:
+   `Singleplayer, Multiplayer, Great Soundtrack, Early Access, Free to Play,
+   Controller, Steam Achievements, Atmospheric`) — SteamPeek-style troll/generic
+   suppression, tune at the gate.
+3. `profile = L2-normalise( Σ gameWeight × gameTagVector )`.
 
-- ITAD **`GET /deals/v2`** with `country=AU`, `shops=61` (Steam), `sort=-cut`,
-  `limit=200`, paginate `offset` until exhausted (cap ~1,000 deals), server-side
-  filter `minCut` (default 60; accept 40–90).
-- Per deal, extract: title, ITAD game id, **Steam appid** (parse from the deal's
-  Steam store URL — deals on shop 61 carry it), price (AUD), regular price,
-  `cut` %, deal flags/expiry if present.
-- **Historical low:** batch the filtered set through **`POST /games/historylow/v1`**
-  (`country=AU`, ≤200 ids/call). Flag `atHistoricalLow` (deal price ≤ recorded
-  low + a few cents tolerance) and include the low for display.
-- **Exclude owned:** reuse the cached library (inc 1) by appid before returning.
-- **Cache 6h** (deals) / 7 days (history lows), `?refresh=1` bypass. Respect
-  ITAD's 1,000 req/5min limit trivially via the cache.
-- Clear errors: missing `ITAD_API_KEY`, upstream 429 (surface Retry-After).
+### `score.js` — rank the candidates
 
-### 2. UI — "Deals" section alongside the inc-1 library view
+1. `similarity = cosine(profile, candidateTagVector)` → shown as a % (this is
+   the "% of similar" number the Phase-2 filter will use).
+2. `quality = positive/(positive+negative)` clamped to [0.5, 1]; neutral 0.75
+   if < 50 total reviews.
+3. `rankScore = similarity × quality × (atHistoricalLow ? 1.15 : 1)`.
+   (Deal depth already gated by minCut; don't double-count discount.)
+4. **`appid: null` or tagless candidates: excluded from recs** (still visible in
+   the Deals tab); show an excluded-count line so nothing silently vanishes.
 
-- Simple two-tab nav: **Library** (inc 1) · **Deals** (new).
-- Controls: **minimum discount** (default 60%, range 40–90, persisted to
-  localStorage like the recency setting) · sort by **% off / price / title**.
-- Table: name, AUD price, regular price (struck through), % off badge,
-  **HISTORICAL LOW** badge where flagged, link out to the Steam store page
-  (`store.steampowered.com/app/<appid>`).
-- Totals: deal count at current threshold, count at historical lows.
-- Still diagnostic-grade styling; the product UI comes after the Phase 1 gate.
+### `why.js` — the explanation line
 
-## Out of scope (this increment)
+Per rec: top 3 overlapping tags by contribution to the cosine + the 2 owned
+games that contributed most weight to those tags, with hours. Format:
+_"Roguelike Deckbuilder, Turn-Based, Strategy — because Slay the Spire (180h)
+and Balatro (42h)"_.
 
-Recommendations/similarity (inc 3), SteamSpy, wishlist, genre/price/similarity
-filters (Phase 2 — minCut is the only control now), any deploy.
+## UI — third tab: **Recs**
+
+1. Progress state while the tag cache builds (fetched/total, partial list
+   fills in live).
+2. Ranked cards/rows: name, **similarity %**, AUD price + struck regular,
+   % off badge, HISTORICAL LOW badge, the *why* line, Steam store link.
+   Sorted by rankScore.
+3. Controls: reuses the deals min-discount control; **recency window setting
+   now also recomputes the profile** (client re-request, profile rebuild is
+   cheap once tags are cached). Excluded-count footnote.
+4. No filters beyond that (Phase 2), no dismissals (Phase 2), diagnostic styling.
+
+## Inc-2 flag handling (for the record)
+
+1. Null-appid deals → excluded from recs, counted (above).
+2. Degraded-mode owned-exclusion (missing Steam key) → recs must **refuse to
+   run** in this state (a recommender that suggests owned games is broken):
+   `/api/recs` returns a clear error if the library fetch failed.
+3. Library cache staleness (≤24h) is fine for scoring; `?refresh=1` on
+   `/api/recs` refreshes library + deals + recomputes (not the 30-day tag KV).
+
+## Out of scope
+
+Phase-2 filters (price cap, min-similarity, genre), wishlist lane, dismissals,
+LLM re-rank, any deploy. Local-only stands.
 
 ## Testing
 
-- Unit: appid parsing from deal URLs, minCut filtering, owned-exclusion,
-  historical-low flagging (incl. tolerance), pagination assembly — all against
-  mocked ITAD fixtures shaped from the real v2 responses.
-- Worker route test: mocked ITAD upstream, cache behaviour, 429 handling.
-- Manual acceptance (James): localhost → Deals tab at 60% shows a plausible
-  sale list in AUD, owned games absent, spot-check 2–3 prices against the
-  Steam store, historical-low badges sane.
+- Unit (fixtures shaped from real SteamSpy payloads): playtimeNorm incl. median
+  fallback + clamps, profile normalisation, stoplist, cosine, quality clamps,
+  historical-low bonus, why-line selection, null/tagless exclusion, partial-
+  cache ranking (recs from 40% of tags ≠ crash), refuse-on-degraded-library.
+- Queue: 1 req/sec pacing, null-caching of empty responses, 30d/24h TTLs.
+- Manual acceptance = **⛩ Phase 1 gate (James, on a real sale week):** let the
+  cache build, then judge the top 20 — "would I click buy on most of these?"
+  Tune weights/stoplist in-loop if close; park cheaply if fundamentally off.
