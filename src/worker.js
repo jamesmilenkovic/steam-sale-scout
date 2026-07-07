@@ -21,10 +21,13 @@ import {
   normalizeDeal,
   parseSteamAppId,
 } from "./deals.js";
-import { TOP_OWNED_GAMES, buildProfile, selectTopOwnedGames, computeIdf } from "./profile.js";
-import { scoreCandidates } from "./score.js";
+import { TOP_OWNED_GAMES, buildProfile, selectTopOwnedGames, computeIdf, buildTagVector, applyIdf } from "./profile.js";
+import { scoreCandidates, cosineSimilarity } from "./score.js";
 import { buildWhy } from "./why.js";
 import { getCachedSpy, enqueueSpyFetch } from "./spyQueue.js";
+import { resolveDeckCompat, DEFAULT_DECK_COMPAT } from "./deckCompat.js";
+import { batteryFriendly } from "./battery.js";
+import { buildHallOfFame } from "./hallOfFame.js";
 
 const STEAM_API_URL =
   "https://api.steampowered.com/IPlayerService/GetOwnedGames/v1/";
@@ -407,6 +410,55 @@ async function buildDealsFeed(env, ctx, minCut, refresh) {
   return excludeOwned(deals, ownedAppIds);
 }
 
+/**
+ * Attach the per-deal signals the Increment 5 filter bar needs (genre/tag
+ * chips, Steam Deck badge, battery-friendly badge) to an already-assembled
+ * deals array. NOT baked into the 6h dealsCacheKey blob above — SteamSpy tag
+ * data is fetched lazily (same partial-cache-is-fine model as /api/recs) and
+ * would otherwise freeze an incomplete state into that longer-lived cache.
+ *
+ * ADDED FETCH SURFACE (flagged for the gate): this is the "how do we enrich
+ * Deals" decision SPEC.md's ambiguity list calls out. It reuses the existing
+ * SteamSpy tag cache read-only (a KV read per appid, no new network calls —
+ * misses just get enqueued to the same background queue /api/recs already
+ * drives) plus one new live call: resolveDeckCompat's batched GetItems fetch,
+ * which is awaited inline so /api/deals always returns deck data rather than
+ * "pending" for it. That fetch is itself KV-cached for 30 days, so only a
+ * cold cache pays this cost.
+ * @param {object} env
+ * @param {object} ctx
+ * @param {Array<object>} deals
+ * @returns {Promise<Array<object>>}
+ */
+async function enrichDeals(env, ctx, deals) {
+  const appids = Array.from(new Set(deals.filter((d) => d.appid != null).map((d) => d.appid)));
+
+  const spyByAppid = new Map();
+  await Promise.all(
+    appids.map(async (appid) => {
+      spyByAppid.set(appid, await getCachedSpy(env, appid));
+    }),
+  );
+  const missingSpy = appids.filter((appid) => !spyByAppid.get(appid).cached);
+  if (missingSpy.length > 0) enqueueSpyFetch(env, ctx, missingSpy);
+
+  const deckByAppid = await resolveDeckCompat(env, appids);
+
+  return deals.map((deal) => {
+    if (deal.appid == null) {
+      return { ...deal, tagNames: [], batteryFriendly: false, deck: DEFAULT_DECK_COMPAT };
+    }
+    const spyEntry = spyByAppid.get(deal.appid);
+    const tags = spyEntry?.cached ? spyEntry.data?.tags || {} : {};
+    return {
+      ...deal,
+      tagNames: Object.keys(tags),
+      batteryFriendly: batteryFriendly(tags),
+      deck: deckByAppid.get(deal.appid) || DEFAULT_DECK_COMPAT,
+    };
+  });
+}
+
 async function handleDeals(request, env, ctx) {
   if (!env.ITAD_API_KEY) {
     return jsonError(
@@ -422,29 +474,41 @@ async function handleDeals(request, env, ctx) {
   const cache = caches.default;
   const cacheKey = dealsCacheKey(minCut);
 
+  let deals;
   if (!refresh) {
     const cached = await cache.match(cacheKey);
-    if (cached) return cached;
+    if (cached) {
+      const body = await cached.clone().json();
+      deals = body.deals;
+    }
   }
 
-  let deals;
-  try {
-    deals = await buildDealsFeed(env, ctx, minCut, refresh);
-  } catch (err) {
-    return upstreamErrorResponse(err);
+  if (!deals) {
+    try {
+      deals = await buildDealsFeed(env, ctx, minCut, refresh);
+    } catch (err) {
+      return upstreamErrorResponse(err);
+    }
+
+    const response = new Response(JSON.stringify({ deals, minCut }), {
+      status: 200,
+      headers: {
+        "content-type": "application/json",
+        "cache-control": `public, max-age=${DEALS_CACHE_TTL_SECONDS}`,
+      },
+    });
+    ctx.waitUntil(cache.put(cacheKey, response.clone()));
   }
 
-  const response = new Response(JSON.stringify({ deals, minCut }), {
+  const enriched = await enrichDeals(env, ctx, deals);
+
+  return new Response(JSON.stringify({ deals: enriched, minCut }), {
     status: 200,
     headers: {
       "content-type": "application/json",
       "cache-control": `public, max-age=${DEALS_CACHE_TTL_SECONDS}`,
     },
   });
-
-  ctx.waitUntil(cache.put(cacheKey, response.clone()));
-
-  return response;
 }
 
 // ---------------------------------------------------------------------------
@@ -507,43 +571,23 @@ async function loadDealsForRecs(env, ctx, minCut, refresh) {
   return deals;
 }
 
-async function handleRecs(request, env, ctx) {
-  if (!env.STEAM_API_KEY || !env.STEAM_ID) {
-    return jsonError(
-      "Recommendations need your Steam library to exclude owned games — missing STEAM_API_KEY or STEAM_ID (see .dev.vars locally). Refusing to run rather than risk recommending something you already own.",
-      500,
-    );
-  }
-  if (!env.ITAD_API_KEY) {
-    return jsonError(
-      "Missing ITAD_API_KEY — recs are computed over the deals feed, which needs it (see .dev.vars locally).",
-      500,
-    );
-  }
-
-  const url = new URL(request.url);
-  const refresh = url.searchParams.get("refresh") === "1";
-  const minCut = clampMinCut(url.searchParams.get("minCut"));
-  const windowMonthsParam = Number(url.searchParams.get("windowMonths"));
-  const windowMonths = windowMonthsParam > 0 ? windowMonthsParam : 12;
-
-  let libraryGames;
-  try {
-    libraryGames = await loadLibraryForRecs(env, ctx, refresh);
-  } catch (err) {
-    return jsonError(
-      `Recommendations need your Steam library to exclude owned games, but the Steam fetch failed (${err.message}). Refusing to run rather than risk recommending something you already own.`,
-      err.status || 502,
-    );
-  }
-
-  let deals;
-  try {
-    deals = await loadDealsForRecs(env, ctx, minCut, refresh);
-  } catch (err) {
-    return upstreamErrorResponse(err);
-  }
-
+/**
+ * Build the shared candidate pool both /api/recs (scoreCandidates) and
+ * /api/best-of (buildHallOfFame) rank over: the taste profile, its IDF map,
+ * and every deal candidate with whatever SteamSpy tag/review/owners data is
+ * currently cached attached (pending candidates held back, same as before
+ * Increment 5's split into this helper). Extracted out of handleRecs
+ * unchanged in behaviour — Increment 5 needs the SAME pool for two
+ * different rankings (taste-similarity vs. taste-agnostic Hall of Fame)
+ * rather than two independent, divergent tag-fetch passes.
+ * @param {object} env
+ * @param {object} ctx
+ * @param {Array<object>} libraryGames
+ * @param {Array<object>} deals
+ * @param {number} windowMonths
+ * @returns {Promise<{candidates: Array<object>, profile: object, contributions: Array<object>, idfMap: object, pendingCount: number, fetched: number, total: number, ready: boolean}>}
+ */
+async function buildCandidatePool(env, ctx, libraryGames, deals, windowMonths) {
   const now = Date.now();
   const ownedAppids = selectTopOwnedGames(libraryGames, windowMonths, now, TOP_OWNED_GAMES).map(
     (g) => g.appid,
@@ -587,7 +631,7 @@ async function handleRecs(request, env, ctx) {
   // Split "not yet fetched" (pendingCount) from "fetched but permanently
   // tagless / null-appid" (excludedCount, computed inside scoreCandidates —
   // it only sees cache state, not fetch status). Pending deals are held
-  // back from scoreCandidates entirely so they don't inflate excludedCount.
+  // back from scoring entirely so they don't inflate excludedCount.
   let pendingCount = 0;
   const candidates = [];
   for (const deal of deals) {
@@ -604,31 +648,185 @@ async function handleRecs(request, env, ctx) {
     });
   }
 
+  const fetched = neededAppids.length - missing.length;
+
+  return {
+    candidates,
+    profile,
+    contributions,
+    idfMap,
+    pendingCount,
+    fetched,
+    total: neededAppids.length,
+    ready: fetched >= neededAppids.length,
+  };
+}
+
+async function handleRecs(request, env, ctx) {
+  if (!env.STEAM_API_KEY || !env.STEAM_ID) {
+    return jsonError(
+      "Recommendations need your Steam library to exclude owned games — missing STEAM_API_KEY or STEAM_ID (see .dev.vars locally). Refusing to run rather than risk recommending something you already own.",
+      500,
+    );
+  }
+  if (!env.ITAD_API_KEY) {
+    return jsonError(
+      "Missing ITAD_API_KEY — recs are computed over the deals feed, which needs it (see .dev.vars locally).",
+      500,
+    );
+  }
+
+  const url = new URL(request.url);
+  const refresh = url.searchParams.get("refresh") === "1";
+  const minCut = clampMinCut(url.searchParams.get("minCut"));
+  const windowMonthsParam = Number(url.searchParams.get("windowMonths"));
+  const windowMonths = windowMonthsParam > 0 ? windowMonthsParam : 12;
+
+  let libraryGames;
+  try {
+    libraryGames = await loadLibraryForRecs(env, ctx, refresh);
+  } catch (err) {
+    return jsonError(
+      `Recommendations need your Steam library to exclude owned games, but the Steam fetch failed (${err.message}). Refusing to run rather than risk recommending something you already own.`,
+      err.status || 502,
+    );
+  }
+
+  let deals;
+  try {
+    deals = await loadDealsForRecs(env, ctx, minCut, refresh);
+  } catch (err) {
+    return upstreamErrorResponse(err);
+  }
+
+  const pool = await buildCandidatePool(env, ctx, libraryGames, deals, windowMonths);
+
   const {
     recs: scoredRecs,
     excludedCount,
     qualityExcludedCount,
-  } = scoreCandidates(profile, candidates, idfMap);
+  } = scoreCandidates(pool.profile, pool.candidates, pool.idfMap);
+
+  // Deck compat (Increment 5): only for the appids that actually made it
+  // into recs, not the whole candidate pool — cheaper, and matches spec §2
+  // ("batch-fetch for candidates only").
+  const recAppids = scoredRecs.filter((rec) => rec.appid != null).map((rec) => rec.appid);
+  const deckByAppid = await resolveDeckCompat(env, recAppids);
 
   const recs = scoredRecs.map((rec) => {
-    const why = buildWhy(profile, rec.tagVector, contributions);
+    const why = buildWhy(pool.profile, rec.tagVector, pool.contributions);
     const { tags, tagVector, reviews, owners, ...rest } = rec;
     const totalReviews = (reviews?.positive || 0) + (reviews?.negative || 0);
     const reviewPercent = totalReviews > 0 ? Math.round((reviews.positive / totalReviews) * 100) : null;
-    return { ...rest, why, reviewPercent, reviewCount: totalReviews, owners };
+    return {
+      ...rest,
+      why,
+      reviewPercent,
+      reviewCount: totalReviews,
+      owners,
+      tagNames: Object.keys(tags || {}),
+      batteryFriendly: batteryFriendly(tags),
+      deck: rec.appid != null ? deckByAppid.get(rec.appid) || DEFAULT_DECK_COMPAT : DEFAULT_DECK_COMPAT,
+    };
   });
-
-  const fetched = neededAppids.length - missing.length;
 
   return new Response(
     JSON.stringify({
-      ready: fetched >= neededAppids.length,
-      fetched,
-      total: neededAppids.length,
-      pendingCount,
+      ready: pool.ready,
+      fetched: pool.fetched,
+      total: pool.total,
+      pendingCount: pool.pendingCount,
       excludedCount,
       qualityExcludedCount,
       recs,
+    }),
+    { status: 200, headers: { "content-type": "application/json" } },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// /api/best-of (Increment 5) — "Best of Steam": taste-agnostic, unanimously
+// excellent games at deep discount. Shares buildCandidatePool with /api/recs
+// (same library/deals loading, same lazily-fetched SteamSpy trio) but ranks
+// with src/hallOfFame.js instead of src/score.js — qualification is on
+// review volume/ratio alone, never on similarity to James's taste profile.
+// Similarity IS computed here too, but only as a secondary display field
+// (spec §4: "show similarity % as a secondary column ... without ranking on
+// it") — this reuses the same profile/idfMap buildCandidatePool already
+// built, so it's the same number /api/recs would show for the same game.
+// ---------------------------------------------------------------------------
+
+async function handleHof(request, env, ctx) {
+  if (!env.STEAM_API_KEY || !env.STEAM_ID) {
+    return jsonError(
+      "Best of Steam needs your Steam library to exclude owned games — missing STEAM_API_KEY or STEAM_ID (see .dev.vars locally). Refusing to run rather than risk recommending something you already own.",
+      500,
+    );
+  }
+  if (!env.ITAD_API_KEY) {
+    return jsonError(
+      "Missing ITAD_API_KEY — Best of Steam is computed over the deals feed, which needs it (see .dev.vars locally).",
+      500,
+    );
+  }
+
+  const url = new URL(request.url);
+  const refresh = url.searchParams.get("refresh") === "1";
+  const minCut = clampMinCut(url.searchParams.get("minCut"));
+  const windowMonthsParam = Number(url.searchParams.get("windowMonths"));
+  const windowMonths = windowMonthsParam > 0 ? windowMonthsParam : 12;
+
+  let libraryGames;
+  try {
+    libraryGames = await loadLibraryForRecs(env, ctx, refresh);
+  } catch (err) {
+    return jsonError(
+      `Best of Steam needs your Steam library to exclude owned games, but the Steam fetch failed (${err.message}). Refusing to run rather than risk recommending something you already own.`,
+      err.status || 502,
+    );
+  }
+
+  let deals;
+  try {
+    deals = await loadDealsForRecs(env, ctx, minCut, refresh);
+  } catch (err) {
+    return upstreamErrorResponse(err);
+  }
+
+  const pool = await buildCandidatePool(env, ctx, libraryGames, deals, windowMonths);
+  const hofCandidates = buildHallOfFame(pool.candidates);
+
+  const hofAppids = hofCandidates.filter((c) => c.appid != null).map((c) => c.appid);
+  const deckByAppid = await resolveDeckCompat(env, hofAppids);
+
+  const hof = hofCandidates.map((candidate) => {
+    const rawTagVector = buildTagVector(candidate.tags);
+    const tagVector = pool.idfMap ? applyIdf(rawTagVector, pool.idfMap) : rawTagVector;
+    const similarity = cosineSimilarity(pool.profile, tagVector);
+
+    const { tags, reviews, owners, ...rest } = candidate;
+    const totalReviews = (reviews?.positive || 0) + (reviews?.negative || 0);
+    const reviewPercent = totalReviews > 0 ? Math.round((reviews.positive / totalReviews) * 100) : null;
+
+    return {
+      ...rest,
+      similarity,
+      reviewPercent,
+      reviewCount: totalReviews,
+      owners,
+      tagNames: Object.keys(tags || {}),
+      batteryFriendly: batteryFriendly(tags),
+      deck: candidate.appid != null ? deckByAppid.get(candidate.appid) || DEFAULT_DECK_COMPAT : DEFAULT_DECK_COMPAT,
+    };
+  });
+
+  return new Response(
+    JSON.stringify({
+      ready: pool.ready,
+      fetched: pool.fetched,
+      total: pool.total,
+      pendingCount: pool.pendingCount,
+      hof,
     }),
     { status: 200, headers: { "content-type": "application/json" } },
   );
@@ -645,6 +843,9 @@ export default {
     }
     if (url.pathname === "/api/recs") {
       return handleRecs(request, env, ctx);
+    }
+    if (url.pathname === "/api/best-of") {
+      return handleHof(request, env, ctx);
     }
     if (url.pathname.startsWith("/api/")) {
       return jsonError("not implemented", 501);

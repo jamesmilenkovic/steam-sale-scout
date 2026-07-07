@@ -90,6 +90,40 @@
   .progress-fill { background: #2a6df5; height: 100%; }
   .progress-label { color: #666; font-size: 0.85rem; margin-top: 0.25rem; }
   .why-line { color: #444; font-size: 0.85rem; }
+  .filter-bar {
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+    margin: 1rem 0 0;
+    padding: 0.75rem;
+    background: #eef2fb;
+    border: 1px solid #d6dff2;
+    border-radius: 6px;
+  }
+  .filter-bar .filter-row {
+    display: flex;
+    align-items: center;
+    gap: 1.25rem;
+    flex-wrap: wrap;
+  }
+  .filter-bar label { display: flex; align-items: center; gap: 0.35rem; }
+  .filter-bar input[type="number"] { width: 4.5rem; }
+  .filter-hint { color: #667; font-size: 0.8rem; }
+  .chip-list { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+  .chip {
+    border: 1px solid #ccc;
+    background: #fff;
+    border-radius: 999px;
+    padding: 0.15rem 0.65rem;
+    font-size: 0.82rem;
+    cursor: pointer;
+  }
+  .chip.include { background: #2a6df5; border-color: #2a6df5; color: #fff; }
+  .chip.exclude { background: #c0392b; border-color: #c0392b; color: #fff; text-decoration: line-through; }
+  .reset-btn { margin-left: auto; }
+  .badge-deck-verified { background: #1a8a3c; color: #fff; }
+  .badge-deck-playable { background: #b7860b; color: #fff; }
+  .badge-battery { background: #2f7d6b; color: #fff; margin-left: 0.3rem; cursor: help; }
 </style>
 
 <h1>Steam Sale Scout</h1>
@@ -99,7 +133,80 @@
   <button type="button" class="tab-btn" data-tab="library" aria-selected="true">Library</button>
   <button type="button" class="tab-btn" data-tab="deals" aria-selected="false">Deals</button>
   <button type="button" class="tab-btn" data-tab="recs" aria-selected="false">Recs</button>
+  <button type="button" class="tab-btn" data-tab="hof" aria-selected="false">Best of Steam</button>
 </nav>
+
+<!--
+  Filter bar (Increment 5). One shared bar, applied to the sale tabs (Deals,
+  Recs, Best of Steam) — not Library, which is owned games with no
+  price/deal/tags in the same shape (see public/filters.js's header FLAGGED
+  note). Min discount is the pre-existing per-tab control, consolidated here
+  per spec ("existing control, moves into the bar") — it's still a SERVER
+  parameter (?minCut=) shared by all three sale tabs, not a client-only
+  filter. Every other field here is a client-side filter applied to whatever
+  the active tab already fetched, via public/filters.js's applyFilters().
+-->
+<div id="filter-bar" class="filter-bar" hidden>
+  <div class="filter-row">
+    <label>
+      Min discount (%):
+      <input type="number" id="min-cut" min="40" max="90" step="1" />
+    </label>
+    <label>
+      Max price (AUD):
+      <input type="number" id="filter-max-price" min="0" step="1" placeholder="any" />
+    </label>
+    <label>
+      Min similarity (%) <span class="filter-hint">(Recs only)</span>:
+      <input type="number" id="filter-min-similarity" min="0" max="100" step="1" placeholder="any" />
+    </label>
+    <button id="filter-reset-btn" class="reset-btn" type="button">Reset filters</button>
+  </div>
+  <div class="filter-row">
+    <label>
+      Steam Deck:
+      <select id="filter-deck-mode">
+        <option value="any">Any</option>
+        <option value="verified">Verified only</option>
+        <option value="verified+playable">Verified + Playable</option>
+      </select>
+    </label>
+    <label title="Tag-based estimate — no measured battery-life data exists for these games.">
+      <input type="checkbox" id="filter-battery-only" />
+      🔋 Battery friendly only
+    </label>
+    <label>
+      Min reviews <span class="filter-hint">(Recs + Best-of only)</span>:
+      <input type="number" id="filter-min-reviews" min="0" step="1" placeholder="default" />
+    </label>
+    <label>
+      Min quality (%) <span class="filter-hint">(Recs + Best-of only)</span>:
+      <input type="number" id="filter-min-quality" min="0" max="100" step="1" placeholder="default" />
+    </label>
+    <label>
+      Min owners <span class="filter-hint">(Recs + Best-of only)</span>:
+      <input type="number" id="filter-min-owners" min="0" step="1" placeholder="default" />
+    </label>
+  </div>
+  <div class="filter-row">
+    <span>Genre/tags (click to include, click again to exclude, once more to clear):</span>
+  </div>
+  <div class="filter-row">
+    <div id="filter-tag-chips" class="chip-list"></div>
+  </div>
+  <div class="filter-row">
+    <label>
+      Add tag filter:
+      <input type="text" id="filter-tag-search" list="filter-tag-datalist" placeholder="type a tag name" />
+    </label>
+    <datalist id="filter-tag-datalist"></datalist>
+    <select id="filter-tag-search-mode">
+      <option value="include">Include</option>
+      <option value="exclude">Exclude</option>
+    </select>
+    <button id="filter-tag-search-add" type="button">Add</button>
+  </div>
+</div>
 
 <section id="tab-library" class="tab-panel">
   <div class="controls">
@@ -134,10 +241,6 @@
 <section id="tab-deals" class="tab-panel" hidden>
   <div class="controls">
     <label>
-      Minimum discount (%):
-      <input type="number" id="min-cut" min="40" max="90" step="1" />
-    </label>
-    <label>
       Sort by:
       <select id="deals-sort">
         <option value="cut">% off</option>
@@ -157,6 +260,8 @@
         <th>Price (AUD)</th>
         <th>Regular</th>
         <th>% off</th>
+        <th>Deck</th>
+        <th>Battery</th>
         <th>Store</th>
       </tr>
     </thead>
@@ -166,10 +271,6 @@
 
 <section id="tab-recs" class="tab-panel" hidden>
   <div class="controls">
-    <label>
-      Minimum discount (%):
-      <input type="number" id="recs-min-cut" min="40" max="90" step="1" />
-    </label>
     <label>
       Recency window (months):
       <input type="number" id="recs-window-months" min="1" step="1" />
@@ -194,6 +295,8 @@
         <th>Regular</th>
         <th>% off</th>
         <th>Reviews</th>
+        <th>Deck</th>
+        <th>Battery</th>
         <th>Why</th>
         <th>Store</th>
       </tr>
@@ -202,8 +305,48 @@
   </table>
 </section>
 
+<section id="tab-hof" class="tab-panel" hidden>
+  <div class="controls">
+    <button id="hof-refresh-btn" type="button">Refresh library + deals</button>
+  </div>
+
+  <div id="hof-status" class="status">Loading…</div>
+  <div id="hof-progress-wrap" hidden>
+    <div class="progress-track">
+      <div id="hof-progress-fill" class="progress-fill" style="width: 0%"></div>
+    </div>
+    <div id="hof-progress-label" class="progress-label"></div>
+  </div>
+  <div id="hof-totals" class="totals"></div>
+  <table id="hof-table" hidden>
+    <thead>
+      <tr>
+        <th>Name</th>
+        <th>Price (AUD)</th>
+        <th>Regular</th>
+        <th>% off</th>
+        <th>Reviews</th>
+        <th>Also you?</th>
+        <th>Deck</th>
+        <th>Battery</th>
+        <th>Store</th>
+      </tr>
+    </thead>
+    <tbody id="hof-table-body"></tbody>
+  </table>
+</section>
+
 <script type="module">
   import { weight } from "./weight.js";
+  import {
+    DEFAULT_FILTERS,
+    loadFilters,
+    saveFilters,
+    resetFilters,
+    computeTopTags,
+    computeAllTagNames,
+    applyFilters,
+  } from "./filters.js";
 
   const STORAGE_KEY = "steam-sale-scout.windowMonths";
   const DEFAULT_WINDOW_MONTHS = 12;
@@ -363,17 +506,26 @@
     library: document.getElementById("tab-library"),
     deals: document.getElementById("tab-deals"),
     recs: document.getElementById("tab-recs"),
+    hof: document.getElementById("tab-hof"),
   };
   let dealsLoaded = false;
   let recsLoaded = false;
+  let hofLoaded = false;
+  let activeTab = "library";
 
   tabButtons.forEach((btn) => {
     btn.addEventListener("click", () => {
       const tab = btn.dataset.tab;
+      activeTab = tab;
       tabButtons.forEach((b) => b.setAttribute("aria-selected", String(b === btn)));
       Object.entries(tabPanels).forEach(([name, panel]) => {
         panel.hidden = name !== tab;
       });
+      // The filter bar applies to the sale tabs only (Deals/Recs/Best of
+      // Steam) — Library is owned games with no price/deal/tags in the same
+      // shape, so a discount/deck/battery/tag filter has nothing to act on
+      // there (flagged in public/filters.js's header + the handoff notes).
+      filterBarEl.hidden = tab === "library";
       if (tab === "deals" && !dealsLoaded) {
         dealsLoaded = true;
         loadDeals();
@@ -382,10 +534,217 @@
         recsLoaded = true;
         loadRecs();
       }
+      if (tab === "hof" && !hofLoaded) {
+        hofLoaded = true;
+        loadHof();
+      }
+      renderTagChips(currentTabRawItems());
     });
   });
 
-  // --- Deals (Increment 2) -------------------------------------------------
+  // --- Filter bar (Increment 5) --------------------------------------------
+  // One shared bar (see the HTML comment above #filter-bar) driving
+  // public/filters.js's pure predicates. `filters` is the persisted state;
+  // every input below updates it, saves it, and re-renders whichever sale
+  // tab is currently active — cheap, since filtering runs client-side over
+  // data already fetched. Only Min discount (the pre-existing `min-cut`
+  // control) is a SERVER parameter — changing it re-fetches.
+
+  const filterBarEl = document.getElementById("filter-bar");
+  const filterMaxPriceInput = document.getElementById("filter-max-price");
+  const filterMinSimilarityInput = document.getElementById("filter-min-similarity");
+  const filterDeckModeSelect = document.getElementById("filter-deck-mode");
+  const filterBatteryOnlyCheckbox = document.getElementById("filter-battery-only");
+  const filterMinReviewsInput = document.getElementById("filter-min-reviews");
+  const filterMinQualityInput = document.getElementById("filter-min-quality");
+  const filterMinOwnersInput = document.getElementById("filter-min-owners");
+  const filterResetBtn = document.getElementById("filter-reset-btn");
+  const filterTagChipsEl = document.getElementById("filter-tag-chips");
+  const filterTagDatalistEl = document.getElementById("filter-tag-datalist");
+  const filterTagSearchInput = document.getElementById("filter-tag-search");
+  const filterTagSearchModeSelect = document.getElementById("filter-tag-search-mode");
+  const filterTagSearchAddBtn = document.getElementById("filter-tag-search-add");
+
+  let filters = loadFilters(localStorage);
+
+  function persistFilters() {
+    saveFilters(filters, localStorage);
+  }
+
+  function applyFilterInputsToUi() {
+    filterMaxPriceInput.value = filters.maxPrice ?? "";
+    filterMinSimilarityInput.value = filters.minSimilarity || "";
+    filterDeckModeSelect.value = filters.deckMode;
+    filterBatteryOnlyCheckbox.checked = filters.batteryOnly;
+    filterMinReviewsInput.value = filters.minReviews ?? "";
+    filterMinQualityInput.value = filters.minQuality != null ? Math.round(filters.minQuality * 100) : "";
+    filterMinOwnersInput.value = filters.minOwners ?? "";
+  }
+  applyFilterInputsToUi();
+
+  /** The raw (unfiltered) items currently loaded for whichever tab is
+   * active — feeds both the chip list (candidate-pool tag frequencies) and
+   * rerenderActiveTab (re-applies filters without a server round-trip). */
+  function currentTabRawItems() {
+    if (activeTab === "deals") return deals;
+    if (activeTab === "recs") return lastRecsBody?.recs || [];
+    if (activeTab === "hof") return lastHofBody?.hof || [];
+    return [];
+  }
+
+  function rerenderActiveTab() {
+    if (activeTab === "deals" && dealsLoaded) renderDeals();
+    if (activeTab === "recs" && recsLoaded && lastRecsBody) renderRecs(lastRecsBody);
+    if (activeTab === "hof" && hofLoaded && lastHofBody) renderHof(lastHofBody);
+  }
+
+  function chipState(tagName) {
+    if (filters.includeTags.includes(tagName)) return "include";
+    if (filters.excludeTags.includes(tagName)) return "exclude";
+    return "neutral";
+  }
+
+  /** Clicking a chip cycles neutral -> include -> exclude -> neutral. */
+  function cycleTag(tagName) {
+    const state = chipState(tagName);
+    filters.includeTags = filters.includeTags.filter((t) => t !== tagName);
+    filters.excludeTags = filters.excludeTags.filter((t) => t !== tagName);
+    if (state === "neutral") filters.includeTags.push(tagName);
+    else if (state === "include") filters.excludeTags.push(tagName);
+    persistFilters();
+    renderTagChips(currentTabRawItems());
+    rerenderActiveTab();
+  }
+
+  function renderTagChips(items) {
+    const top = computeTopTags(items);
+    // Keep any already-active include/exclude tag visible as a chip even if
+    // it falls outside the current top-~30, so it stays clickable to clear.
+    const extra = [...filters.includeTags, ...filters.excludeTags].filter((t) => !top.includes(t));
+    const allChipTags = [...top, ...extra];
+
+    filterTagChipsEl.innerHTML = "";
+    allChipTags.forEach((tagName) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      const state = chipState(tagName);
+      btn.className = state === "neutral" ? "chip" : `chip ${state}`;
+      btn.textContent = tagName;
+      btn.addEventListener("click", () => cycleTag(tagName));
+      filterTagChipsEl.appendChild(btn);
+    });
+
+    filterTagDatalistEl.innerHTML = "";
+    computeAllTagNames(items).forEach((name) => {
+      const option = document.createElement("option");
+      option.value = name;
+      filterTagDatalistEl.appendChild(option);
+    });
+  }
+
+  filterMaxPriceInput.addEventListener("change", () => {
+    const raw = filterMaxPriceInput.value;
+    const value = Number(raw);
+    filters.maxPrice = raw === "" || !(value >= 0) ? null : value;
+    persistFilters();
+    rerenderActiveTab();
+  });
+
+  filterMinSimilarityInput.addEventListener("change", () => {
+    const raw = filterMinSimilarityInput.value;
+    const value = Number(raw);
+    filters.minSimilarity = raw === "" || !(value >= 0) ? 0 : value;
+    persistFilters();
+    rerenderActiveTab();
+  });
+
+  filterDeckModeSelect.addEventListener("change", () => {
+    filters.deckMode = filterDeckModeSelect.value;
+    persistFilters();
+    rerenderActiveTab();
+  });
+
+  filterBatteryOnlyCheckbox.addEventListener("change", () => {
+    filters.batteryOnly = filterBatteryOnlyCheckbox.checked;
+    persistFilters();
+    rerenderActiveTab();
+  });
+
+  filterMinReviewsInput.addEventListener("change", () => {
+    const raw = filterMinReviewsInput.value;
+    const value = Number(raw);
+    filters.minReviews = raw === "" || !(value >= 0) ? null : value;
+    persistFilters();
+    rerenderActiveTab();
+  });
+
+  filterMinQualityInput.addEventListener("change", () => {
+    const raw = filterMinQualityInput.value;
+    const value = Number(raw);
+    filters.minQuality = raw === "" || !(value >= 0) ? null : value / 100;
+    persistFilters();
+    rerenderActiveTab();
+  });
+
+  filterMinOwnersInput.addEventListener("change", () => {
+    const raw = filterMinOwnersInput.value;
+    const value = Number(raw);
+    filters.minOwners = raw === "" || !(value >= 0) ? null : value;
+    persistFilters();
+    rerenderActiveTab();
+  });
+
+  filterResetBtn.addEventListener("click", () => {
+    filters = resetFilters(localStorage);
+    applyFilterInputsToUi();
+    renderTagChips(currentTabRawItems());
+    rerenderActiveTab();
+  });
+
+  filterTagSearchAddBtn.addEventListener("click", () => {
+    const name = filterTagSearchInput.value.trim();
+    if (!name) return;
+    const mode = filterTagSearchModeSelect.value;
+    filters.includeTags = filters.includeTags.filter((t) => t !== name);
+    filters.excludeTags = filters.excludeTags.filter((t) => t !== name);
+    if (mode === "include") filters.includeTags.push(name);
+    else filters.excludeTags.push(name);
+    filterTagSearchInput.value = "";
+    persistFilters();
+    renderTagChips(currentTabRawItems());
+    rerenderActiveTab();
+  });
+
+  /** Deck badge: ✅ Verified / 🟡 Playable / nothing for Unknown/Unsupported
+   * (spec §2). `deck` is the {deck, os, frame} shape from src/deckCompat.js —
+   * only the `deck` (handheld) category gets a badge here. */
+  function appendDeckBadge(td, deck) {
+    const category = deck?.deck ?? 0;
+    if (category === 3) {
+      const span = document.createElement("span");
+      span.className = "badge badge-deck-verified";
+      span.textContent = "✅ Verified";
+      td.appendChild(span);
+    } else if (category === 2) {
+      const span = document.createElement("span");
+      span.className = "badge badge-deck-playable";
+      span.textContent = "🟡 Playable";
+      td.appendChild(span);
+    }
+  }
+
+  /** Battery badge — honest tooltip per spec §3: this is a tag-based
+   * estimate, not measured data (no such data source exists). */
+  function appendBatteryBadge(td, item) {
+    if (!item.batteryFriendly) return;
+    const span = document.createElement("span");
+    span.className = "badge badge-battery";
+    span.textContent = "🔋";
+    span.title = "Tag-based estimate — no measured battery-life data exists for this game.";
+    td.appendChild(span);
+  }
+
+  // --- Deals (Increment 2, filters/deck/battery added Increment 5) --------
 
   const MIN_CUT_STORAGE_KEY = "steam-sale-scout.minCut";
   const DEFAULT_MIN_CUT = 60;
@@ -396,7 +755,7 @@
   const dealsTotalsEl = document.getElementById("deals-totals");
   const dealsTableEl = document.getElementById("deals-table");
   const dealsTableBodyEl = document.getElementById("deals-table-body");
-  const minCutInput = document.getElementById("min-cut");
+  const minCutInput = document.getElementById("min-cut"); // now lives in the shared filter bar
   const dealsSortSelect = document.getElementById("deals-sort");
   const dealsRefreshBtn = document.getElementById("deals-refresh-btn");
 
@@ -411,8 +770,10 @@
   minCutInput.value = loadMinCut();
 
   function renderDeals() {
+    const filtered = applyFilters(deals, filters);
+
     const sortBy = dealsSortSelect.value;
-    const sorted = [...deals];
+    const sorted = [...filtered];
     if (sortBy === "price") {
       sorted.sort((a, b) => (a.price ?? Infinity) - (b.price ?? Infinity));
     } else if (sortBy === "title") {
@@ -458,6 +819,14 @@
       }
       tr.appendChild(cutTd);
 
+      const deckTd = document.createElement("td");
+      appendDeckBadge(deckTd, deal.deck);
+      tr.appendChild(deckTd);
+
+      const batteryTd = document.createElement("td");
+      appendBatteryBadge(batteryTd, deal);
+      tr.appendChild(batteryTd);
+
       const storeTd = document.createElement("td");
       if (deal.appid) {
         const a = document.createElement("a");
@@ -472,8 +841,10 @@
       dealsTableBodyEl.appendChild(tr);
     });
 
-    const atLowCount = deals.filter((d) => d.atHistoricalLow).length;
-    dealsTotalsEl.textContent = `${deals.length} deals at ≥${minCutInput.value}% off · ${atLowCount} at historical low`;
+    const atLowCount = filtered.filter((d) => d.atHistoricalLow).length;
+    dealsTotalsEl.textContent =
+      `${filtered.length} of ${deals.length} deals at ≥${minCutInput.value}% off shown ` +
+      `(filters applied) · ${atLowCount} at historical low`;
 
     dealsTableEl.hidden = false;
   }
@@ -497,10 +868,21 @@
       deals = body.deals || [];
       dealsStatusEl.hidden = true;
       renderDeals();
+      if (activeTab === "deals") renderTagChips(currentTabRawItems());
     } catch (err) {
       dealsStatusEl.textContent = err.message;
       dealsStatusEl.className = "status error";
     }
+  }
+
+  /** Reloads whichever sale tabs have already been visited/loaded — the
+   * min-discount control is now shared across all three (Increment 5), so
+   * changing it should refresh every tab it affects, not just the one
+   * that's currently active. */
+  function reloadLoadedSaleTabs() {
+    if (dealsLoaded) loadDeals();
+    if (recsLoaded) loadRecs();
+    if (hofLoaded) loadHof();
   }
 
   minCutInput.addEventListener("change", () => {
@@ -508,18 +890,18 @@
     if (!(value >= MIN_CUT_MIN && value <= MIN_CUT_MAX)) value = DEFAULT_MIN_CUT;
     minCutInput.value = value;
     localStorage.setItem(MIN_CUT_STORAGE_KEY, String(value));
-    loadDeals();
+    reloadLoadedSaleTabs();
   });
 
   dealsSortSelect.addEventListener("change", renderDeals);
 
   dealsRefreshBtn.addEventListener("click", () => loadDeals(true));
 
-  // --- Recs (Increment 3) --------------------------------------------------
-  // Reuses the same min-discount control/storage as the Deals tab, and the
-  // same recency-window control/storage as the Library tab — changing
-  // either here recomputes the profile server-side via a fresh /api/recs
-  // request. Polls while the SteamSpy tag cache is still building
+  // --- Recs (Increment 3; filters/deck/battery added Increment 5) ---------
+  // Reuses the shared min-discount control/storage (now in the filter bar)
+  // and the same recency-window control/storage as the Library tab —
+  // changing either recomputes the profile server-side via a fresh
+  // /api/recs request. Polls while the SteamSpy tag cache is still building
   // (ready:false), stops once ready.
 
   const RECS_POLL_MS = 2000;
@@ -531,17 +913,20 @@
   const recsTotalsEl = document.getElementById("recs-totals");
   const recsTableEl = document.getElementById("recs-table");
   const recsTableBodyEl = document.getElementById("recs-table-body");
-  const recsMinCutInput = document.getElementById("recs-min-cut");
   const recsWindowInput = document.getElementById("recs-window-months");
   const recsRefreshBtn = document.getElementById("recs-refresh-btn");
 
-  recsMinCutInput.value = loadMinCut();
   recsWindowInput.value = loadWindowMonths();
 
   let recsPollTimer = null;
+  let lastRecsBody = null;
 
   function renderRecs(body) {
-    const recs = body.recs || [];
+    lastRecsBody = body;
+    const recs = applyFilters(body.recs || [], filters, {
+      includeSimilarity: true,
+      includeQualityFloors: true,
+    });
 
     recsTableBodyEl.innerHTML = "";
     recs.forEach((rec) => {
@@ -589,6 +974,14 @@
       }
       tr.appendChild(reviewsTd);
 
+      const deckTd = document.createElement("td");
+      appendDeckBadge(deckTd, rec.deck);
+      tr.appendChild(deckTd);
+
+      const batteryTd = document.createElement("td");
+      appendBatteryBadge(batteryTd, rec);
+      tr.appendChild(batteryTd);
+
       const whyTd = document.createElement("td");
       whyTd.className = "why-line";
       whyTd.textContent = rec.why || "—";
@@ -609,7 +1002,7 @@
     });
 
     recsTotalsEl.textContent =
-      `${recs.length} recs · ${body.pendingCount ?? 0} pending · ` +
+      `${recs.length} of ${(body.recs || []).length} recs shown (filters applied) · ${body.pendingCount ?? 0} pending · ` +
       `${body.excludedCount ?? 0} tagless · ${body.qualityExcludedCount ?? 0} below quality floor`;
     recsTableEl.hidden = false;
 
@@ -649,6 +1042,7 @@
       }
       recsStatusEl.hidden = true;
       renderRecs(body);
+      if (activeTab === "recs") renderTagChips(currentTabRawItems());
       if (!body.ready) {
         recsPollTimer = setTimeout(() => loadRecs(false), RECS_POLL_MS);
       }
@@ -659,14 +1053,6 @@
     }
   }
 
-  recsMinCutInput.addEventListener("change", () => {
-    let value = Number(recsMinCutInput.value);
-    if (!(value >= MIN_CUT_MIN && value <= MIN_CUT_MAX)) value = DEFAULT_MIN_CUT;
-    recsMinCutInput.value = value;
-    localStorage.setItem(MIN_CUT_STORAGE_KEY, String(value));
-    loadRecs();
-  });
-
   recsWindowInput.addEventListener("change", () => {
     const raw = Number(recsWindowInput.value);
     const value = raw > 0 ? raw : DEFAULT_WINDOW_MONTHS;
@@ -676,4 +1062,151 @@
   });
 
   recsRefreshBtn.addEventListener("click", () => loadRecs(true));
+
+  // --- Best of Steam (Increment 5) -----------------------------------------
+  // Taste-agnostic Hall of Fame: same deals pool + polling shape as Recs,
+  // ranked instead by src/hallOfFame.js (discount depth x Wilson quality).
+  // Similarity is shown as a secondary "Also you?" column only — never
+  // filtered on by minSimilarity (Recs-only) and never sorted on client-side.
+
+  const HOF_POLL_MS = 2000;
+
+  const hofStatusEl = document.getElementById("hof-status");
+  const hofProgressWrapEl = document.getElementById("hof-progress-wrap");
+  const hofProgressFillEl = document.getElementById("hof-progress-fill");
+  const hofProgressLabelEl = document.getElementById("hof-progress-label");
+  const hofTotalsEl = document.getElementById("hof-totals");
+  const hofTableEl = document.getElementById("hof-table");
+  const hofTableBodyEl = document.getElementById("hof-table-body");
+  const hofRefreshBtn = document.getElementById("hof-refresh-btn");
+
+  let hofPollTimer = null;
+  let lastHofBody = null;
+
+  function renderHof(body) {
+    lastHofBody = body;
+    // Best of Steam's own ranking already reflects discount x quality — no
+    // minSimilarity here (that filter is Recs-only per spec).
+    const hof = applyFilters(body.hof || [], filters, { includeQualityFloors: true });
+
+    hofTableBodyEl.innerHTML = "";
+    hof.forEach((entry) => {
+      const tr = document.createElement("tr");
+
+      const nameTd = document.createElement("td");
+      nameTd.textContent = entry.title || "(untitled)";
+      tr.appendChild(nameTd);
+
+      const priceTd = document.createElement("td");
+      priceTd.textContent = entry.price != null ? `$${entry.price.toFixed(2)}` : "—";
+      tr.appendChild(priceTd);
+
+      const regularTd = document.createElement("td");
+      if (entry.regular != null) {
+        const s = document.createElement("s");
+        s.className = "regular-price";
+        s.textContent = `$${entry.regular.toFixed(2)}`;
+        regularTd.appendChild(s);
+      }
+      tr.appendChild(regularTd);
+
+      const cutTd = document.createElement("td");
+      const cutBadge = document.createElement("span");
+      cutBadge.className = "badge badge-cut";
+      cutBadge.textContent = `-${entry.cut}%`;
+      cutTd.appendChild(cutBadge);
+      if (entry.atHistoricalLow) {
+        const lowBadge = document.createElement("span");
+        lowBadge.className = "badge badge-low";
+        lowBadge.textContent = "HISTORICAL LOW";
+        cutTd.appendChild(lowBadge);
+      }
+      tr.appendChild(cutTd);
+
+      const reviewsTd = document.createElement("td");
+      reviewsTd.textContent =
+        entry.reviewCount > 0 ? `${entry.reviewPercent}% · ${entry.reviewCount.toLocaleString()}` : "—";
+      if (entry.owners > 0) {
+        reviewsTd.title = `~${entry.owners.toLocaleString()} owners`;
+      }
+      tr.appendChild(reviewsTd);
+
+      const alsoYouTd = document.createElement("td");
+      alsoYouTd.textContent = `it's also ${Math.round((entry.similarity || 0) * 100)}% you`;
+      tr.appendChild(alsoYouTd);
+
+      const deckTd = document.createElement("td");
+      appendDeckBadge(deckTd, entry.deck);
+      tr.appendChild(deckTd);
+
+      const batteryTd = document.createElement("td");
+      appendBatteryBadge(batteryTd, entry);
+      tr.appendChild(batteryTd);
+
+      const storeTd = document.createElement("td");
+      if (entry.appid) {
+        const a = document.createElement("a");
+        a.href = `https://store.steampowered.com/app/${entry.appid}`;
+        a.target = "_blank";
+        a.rel = "noopener";
+        a.textContent = "Steam";
+        storeTd.appendChild(a);
+      }
+      tr.appendChild(storeTd);
+
+      hofTableBodyEl.appendChild(tr);
+    });
+
+    hofTotalsEl.textContent =
+      `${hof.length} of ${(body.hof || []).length} Best-of-Steam picks shown (filters applied) · ${body.pendingCount ?? 0} pending`;
+    hofTableEl.hidden = false;
+
+    if (body.ready) {
+      hofProgressWrapEl.hidden = true;
+    } else {
+      hofProgressWrapEl.hidden = false;
+      const pct = body.total > 0 ? Math.round((body.fetched / body.total) * 100) : 0;
+      hofProgressFillEl.style.width = `${pct}%`;
+      hofProgressLabelEl.textContent = `Building tag cache: ${body.fetched}/${body.total} games (${pct}%) — picks fill in as it goes`;
+    }
+  }
+
+  function stopHofPoll() {
+    if (hofPollTimer) {
+      clearTimeout(hofPollTimer);
+      hofPollTimer = null;
+    }
+  }
+
+  async function loadHof(refresh = false) {
+    stopHofPoll();
+    hofStatusEl.textContent = "Loading…";
+    hofStatusEl.hidden = false;
+    hofStatusEl.className = "status";
+
+    const minCut = loadMinCut();
+    const windowMonths = loadWindowMonths();
+    const params = new URLSearchParams({ minCut: String(minCut), windowMonths: String(windowMonths) });
+    if (refresh) params.set("refresh", "1");
+
+    try {
+      const res = await fetch(`/api/best-of?${params}`);
+      const body = await res.json();
+      if (!res.ok) {
+        throw new Error(body.error || `Request failed with status ${res.status}`);
+      }
+      hofStatusEl.hidden = true;
+      renderHof(body);
+      if (activeTab === "hof") renderTagChips(currentTabRawItems());
+      if (!body.ready) {
+        hofPollTimer = setTimeout(() => loadHof(false), HOF_POLL_MS);
+      }
+    } catch (err) {
+      hofStatusEl.textContent = err.message;
+      hofStatusEl.className = "status error";
+      hofProgressWrapEl.hidden = true;
+    }
+  }
+
+  hofRefreshBtn.addEventListener("click", () => loadHof(true));
 </script>

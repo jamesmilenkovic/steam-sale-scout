@@ -14,9 +14,23 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import worker from "../src/worker.js";
+import { __setSpyMinIntervalMsForTests, __resetSpyQueueForTests } from "../src/spyQueue.js";
 
 const originalFetch = globalThis.fetch;
 const originalCaches = globalThis.caches;
+
+// Increment 5: /api/deals now also enriches each deal with SteamSpy
+// tags/battery (lazy, KV-only — see src/worker.js's enrichDeals) and Steam
+// Deck compat (a batched, KV-cached GetItems fetch — see src/deckCompat.js).
+// Both need a TAG_CACHE binding on env (added to makeEnv() below); the
+// SteamSpy half also shares the same background queue /api/recs drives, so
+// tests shrink its pacing to 0ms the same way test/worker-recs.test.mjs
+// does, to avoid real per-appid 1-second waits when a test's deals carry
+// many candidate appids.
+test.beforeEach(() => {
+  __setSpyMinIntervalMsForTests(0);
+  __resetSpyQueueForTests();
+});
 
 function restoreGlobals() {
   globalThis.fetch = originalFetch;
@@ -52,9 +66,30 @@ function makeCtx() {
   };
 }
 
+/** Minimal in-memory stand-in for a Workers KV namespace binding, mirroring
+ * test/worker-recs.test.mjs's makeMockKv() — needed since Increment 5's
+ * /api/deals enrichment reads/writes TAG_CACHE (SteamSpy tag lookups +
+ * Steam Deck compat cache). */
+function makeMockKv() {
+  const store = new Map();
+  const ttlByKey = new Map();
+  return {
+    store,
+    ttlByKey,
+    async get(key) {
+      return store.has(key) ? store.get(key) : null;
+    },
+    async put(key, value, opts) {
+      store.set(key, value);
+      ttlByKey.set(key, opts?.expirationTtl);
+    },
+  };
+}
+
 function makeEnv(overrides = {}) {
   return {
     ITAD_API_KEY: "test-itad-key",
+    TAG_CACHE: makeMockKv(),
     ASSETS: { fetch: async () => new Response("not found", { status: 404 }) },
     ...overrides,
   };
@@ -124,8 +159,33 @@ function rawDeal(id, title, cut, priceAmount) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Increment 5 enrichment: tagNames/batteryFriendly/deck, keyed off
+// TAG_CACHE (v2:spytag:<appid> for SteamSpy, deck:<appid> for Deck compat).
+// Mirrors test/worker-hof.test.mjs's v2Key/deckKey helpers.
+// ---------------------------------------------------------------------------
+
+function v2Key(appid) {
+  return `v2:spytag:${appid}`;
+}
+
+function deckKey(appid) {
+  return `deck:${appid}`;
+}
+
+function goodSpyEntry(overrides = {}) {
+  return {
+    tags: { Roguelike: 10 },
+    median: 300,
+    reviews: { positive: 90, negative: 10 },
+    owners: 75000,
+    ...overrides,
+  };
+}
+
 test.afterEach(() => {
   restoreGlobals();
+  __setSpyMinIntervalMsForTests(1000);
 });
 
 // ---------------------------------------------------------------------------
@@ -418,4 +478,119 @@ test("pagination: stops early (no second page fetched) once a full page's last i
   const body = await res.json();
   // 199 deals at cut=80 kept, the 1 at cut=50 filtered out by filterByMinCut.
   assert.equal(body.deals.length, 199);
+});
+
+// ---------------------------------------------------------------------------
+// Increment 5: /api/deals enrichment (tagNames, batteryFriendly, deck) and
+// the cache-control regression lock (reviewer issue #2).
+// ---------------------------------------------------------------------------
+
+test("a deal with a known appid gets deck populated from a primed deck-cache KV entry", async () => {
+  const dealKnown = rawDeal("itad-deck", "Deck-checked Game", 75, 9.99);
+
+  globalThis.fetch = makeItadFetch({
+    dealsPagesByOffset: { 0: { list: [dealKnown], hasMore: false } },
+    appIdsById: { "itad-deck": ["app/440"] },
+  });
+  globalThis.caches = { default: makeMockCache() };
+
+  const env = makeEnv();
+  // Prime the deck-cache KV entry directly — resolveDeckCompat should read
+  // this cached entry rather than hitting GetItems (no GetItems mock wired
+  // into makeItadFetch's router, so any live call here would throw and fail
+  // the test).
+  env.TAG_CACHE.store.set(deckKey(440), JSON.stringify({ deck: 3, os: 2, frame: 0 }));
+
+  const ctx = makeCtx();
+  const res = await worker.fetch(new Request("https://x/api/deals"), env, ctx);
+  await ctx.flush();
+
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.deals.length, 1);
+  const enriched = body.deals[0];
+  assert.equal(enriched.appid, 440);
+  assert.deepEqual(enriched.deck, { deck: 3, os: 2, frame: 0 });
+  // The badge-relevant category (deckBadge(3) === "verified") is carried
+  // through on the `deck.deck` field, not dropped/renamed.
+  assert.equal(enriched.deck.deck, 3);
+});
+
+test("tagNames and batteryFriendly are present on enriched deals", async () => {
+  const dealTagged = rawDeal("itad-tags", "Tagged Game", 70, 4.99);
+
+  globalThis.fetch = makeItadFetch({
+    dealsPagesByOffset: { 0: { list: [dealTagged], hasMore: false } },
+    appIdsById: { "itad-tags": ["app/555"] },
+  });
+  globalThis.caches = { default: makeMockCache() };
+
+  const env = makeEnv();
+  // Prime both the SteamSpy tag cache (drives tagNames/batteryFriendly) and
+  // the deck cache (so this test doesn't also need a GetItems mock).
+  env.TAG_CACHE.store.set(
+    v2Key(555),
+    JSON.stringify(goodSpyEntry({ tags: { Puzzle: 40, "2D": 20 } })),
+  );
+  env.TAG_CACHE.store.set(deckKey(555), JSON.stringify({ deck: 0, os: 0, frame: 0 }));
+
+  const ctx = makeCtx();
+  const res = await worker.fetch(new Request("https://x/api/deals"), env, ctx);
+  await ctx.flush();
+
+  const body = await res.json();
+  assert.equal(body.deals.length, 1);
+  const enriched = body.deals[0];
+  assert.deepEqual(enriched.tagNames.sort(), ["2D", "Puzzle"]);
+  assert.equal(typeof enriched.batteryFriendly, "boolean");
+  // Puzzle + 2D are both LOW_POWER tags with no HIGH_POWER hit -> true.
+  assert.equal(enriched.batteryFriendly, true);
+});
+
+test("a deal with appid == null is handled cleanly: no deck fetch, no crash", async () => {
+  const dealNoAppid = rawDeal("itad-noapp-enrich", "Bundle-only Deal", 70, 5.0);
+
+  let getItemsCalls = 0;
+  globalThis.fetch = async (url, options = {}) => {
+    const u = new URL(url);
+    if (u.hostname === "api.steampowered.com") {
+      getItemsCalls++;
+      throw new Error("GetItems should never be called for a null-appid deal");
+    }
+    return makeItadFetch({
+      dealsPagesByOffset: { 0: { list: [dealNoAppid], hasMore: false } },
+      appIdsById: { "itad-noapp-enrich": ["bundle/12"] }, // no app/ entry -> appid=null
+    })(url, options);
+  };
+  globalThis.caches = { default: makeMockCache() };
+
+  const env = makeEnv();
+  const ctx = makeCtx();
+  const res = await worker.fetch(new Request("https://x/api/deals"), env, ctx);
+  await ctx.flush();
+
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.deals.length, 1);
+  const enriched = body.deals[0];
+  assert.equal(enriched.appid, null);
+  assert.deepEqual(enriched.tagNames, []);
+  assert.equal(enriched.batteryFriendly, false);
+  assert.deepEqual(enriched.deck, { deck: 0, os: 0, frame: 0 });
+  assert.equal(getItemsCalls, 0, "a null-appid deal must never trigger a Deck compat fetch");
+});
+
+test("/api/deals response carries the restored cache-control: public, max-age=21600 header", async () => {
+  globalThis.fetch = makeItadFetch({
+    dealsPagesByOffset: { 0: { list: [], hasMore: false } },
+  });
+  globalThis.caches = { default: makeMockCache() };
+
+  const env = makeEnv();
+  const ctx = makeCtx();
+  const res = await worker.fetch(new Request("https://x/api/deals"), env, ctx);
+  await ctx.flush();
+
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get("cache-control"), "public, max-age=21600");
 });

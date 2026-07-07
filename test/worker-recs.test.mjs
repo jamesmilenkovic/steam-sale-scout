@@ -326,6 +326,11 @@ test("warm run (everything already cached): ready:true, fetched===total, recs po
     v2Key(candidateAppid),
     JSON.stringify(goodSpyEntry({ tags: { Roguelike: 80, Deckbuilder: 40 }, median: 600, owners: 120000 })),
   );
+  // Increment 5: /api/recs also resolves Steam Deck compat for whatever
+  // makes it into `recs` (src/deckCompat.js's resolveDeckCompat). Priming
+  // this KV entry keeps this test's "no SteamSpy calls on a fully warm
+  // cache" guarantee — and the whole request — free of any live fetch.
+  env.TAG_CACHE.store.set(`deck:${candidateAppid}`, JSON.stringify({ deck: 3, os: 3, frame: 0 }));
 
   const ctx = makeCtx();
   const res = await worker.fetch(new Request("https://x/api/recs"), env, ctx);
@@ -347,6 +352,12 @@ test("warm run (everything already cached): ready:true, fetched===total, recs po
   assert.equal("tags" in body.recs[0], false);
   assert.equal("tagVector" in body.recs[0], false);
   assert.equal("reviews" in body.recs[0], false);
+  // Increment 5 fields: raw tag names (not the vote-weighted `tags` object,
+  // which stays stripped above), the battery heuristic, and the Deck badge
+  // data primed just above.
+  assert.deepEqual(body.recs[0].tagNames.sort(), ["Deckbuilder", "Roguelike"]);
+  assert.equal(typeof body.recs[0].batteryFriendly, "boolean");
+  assert.deepEqual(body.recs[0].deck, { deck: 3, os: 3, frame: 0 });
   assert.equal(steamSpyCalls, 0);
 });
 
@@ -398,6 +409,11 @@ test("candidates that clear the tag/similarity bar but fail a quality floor are 
   env.TAG_CACHE.store.set(v2Key(200), JSON.stringify(goodSpyEntry()));
   // appid 201 has usable tags but far too few owners — floored, not tagless.
   env.TAG_CACHE.store.set(v2Key(201), JSON.stringify(goodSpyEntry({ owners: 100 })));
+  // This test sets no globalThis.fetch mock at all (nothing above should
+  // ever need one) — prime appid 200's Deck compat cache too, so /api/recs
+  // resolving deck data for the one rec that survives doesn't attempt a
+  // real network call.
+  env.TAG_CACHE.store.set("deck:200", JSON.stringify({ deck: 0, os: 0, frame: 0 }));
 
   const ctx = makeCtx();
   const res = await worker.fetch(new Request("https://x/api/recs"), env, ctx);

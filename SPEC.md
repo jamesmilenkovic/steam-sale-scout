@@ -1,89 +1,89 @@
-# Increment 4 — Quality metrics + smarter similarity (kill the shovelware)
+# Increment 5 — Filters, Steam Deck signals + "Best of Steam" lane
 
-**Project:** Steam Sale Scout · **Phase 1 gate response — gate stays open until this passes**
+**Project:** Steam Sale Scout · **Phase 2, slice 1** (⛩ Phase 1 gate PASSED 2026-07-07 after inc 4)
 **PRD:** `PRDs/2-in-progress/2026-07-04-steam-sale-recommender.md`
-**Base:** `main` @ `a79a426` (inc 3) · **Status:** Build-ready (scoped 2026-07-06)
+**Base:** `main` @ inc-4 result · **Status:** Build-ready (scoped 2026-07-07)
 
-## Why (James's ⛩ gate verdict, 2026-07-06)
+## Why (James's post-gate asks, 2026-07-07)
 
-Recs work but **shovelware ranks high**. Two confirmed drivers (inc-3 save-down
-called both): (1) the 0.75 neutral quality default means near-reviewless junk
-pays no penalty; (2) generic tags (Action/Adventure/Strategy) create false
-similarity. Constant-tweaks alone won't fix it — this increment builds real
-quality metrics into the engine. The planned filters slice shifts to inc 5.
+Recs are now good; James wants to steer them: genre toggles, Steam Deck
+suitability (he plays on Deck), and a taste-agnostic "unanimously excellent
+games on deep discount" lane. Fun-per-minute merge is **increment 7**, not here.
 
 ## Build
 
-### 1. Quality = Wilson lower bound (replaces the clamp + neutral default)
+### 1. Filter bar (persisted, applies across tabs as marked)
 
-`quality = wilsonLowerBound(positive, negative, z=1.96)` — the lower bound of
-the 95% confidence interval on the true positive-review ratio.
+All persisted to localStorage, combinable, with a "reset filters" control:
 
-- A 92%-positive game with 12 reviews scores ~0.64; with 4,000 reviews ~0.91.
-  Thin-review shovelware **cannot** free-ride: no reviews → quality ≈ 0.
-- No clamping, no neutral default. Delete `QUALITY_NEUTRAL` /
-  `REVIEW_NEUTRAL_THRESHOLD` config.
-- `rankScore = similarity × quality × (atHistoricalLow ? LOW_BONUS : 1)` —
-  formula shape unchanged, quality term now honest.
+1. **Min discount %** (existing control, moves into the bar) — Deals + Recs + Best-of.
+2. **Max price (AUD)** — all tabs.
+3. **Min similarity %** — Recs only.
+4. **Genre/tag toggles** — include + exclude chip sets, built from the tags
+   present in the current candidate pool (top ~30 by frequency, searchable for
+   the tail). Filtering acts on raw cached tags (IDF is a scoring concern, not
+   a filtering one). All tabs.
+5. **Quality floors user-facing** — min reviews / min quality / min owners
+   move from config-only to advanced controls (defaults unchanged). Recs +
+   Best-of.
+6. **☑ Steam Deck: Verified only / Verified+Playable** (see §2) — all tabs.
+7. **☑ Battery friendly** (see §3) — all tabs.
 
-### 2. Hard quality floors (config, applied before ranking)
+### 2. Steam Deck compatibility (new data, the only new fetch)
 
-- `MIN_REVIEWS` default **50** total reviews.
-- `MIN_QUALITY` default **0.70** Wilson score (≈ "clearly well-reviewed").
-- `MIN_OWNERS` default **5,000** (SteamSpy owners-range midpoint) — shovelware
-  rarely clears it; genuinely obscure gems on deep sale usually do.
-- Floored-out candidates → `qualityExcludedCount`, surfaced in the UI footnote
-  (distinct from tagless/pending), so we can see what the floors are eating.
+- **Source:** `IStoreBrowseService/GetItems` (api.steampowered.com, anonymous,
+  batch `ids` via `input_json`) with platform info → deck compat category.
+  **Verify field name/shape live at build time** — research flags: (a) exact
+  field (`steam_deck_compat_category` per protobuf dumps) unconfirmed; (b) the
+  Verified program split per-device in 2026 (Deck / Machine / Frame) so **store
+  per-device**: `{deck: 0-3}` minimum, keep others if present.
+- Fallback if GetItems doesn't carry it: per-app
+  `store.steampowered.com/saleaction/ajaxgetdeckappcompatibilityreport?nAppID=`
+  at ≤1 req/sec through the existing queue pattern.
+- Cache: KV alongside the SteamSpy trio (own key prefix, 30d TTL). Batch-fetch
+  for candidates only (not the owned library).
+- UI: badge per row — ✅ Verified / 🟡 Playable / (nothing for
+  unsupported/unknown), on Deals + Recs + Best-of.
 
-### 3. IDF tag weighting (fixes generic-tag similarity properly)
+### 3. Battery-friendly heuristic (no reliable data source exists — be honest)
 
-- Compute document frequency per tag across the working corpus (cached tag sets:
-  top-200 owned + current candidates); `idf(tag) = ln(N / df)`.
-- Apply `idf` to tag values in **both** profile and candidate vectors before
-  normalisation/cosine. "Action" (in everything) → near-zero weight;
-  "Roguelike Deckbuilder" → high weight. The principled fix — the stoplist
-  stays only as a small backstop (keep current entries, expect to shrink it).
-- Recompute IDF per recs run (cheap — it's a count over cached data).
-- Why-lines automatically improve: contributions are now IDF-weighted, so the
-  named tags become the distinctive ones.
+- **There is no official battery-per-game data.** Community DeckSettings API is
+  the only structured source (coverage unknown) — **backlog, not this
+  increment**. Ship a **tag heuristic**:
+  `batteryFriendly(tags)` = true when the game's top tags hit the LOW_POWER
+  list (config: `2D, Pixel Graphics, Turn-Based Strategy, Turn-Based Tactics,
+  Card Game, Card Battler, Visual Novel, Puzzle, Point & Click, Roguelike
+  Deckbuilder, Board Game`) and miss the HIGH_POWER list (config: `Open World,
+  Realistic, Photorealistic, Racing, VR, MMORPG`).
+- UI: 🔋 badge + the filter toggle; tooltip states plainly it's a tag-based
+  estimate, not measured data.
 
-### 4. Cache schema: add `owners` to the SteamSpy trio
+### 4. "Best of Steam" lane (fourth tab)
 
-- Trimmed entry becomes `{tags, median, reviews, owners}` — **bump the KV cache
-  version** (`TAG_CACHE` key prefix `v2:`); old entries lazily refetched, which
-  means one more cold crawl (~20 min, overnight-friendly). Same-call data, no
-  new requests.
+Taste-agnostic: **unanimously excellent games at deep discount**, even outside
+James's wheelhouse.
 
-### 5. Small fixes pulled in from the inc-3 save-down flags
-
-- **Failure-TTL split (flag 4):** network/5xx errors cached 1h, genuine
-  empty/no-tags responses keep 24h `null` — a SteamSpy blip can no longer
-  strand good games for a day.
-- **`pendingCount` split (flag 3):** separate "not yet fetched" from
-  "permanently tagless" in the API response + UI footnote.
-
-### 6. UI (Recs tab)
-
-- Each rec row adds: **review % + count** (e.g. "94% · 12,410") and an owners
-  bracket on hover/small text — so quality is eyeballable at the gate.
-- Footnote now itemises: pending / tagless / below-quality-floor counts.
-- No new controls (floors are config this increment; they become user-facing
-  filters in inc 5 alongside price/similarity/genre).
+- Candidates from the same deals pool (owned still excluded), qualifying on
+  config thresholds: `HOF_MIN_REVIEWS = 10,000` total + `HOF_MIN_RATIO = 0.95`
+  positive (≈ Overwhelmingly Positive tier).
+- Sort: discount depth × Wilson quality (config-weighted); historical-low
+  badge; show similarity % as a secondary column ("it's also 74% you") without
+  ranking on it.
+- No new data — reviews/owners are already in the v2 trio.
 
 ## Out of scope
 
-Inc-5 filters (price cap, min-similarity, genre — floors become user-facing
-there), wishlist lane, dismissals, LLM re-rank, external quality sources
-(Metacritic/SteamDB ratings — Wilson on Steam reviews should suffice; revisit
-only if the gate still fails).
+Wishlist lane (inc 6), fun-per-minute / HLTB (inc 7), DeckSettings battery API
+(backlog), dismissals + recency-window-in-bar (inc 8), any deploy.
 
 ## Testing
 
-- Unit: Wilson bound (known values, 0-review, extreme n), floors incl.
-  owners-midpoint parsing ("10,000 .. 20,000" strings), IDF (uniform tag →
-  ~0 weight; unique tag → max; N=1 corpus edge), v2 cache versioning + lazy
-  refetch, error-vs-empty TTLs, pending/tagless/floored count separation.
-- Regression: inc-3 suites stay green (update fixtures for the v2 trio).
-- Manual acceptance = **⛩ Phase 1 gate, take 2 (James):** rebuild cache, then
-  the top-20 test again — shovelware gone, hidden gems intact. If floors are
-  eating good games, tune `MIN_*` config in-loop before touching the engine.
+- Unit: each filter predicate + combinations, persistence round-trip, deck
+  category parsing incl. per-device shape + missing-field fallback, battery
+  heuristic (both lists, edge: no tags), HoF qualification + ordering, badge
+  render logic.
+- Regression: inc 1–4 suites green.
+- Manual acceptance (James): filter bar steers Recs sensibly; Deck badges match
+  a spot-check against the store page (3–4 known games, e.g. one Verified, one
+  Playable, one Unsupported); Best-of tab surfaces recognisable all-timers at
+  real discounts; battery toggle behaves plausibly.
