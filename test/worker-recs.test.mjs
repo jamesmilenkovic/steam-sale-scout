@@ -1,4 +1,4 @@
-// Tests for src/worker.js — the /api/recs route (Increment 3), with a
+// Tests for src/worker.js — the /api/recs route (Increments 3 and 4), with a
 // MOCKED ITAD/SteamSpy upstream, mocked Steam library cache, and a mocked
 // KV namespace standing in for TAG_CACHE.
 //
@@ -15,6 +15,14 @@
 // module as a potential handler — plain constants/functions exported
 // straight from worker.js crash `wrangler dev` at boot (confirmed live; see
 // src/spyQueue.js's header comment).
+//
+// Increment 4 note: cached SteamSpy trios are now `{tags, median, reviews,
+// owners}` under a `v2:spytag:` KV key (bumped from `spytag:`). Fixtures
+// below use a "good" review/owners shape by default (n=100, 90% positive,
+// owners midpoint comfortably above MIN_OWNERS) so pre-existing tests about
+// tag/similarity/caching behaviour aren't incidentally tripped by the new
+// hard quality floors (src/score.js) — floor-specific behaviour has its own
+// tests in test/score.test.mjs.
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -22,7 +30,9 @@ import worker from "../src/worker.js";
 import {
   TAG_CACHE_TTL_SECONDS,
   TAG_CACHE_FAIL_TTL_SECONDS,
+  TAG_CACHE_ERROR_TTL_SECONDS,
   classifySpyResponse,
+  parseOwnersMidpoint,
   computeSpyWaitMs,
   enqueueSpyFetch,
   __setSpyMinIntervalMsForTests,
@@ -56,7 +66,7 @@ function makeMockCache() {
 
 /** Minimal in-memory stand-in for a Workers KV namespace binding. Records the
  * `expirationTtl` each put() was called with, so tests can assert the
- * 30d/24h TTL split without a real KV clock. */
+ * 30d/24h/1h TTL split without a real KV clock. */
 function makeMockKv() {
   const store = new Map();
   const ttlByKey = new Map();
@@ -119,6 +129,37 @@ function primeLibrary(cache, env, games) {
 function primeDeals(cache, minCut, deals) {
   const key = `https://steam-sale-scout.cache/api/deals?minCut=${minCut}`;
   cache.store.set(key, jsonResponse({ deals, minCut }));
+}
+
+/** KV key helper matching src/spyQueue.js's v2 key scheme. */
+function v2Key(appid) {
+  return `v2:spytag:${appid}`;
+}
+
+/** A cached SteamSpy trio that comfortably clears every inc-4 quality floor
+ * (MIN_REVIEWS=50, MIN_QUALITY=0.70, MIN_OWNERS=5000) so tests about tags,
+ * similarity, and caching aren't incidentally floored out. */
+function goodSpyEntry(overrides = {}) {
+  return {
+    tags: { Roguelike: 10 },
+    median: 300,
+    reviews: { positive: 90, negative: 10 }, // n=100, wilson ~0.83
+    owners: 75000,
+    ...overrides,
+  };
+}
+
+/** A raw (un-cached) SteamSpy `appdetails`-shaped response with the same
+ * "clears every floor" reviews/owners, for mocking `fetch()`. */
+function goodSpyRaw(overrides = {}) {
+  return {
+    tags: { Roguelike: 10 },
+    median_forever: 300,
+    positive: 90,
+    negative: 10,
+    owners: "50,000 .. 100,000", // midpoint 75000
+    ...overrides,
+  };
 }
 
 function ownedGame(overrides = {}) {
@@ -224,7 +265,7 @@ test("cold start (no tags cached yet): responds immediately with ready:false, fe
     const u = new URL(url);
     if (u.pathname === "/api.php") {
       steamSpyCalls++;
-      return jsonResponse({ tags: { Roguelike: 10 }, median_forever: 300, positive: 80, negative: 20 });
+      return jsonResponse(goodSpyRaw());
     }
     throw new Error(`unexpected fetch: ${url}`);
   };
@@ -244,6 +285,7 @@ test("cold start (no tags cached yet): responds immediately with ready:false, fe
   assert.equal(body.fetched, 0);
   assert.equal(body.total, 2); // 1 owned appid + 1 deal appid
   assert.equal(body.recs.length, 0); // nothing cached yet -> nothing scoreable
+  assert.equal(body.pendingCount, 1); // the one deal candidate, not yet fetched
 
   // The background queue was kicked (via ctx.waitUntil) even though the
   // response above already came back.
@@ -251,7 +293,7 @@ test("cold start (no tags cached yet): responds immediately with ready:false, fe
   assert.equal(steamSpyCalls, 2);
 });
 
-test("warm run (everything already cached): ready:true, fetched===total, recs populated with a why-line, no SteamSpy calls", async () => {
+test("warm run (everything already cached): ready:true, fetched===total, recs populated with a why-line + review/owners fields, no SteamSpy calls", async () => {
   let steamSpyCalls = 0;
   globalThis.fetch = async () => {
     steamSpyCalls++;
@@ -265,16 +307,24 @@ test("warm run (everything already cached): ready:true, fetched===total, recs po
   const candidateAppid = 100;
   primeLibrary(cache, env, [
     ownedGame({ appid: ownedAppid, name: "Slay the Spire", playtime_forever: 10800 }), // 180h
+    // A second owned game, played too little (<30min) to contribute to the
+    // profile itself, but still part of the IDF corpus (top-200 owned +
+    // candidates) — without it, this 2-document corpus (1 owned + 1
+    // candidate) shares identical tags, so both would get idf 0 (df===N)
+    // and legitimately zero out similarity. Real runs have hundreds of
+    // owned games, so this tag-diversity is realistic, not a fudge.
+    ownedGame({ appid: 2, name: "Barely Played", playtime_forever: 1 }),
   ]);
   primeDeals(cache, 60, [deal({ appid: candidateAppid, title: "Balatro-like Deal" })]);
 
   env.TAG_CACHE.store.set(
-    `spytag:${ownedAppid}`,
-    JSON.stringify({ tags: { Roguelike: 100, Deckbuilder: 50 }, median: 600, reviews: { positive: 90, negative: 10 } }),
+    v2Key(ownedAppid),
+    JSON.stringify(goodSpyEntry({ tags: { Roguelike: 100, Deckbuilder: 50 }, median: 600 })),
   );
+  env.TAG_CACHE.store.set(v2Key(2), JSON.stringify(goodSpyEntry({ tags: { Simulation: 50 } })));
   env.TAG_CACHE.store.set(
-    `spytag:${candidateAppid}`,
-    JSON.stringify({ tags: { Roguelike: 80, Deckbuilder: 40 }, median: 600, reviews: { positive: 95, negative: 5 } }),
+    v2Key(candidateAppid),
+    JSON.stringify(goodSpyEntry({ tags: { Roguelike: 80, Deckbuilder: 40 }, median: 600, owners: 120000 })),
   );
 
   const ctx = makeCtx();
@@ -282,18 +332,26 @@ test("warm run (everything already cached): ready:true, fetched===total, recs po
   const body = await res.json();
 
   assert.equal(body.ready, true);
-  assert.equal(body.fetched, 2);
-  assert.equal(body.total, 2);
+  assert.equal(body.fetched, 3);
+  assert.equal(body.total, 3);
+  assert.equal(body.pendingCount, 0);
   assert.equal(body.recs.length, 1);
   assert.equal(body.recs[0].appid, candidateAppid);
   assert.ok(body.recs[0].similarity > 0);
   assert.match(body.recs[0].why, /Slay the Spire \(180h\)/);
+  // Reviews/owners surfaced for the UI (Increment 4 piece 7) — raw `tags`,
+  // `tagVector`, and `reviews` are stripped from the envelope.
+  assert.equal(body.recs[0].reviewCount, 100);
+  assert.equal(body.recs[0].reviewPercent, 90);
+  assert.equal(body.recs[0].owners, 120000);
+  assert.equal("tags" in body.recs[0], false);
+  assert.equal("tagVector" in body.recs[0], false);
+  assert.equal("reviews" in body.recs[0], false);
   assert.equal(steamSpyCalls, 0);
 });
 
-test("partial cache (~40% of tags cached): recs computed from what's cached, response doesn't crash, excludedCount reflects the rest", async () => {
-  globalThis.fetch = async () =>
-    jsonResponse({ tags: { Roguelike: 10 }, median_forever: 300, positive: 80, negative: 20 });
+test("partial cache (~40% of tags cached): recs computed from what's cached, response doesn't crash, pendingCount/excludedCount split correctly", async () => {
+  globalThis.fetch = async () => jsonResponse(goodSpyRaw());
   const cache = makeMockCache();
   globalThis.caches = { default: cache };
 
@@ -304,15 +362,9 @@ test("partial cache (~40% of tags cached): recs computed from what's cached, res
   const deals = Array.from({ length: 5 }, (_, i) => deal({ itadId: `itad-${i}`, appid: 200 + i, title: `Deal ${i}` }));
   primeDeals(cache, 60, deals);
 
-  env.TAG_CACHE.store.set(
-    `spytag:1`,
-    JSON.stringify({ tags: { Roguelike: 10 }, median: 300, reviews: { positive: 80, negative: 20 } }),
-  );
-  env.TAG_CACHE.store.set(
-    `spytag:200`,
-    JSON.stringify({ tags: { Roguelike: 10 }, median: 300, reviews: { positive: 80, negative: 20 } }),
-  );
-  env.TAG_CACHE.store.set(`spytag:201`, JSON.stringify(null)); // fetched, no usable tags
+  env.TAG_CACHE.store.set(v2Key(1), JSON.stringify(goodSpyEntry()));
+  env.TAG_CACHE.store.set(v2Key(200), JSON.stringify(goodSpyEntry()));
+  env.TAG_CACHE.store.set(v2Key(201), JSON.stringify(null)); // fetched, no usable tags
 
   const ctx = makeCtx();
   const res = await worker.fetch(new Request("https://x/api/recs"), env, ctx);
@@ -324,10 +376,38 @@ test("partial cache (~40% of tags cached): recs computed from what's cached, res
   assert.equal(body.fetched, 3); // appid 1, 200, 201 cached; 202/203/204 not yet
   assert.equal(body.recs.length, 1); // only appid 200 is scoreable
   assert.equal(body.recs[0].appid, 200);
-  // appid 201 (no tags) + 202/203/204 (not yet fetched) all fall out as excluded.
-  assert.equal(body.excludedCount, 4);
+  // appid 201 (cached, no tags) is permanently tagless -> excludedCount.
+  assert.equal(body.excludedCount, 1);
+  // appid 202/203/204 (not yet fetched) are pending, not tagless.
+  assert.equal(body.pendingCount, 3);
+  assert.equal(body.qualityExcludedCount, 0);
 
   await ctx.flush(); // drain the background queue this test kicked off
+});
+
+test("candidates that clear the tag/similarity bar but fail a quality floor are counted in qualityExcludedCount, not excludedCount or recs", async () => {
+  const cache = makeMockCache();
+  globalThis.caches = { default: cache };
+  const env = makeEnv();
+
+  primeLibrary(cache, env, [ownedGame({ appid: 1, name: "Owned", playtime_forever: 600 })]);
+  const deals = [deal({ itadId: "itad-good", appid: 200 }), deal({ itadId: "itad-floored", appid: 201 })];
+  primeDeals(cache, 60, deals);
+
+  env.TAG_CACHE.store.set(v2Key(1), JSON.stringify(goodSpyEntry()));
+  env.TAG_CACHE.store.set(v2Key(200), JSON.stringify(goodSpyEntry()));
+  // appid 201 has usable tags but far too few owners — floored, not tagless.
+  env.TAG_CACHE.store.set(v2Key(201), JSON.stringify(goodSpyEntry({ owners: 100 })));
+
+  const ctx = makeCtx();
+  const res = await worker.fetch(new Request("https://x/api/recs"), env, ctx);
+  const body = await res.json();
+
+  assert.equal(body.recs.length, 1);
+  assert.equal(body.recs[0].appid, 200);
+  assert.equal(body.excludedCount, 0);
+  assert.equal(body.pendingCount, 0);
+  assert.equal(body.qualityExcludedCount, 1);
 });
 
 // ---------------------------------------------------------------------------
@@ -363,7 +443,7 @@ test("?refresh=1 bypasses the library/deals cache but does not touch already-cac
     }
     if (u.pathname === "/api.php") {
       steamSpyCalls++;
-      return jsonResponse({ tags: { Roguelike: 10 }, median_forever: 300, positive: 80, negative: 20 });
+      return jsonResponse(goodSpyRaw());
     }
     throw new Error(`unexpected fetch: ${url}`);
   };
@@ -375,10 +455,7 @@ test("?refresh=1 bypasses the library/deals cache but does not touch already-cac
   // Prime stale library/deals caches — refresh=1 must bypass both.
   primeLibrary(cache, env, [ownedGame({ appid: 999, playtime_forever: 1 })]);
   primeDeals(cache, 60, [deal({ appid: 500 })]);
-  env.TAG_CACHE.store.set(
-    `spytag:1`,
-    JSON.stringify({ tags: { Roguelike: 10 }, median: 300, reviews: { positive: 80, negative: 20 } }),
-  );
+  env.TAG_CACHE.store.set(v2Key(1), JSON.stringify(goodSpyEntry()));
 
   const ctx = makeCtx();
   const res = await worker.fetch(new Request("https://x/api/recs?refresh=1"), env, ctx);
@@ -388,7 +465,7 @@ test("?refresh=1 bypasses the library/deals cache but does not touch already-cac
   assert.equal(steamApiCalls, 1); // library refreshed
   assert.equal(itadCalls, 1); // deals refreshed
   // The already-cached tag for appid 1 must not have been re-fetched.
-  assert.equal(steamSpyCalls, 0); // ?refresh=1 does not bust the 30-day tag KV
+  assert.equal(steamSpyCalls, 0); // ?refresh=1 does not bust the tag KV
   const body = await res.json();
   assert.equal(body.total, 1); // only appid 1 (fresh owned game); stale deal/owned appids gone
 });
@@ -397,13 +474,26 @@ test("?refresh=1 bypasses the library/deals cache but does not touch already-cac
 // SteamSpy classification + null-caching of empty/failed responses.
 // ---------------------------------------------------------------------------
 
-test("classifySpyResponse: a normal response with tags is trimmed to {tags, median, reviews}", () => {
-  const raw = { tags: { Roguelike: 100 }, median_forever: 600, positive: 90, negative: 10, name: "Ignored Field" };
+test("classifySpyResponse: a normal response with tags is trimmed to {tags, median, reviews, owners}", () => {
+  const raw = {
+    tags: { Roguelike: 100 },
+    median_forever: 600,
+    positive: 90,
+    negative: 10,
+    owners: "10,000 .. 20,000",
+    name: "Ignored Field",
+  };
   assert.deepEqual(classifySpyResponse(raw), {
     tags: { Roguelike: 100 },
     median: 600,
     reviews: { positive: 90, negative: 10 },
+    owners: 15000,
   });
+});
+
+test("classifySpyResponse: a missing owners field parses to 0, not a throw", () => {
+  const raw = { tags: { Roguelike: 100 }, median_forever: 600, positive: 90, negative: 10 };
+  assert.deepEqual(classifySpyResponse(raw).owners, 0);
 });
 
 test("classifySpyResponse: SteamSpy's empty-array tags (DLC/bundle/unknown) classifies to null", () => {
@@ -419,14 +509,33 @@ test("classifySpyResponse: a falsy/non-object body classifies to null without th
   assert.equal(classifySpyResponse(undefined), null);
 });
 
-test("background fetch caches a failed/empty SteamSpy response as null (24h TTL) and a successful one for 30d", async () => {
+// ---------------------------------------------------------------------------
+// parseOwnersMidpoint — SteamSpy's "10,000 .. 20,000" owners-range string.
+// ---------------------------------------------------------------------------
+
+test("parseOwnersMidpoint: parses a '..'-separated comma-thousands range to its midpoint", () => {
+  assert.equal(parseOwnersMidpoint("10,000 .. 20,000"), 15000);
+});
+
+test("parseOwnersMidpoint: parses a '-'-separated range too", () => {
+  assert.equal(parseOwnersMidpoint("10,000 - 20,000"), 15000);
+});
+
+test("parseOwnersMidpoint: an unparseable or missing value returns 0", () => {
+  assert.equal(parseOwnersMidpoint("who knows"), 0);
+  assert.equal(parseOwnersMidpoint(""), 0);
+  assert.equal(parseOwnersMidpoint(undefined), 0);
+  assert.equal(parseOwnersMidpoint(null), 0);
+});
+
+test("background fetch caches a genuinely empty/no-tags 2xx response as null (24h TTL) and a successful one for 30d", async () => {
   let calls = 0;
   globalThis.fetch = async (url) => {
     calls++;
     const u = new URL(url);
     const appid = u.searchParams.get("appid");
     if (appid === "1") return jsonResponse({ tags: [], median_forever: 0, positive: 0, negative: 0 }); // no tags
-    return jsonResponse({ tags: { Roguelike: 10 }, median_forever: 300, positive: 80, negative: 20 });
+    return jsonResponse(goodSpyRaw());
   };
   const cache = makeMockCache();
   globalThis.caches = { default: cache };
@@ -440,14 +549,46 @@ test("background fetch caches a failed/empty SteamSpy response as null (24h TTL)
   await ctx.flush();
 
   assert.equal(calls, 2);
-  assert.equal(JSON.parse(env.TAG_CACHE.store.get("spytag:1")), null);
-  assert.ok(JSON.parse(env.TAG_CACHE.store.get("spytag:2")).tags.Roguelike === 10);
+  assert.equal(JSON.parse(env.TAG_CACHE.store.get(v2Key(1))), null);
+  assert.ok(JSON.parse(env.TAG_CACHE.store.get(v2Key(2))).tags.Roguelike === 10);
 
-  // 24h for the failed/no-tags appid, 30d for the successful one.
+  // 24h for the genuinely-empty appid, 30d for the successful one.
   assert.equal(TAG_CACHE_FAIL_TTL_SECONDS, 24 * 60 * 60);
   assert.equal(TAG_CACHE_TTL_SECONDS, 30 * 24 * 60 * 60);
-  assert.equal(env.TAG_CACHE.ttlByKey.get("spytag:1"), TAG_CACHE_FAIL_TTL_SECONDS);
-  assert.equal(env.TAG_CACHE.ttlByKey.get("spytag:2"), TAG_CACHE_TTL_SECONDS);
+  assert.equal(env.TAG_CACHE.ttlByKey.get(v2Key(1)), TAG_CACHE_FAIL_TTL_SECONDS);
+  assert.equal(env.TAG_CACHE.ttlByKey.get(v2Key(2)), TAG_CACHE_TTL_SECONDS);
+});
+
+// ---------------------------------------------------------------------------
+// v2 cache key versioning (Increment 4) — an old `spytag:`-keyed entry is a
+// KV miss under the new `v2:spytag:` key, so it's treated as never-fetched
+// and lazily refetched rather than misread as the old (ownerless) shape.
+// ---------------------------------------------------------------------------
+
+test("v2 cache versioning: an old spytag:-keyed entry is missed and the appid is refetched under the v2 key", async () => {
+  let steamSpyCalls = 0;
+  globalThis.fetch = async () => {
+    steamSpyCalls++;
+    return jsonResponse(goodSpyRaw());
+  };
+  const cache = makeMockCache();
+  globalThis.caches = { default: cache };
+  const env = makeEnv();
+
+  primeLibrary(cache, env, [ownedGame({ appid: 1 })]);
+  primeDeals(cache, 60, []);
+  // Old (pre-v2) key, old (ownerless) shape — must be ignored.
+  env.TAG_CACHE.store.set(`spytag:1`, JSON.stringify({ tags: { Roguelike: 10 }, median: 300, reviews: {} }));
+
+  const ctx = makeCtx();
+  const res = await worker.fetch(new Request("https://x/api/recs"), env, ctx);
+  const body = await res.json();
+  assert.equal(body.ready, false); // not cached under the v2 key -> pending
+  assert.equal(body.pendingCount, 0); // appid 1 is an owned game, not a deal candidate
+
+  await ctx.flush();
+  assert.equal(steamSpyCalls, 1); // refetched despite the stale spytag:1 entry
+  assert.ok(env.TAG_CACHE.store.has(v2Key(1)));
 });
 
 // ---------------------------------------------------------------------------
@@ -482,7 +623,7 @@ test("enqueueSpyFetch/pumpSpyQueue: serialises multiple queued appids, spaced by
   const timestamps = [];
   globalThis.fetch = async (url) => {
     timestamps.push(Date.now());
-    return jsonResponse({ tags: { Roguelike: 10 }, median_forever: 300, positive: 80, negative: 20 });
+    return jsonResponse(goodSpyRaw());
   };
 
   const env = makeEnv();
@@ -496,9 +637,9 @@ test("enqueueSpyFetch/pumpSpyQueue: serialises multiple queued appids, spaced by
   assert.ok(timestamps[1] - timestamps[0] >= 30, `gap0->1 was ${timestamps[1] - timestamps[0]}ms, expected >=30ms`);
   assert.ok(timestamps[2] - timestamps[1] >= 30, `gap1->2 was ${timestamps[2] - timestamps[1]}ms, expected >=30ms`);
 
-  assert.equal(JSON.parse(env.TAG_CACHE.store.get("spytag:1")).tags.Roguelike, 10);
-  assert.equal(JSON.parse(env.TAG_CACHE.store.get("spytag:2")).tags.Roguelike, 10);
-  assert.equal(JSON.parse(env.TAG_CACHE.store.get("spytag:3")).tags.Roguelike, 10);
+  assert.equal(JSON.parse(env.TAG_CACHE.store.get(v2Key(1))).tags.Roguelike, 10);
+  assert.equal(JSON.parse(env.TAG_CACHE.store.get(v2Key(2))).tags.Roguelike, 10);
+  assert.equal(JSON.parse(env.TAG_CACHE.store.get(v2Key(3))).tags.Roguelike, 10);
 });
 
 test("enqueueSpyFetch: dedupes appids already queued/in-flight — each appid fetched exactly once even if re-enqueued", async () => {
@@ -508,7 +649,7 @@ test("enqueueSpyFetch: dedupes appids already queued/in-flight — each appid fe
   globalThis.fetch = async (url) => {
     calls++;
     seenAppids.add(new URL(url).searchParams.get("appid"));
-    return jsonResponse({ tags: { Roguelike: 10 }, median_forever: 300, positive: 80, negative: 20 });
+    return jsonResponse(goodSpyRaw());
   };
 
   const env = makeEnv();
@@ -522,16 +663,18 @@ test("enqueueSpyFetch: dedupes appids already queued/in-flight — each appid fe
 });
 
 // ---------------------------------------------------------------------------
-// Null-caching of a genuinely FAILED SteamSpy call (non-2xx / thrown network
-// error), not just a well-formed-but-empty-tags 200. Also proves one bad
-// appid doesn't wedge the queue for the ones behind it.
+// Error-vs-empty TTL split (Increment 4, inc-3 flag 4): a genuinely FAILED
+// SteamSpy call (non-2xx / thrown network error) gets only a 1h TTL — much
+// shorter than the 24h empty-response TTL — so a blip can't strand a good
+// game out of recs for a day. Also proves one bad appid doesn't wedge the
+// queue for the ones behind it.
 // ---------------------------------------------------------------------------
 
-test("background fetch caches a non-2xx SteamSpy response as null (24h TTL) without crashing the queue for later appids", async () => {
+test("background fetch caches a non-2xx SteamSpy response as null with the short 1h error TTL, without crashing the queue for later appids", async () => {
   globalThis.fetch = async (url) => {
     const appid = new URL(url).searchParams.get("appid");
     if (appid === "1") return new Response("server error", { status: 500 });
-    return jsonResponse({ tags: { Roguelike: 10 }, median_forever: 300, positive: 80, negative: 20 });
+    return jsonResponse(goodSpyRaw());
   };
 
   const env = makeEnv();
@@ -539,18 +682,19 @@ test("background fetch caches a non-2xx SteamSpy response as null (24h TTL) with
   enqueueSpyFetch(env, ctx, [1, 2]);
   await ctx.flush();
 
-  assert.equal(JSON.parse(env.TAG_CACHE.store.get("spytag:1")), null);
-  assert.equal(env.TAG_CACHE.ttlByKey.get("spytag:1"), TAG_CACHE_FAIL_TTL_SECONDS);
+  assert.equal(TAG_CACHE_ERROR_TTL_SECONDS, 60 * 60);
+  assert.equal(JSON.parse(env.TAG_CACHE.store.get(v2Key(1))), null);
+  assert.equal(env.TAG_CACHE.ttlByKey.get(v2Key(1)), TAG_CACHE_ERROR_TTL_SECONDS);
   // appid 2, queued behind the failing appid 1, must still get processed and cached.
-  assert.equal(JSON.parse(env.TAG_CACHE.store.get("spytag:2")).tags.Roguelike, 10);
-  assert.equal(env.TAG_CACHE.ttlByKey.get("spytag:2"), TAG_CACHE_TTL_SECONDS);
+  assert.equal(JSON.parse(env.TAG_CACHE.store.get(v2Key(2))).tags.Roguelike, 10);
+  assert.equal(env.TAG_CACHE.ttlByKey.get(v2Key(2)), TAG_CACHE_TTL_SECONDS);
 });
 
-test("background fetch caches a thrown network error as null (24h TTL) without crashing the queue for later appids", async () => {
+test("background fetch caches a thrown network error as null with the short 1h error TTL, without crashing the queue for later appids", async () => {
   globalThis.fetch = async (url) => {
     const appid = new URL(url).searchParams.get("appid");
     if (appid === "1") throw new Error("ECONNRESET");
-    return jsonResponse({ tags: { Roguelike: 10 }, median_forever: 300, positive: 80, negative: 20 });
+    return jsonResponse(goodSpyRaw());
   };
 
   const env = makeEnv();
@@ -558,8 +702,8 @@ test("background fetch caches a thrown network error as null (24h TTL) without c
   enqueueSpyFetch(env, ctx, [1, 2]);
   await ctx.flush();
 
-  assert.equal(JSON.parse(env.TAG_CACHE.store.get("spytag:1")), null);
-  assert.equal(env.TAG_CACHE.ttlByKey.get("spytag:1"), TAG_CACHE_FAIL_TTL_SECONDS);
-  assert.equal(JSON.parse(env.TAG_CACHE.store.get("spytag:2")).tags.Roguelike, 10);
-  assert.equal(env.TAG_CACHE.ttlByKey.get("spytag:2"), TAG_CACHE_TTL_SECONDS);
+  assert.equal(JSON.parse(env.TAG_CACHE.store.get(v2Key(1))), null);
+  assert.equal(env.TAG_CACHE.ttlByKey.get(v2Key(1)), TAG_CACHE_ERROR_TTL_SECONDS);
+  assert.equal(JSON.parse(env.TAG_CACHE.store.get(v2Key(2))).tags.Roguelike, 10);
+  assert.equal(env.TAG_CACHE.ttlByKey.get(v2Key(2)), TAG_CACHE_TTL_SECONDS);
 });

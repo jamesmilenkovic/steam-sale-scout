@@ -4,7 +4,8 @@
 // filtered/enriched/owned-excluded. /api/recs (Increment 3): taste-profile
 // scoring engine over the deals feed, backed by a SteamSpy tag cache (KV)
 // and a strict-1req/sec background fetch queue. Non-asset requests reach
-// here; static files are served from ./public.
+// here; static files are served from ./public. Increment 4 adds Wilson-bound
+// quality + hard quality floors and IDF tag weighting to the scoring engine.
 
 import {
   BATCH_SIZE,
@@ -20,7 +21,7 @@ import {
   normalizeDeal,
   parseSteamAppId,
 } from "./deals.js";
-import { TOP_OWNED_GAMES, buildProfile, selectTopOwnedGames } from "./profile.js";
+import { TOP_OWNED_GAMES, buildProfile, selectTopOwnedGames, computeIdf } from "./profile.js";
 import { scoreCandidates } from "./score.js";
 import { buildWhy } from "./why.js";
 import { getCachedSpy, enqueueSpyFetch } from "./spyQueue.js";
@@ -567,23 +568,54 @@ async function handleRecs(request, env, ctx) {
     }),
   );
 
-  const { profile, contributions } = buildProfile(libraryGames, spyDataByAppid, windowMonths, now);
+  // IDF corpus (Increment 4): the raw SteamSpy tag sets of every appid in
+  // play (top-200 owned + deal candidates) that's actually been fetched and
+  // has usable tags — pending/tagless entries contribute nothing to
+  // document frequency. Recomputed fresh each request; cheap, it's just a
+  // count over already-cached data.
+  // ASSUMPTION (flagged for the gate): document frequency is counted over the
+  // RAW tag sets, not the post-stoplist/top-15 buildTagVector output. This is
+  // the more literal reading of "cached tag sets"; idf values are then only
+  // ever consulted for tags that survive into a vector, so the broader corpus
+  // scope is harmless. Revisit at the Phase-1 gate if generic tags don't
+  // collapse toward zero weight as expected.
+  const corpusTagSets = neededAppids.map((appid) => spyDataByAppid.get(appid)?.tags).filter(Boolean);
+  const idfMap = computeIdf(corpusTagSets);
 
-  const candidates = deals.map((deal) => {
+  const { profile, contributions } = buildProfile(libraryGames, spyDataByAppid, windowMonths, now, idfMap);
+
+  // Split "not yet fetched" (pendingCount) from "fetched but permanently
+  // tagless / null-appid" (excludedCount, computed inside scoreCandidates —
+  // it only sees cache state, not fetch status). Pending deals are held
+  // back from scoreCandidates entirely so they don't inflate excludedCount.
+  let pendingCount = 0;
+  const candidates = [];
+  for (const deal of deals) {
+    if (deal.appid != null && !tagByAppid.get(deal.appid).cached) {
+      pendingCount++;
+      continue;
+    }
     const spy = deal.appid != null ? spyDataByAppid.get(deal.appid) : undefined;
-    return {
+    candidates.push({
       ...deal,
       tags: spy?.tags || {},
       reviews: spy?.reviews || {},
-    };
-  });
+      owners: spy?.owners ?? 0,
+    });
+  }
 
-  const { recs: scoredRecs, excludedCount } = scoreCandidates(profile, candidates);
+  const {
+    recs: scoredRecs,
+    excludedCount,
+    qualityExcludedCount,
+  } = scoreCandidates(profile, candidates, idfMap);
 
   const recs = scoredRecs.map((rec) => {
     const why = buildWhy(profile, rec.tagVector, contributions);
-    const { tags, tagVector, reviews, ...rest } = rec;
-    return { ...rest, why };
+    const { tags, tagVector, reviews, owners, ...rest } = rec;
+    const totalReviews = (reviews?.positive || 0) + (reviews?.negative || 0);
+    const reviewPercent = totalReviews > 0 ? Math.round((reviews.positive / totalReviews) * 100) : null;
+    return { ...rest, why, reviewPercent, reviewCount: totalReviews, owners };
   });
 
   const fetched = neededAppids.length - missing.length;
@@ -593,7 +625,9 @@ async function handleRecs(request, env, ctx) {
       ready: fetched >= neededAppids.length,
       fetched,
       total: neededAppids.length,
+      pendingCount,
       excludedCount,
+      qualityExcludedCount,
       recs,
     }),
     { status: 200, headers: { "content-type": "application/json" } },

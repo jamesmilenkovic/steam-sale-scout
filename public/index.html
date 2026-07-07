@@ -193,6 +193,7 @@
         <th>Price (AUD)</th>
         <th>Regular</th>
         <th>% off</th>
+        <th>Reviews</th>
         <th>Why</th>
         <th>Store</th>
       </tr>
@@ -580,6 +581,14 @@
       }
       tr.appendChild(cutTd);
 
+      const reviewsTd = document.createElement("td");
+      reviewsTd.textContent =
+        rec.reviewCount > 0 ? `${rec.reviewPercent}% · ${rec.reviewCount.toLocaleString()}` : "—";
+      if (rec.owners > 0) {
+        reviewsTd.title = `~${rec.owners.toLocaleString()} owners`;
+      }
+      tr.appendChild(reviewsTd);
+
       const whyTd = document.createElement("td");
       whyTd.className = "why-line";
       whyTd.textContent = rec.why || "—";
@@ -599,7 +608,9 @@
       recsTableBodyEl.appendChild(tr);
     });
 
-    recsTotalsEl.textContent = `${recs.length} recs · ${body.excludedCount ?? 0} excluded (no appid or no tags)`;
+    recsTotalsEl.textContent =
+      `${recs.length} recs · ${body.pendingCount ?? 0} pending · ` +
+      `${body.excludedCount ?? 0} tagless · ${body.qualityExcludedCount ?? 0} below quality floor`;
     recsTableEl.hidden = false;
 
     if (body.ready) {

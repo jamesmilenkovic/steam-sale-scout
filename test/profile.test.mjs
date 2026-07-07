@@ -18,6 +18,8 @@ import {
   gameWeight,
   buildTagVector,
   l2Normalize,
+  computeIdf,
+  applyIdf,
   buildProfile,
 } from "../src/profile.js";
 
@@ -175,6 +177,67 @@ test("l2Normalize: a zero vector returns {} rather than dividing by zero", () =>
 });
 
 // ---------------------------------------------------------------------------
+// computeIdf / applyIdf — Increment 4 IDF tag weighting.
+// ---------------------------------------------------------------------------
+
+test("computeIdf: a tag present in every document gets idf 0 (ln(N/N))", () => {
+  const idf = computeIdf([{ Action: 1 }, { Action: 1 }, { Action: 1 }]);
+  assert.equal(idf.Action, 0);
+});
+
+test("computeIdf: a tag present in only one of many documents gets a high idf", () => {
+  const idf = computeIdf([
+    { Action: 1, Roguelike: 1 },
+    { Action: 1 },
+    { Action: 1 },
+    { Action: 1 },
+  ]);
+  assert.ok(idf.Roguelike > idf.Action);
+  assert.ok(Math.abs(idf.Roguelike - Math.log(4 / 1)) < 1e-9);
+  assert.equal(idf.Action, 0);
+});
+
+test("computeIdf: N=1 corpus edge — the single document's tags all get idf 0 (df === N)", () => {
+  const idf = computeIdf([{ Action: 1, Roguelike: 1 }]);
+  assert.equal(idf.Action, 0);
+  assert.equal(idf.Roguelike, 0);
+});
+
+test("computeIdf: accepts plain tag-name arrays as documents, not just tag objects", () => {
+  const idf = computeIdf([["Action"], ["Action", "Roguelike"], ["Action"]]);
+  assert.ok(idf.Roguelike > idf.Action);
+});
+
+test("computeIdf: an empty corpus returns an empty map without throwing", () => {
+  assert.deepEqual(computeIdf([]), {});
+  assert.deepEqual(computeIdf(undefined), {});
+});
+
+test("computeIdf: repeated tags within one document count once toward df, not once per mention", () => {
+  // A tag object's keys are already unique, but this guards the array form.
+  const idf = computeIdf([["Action", "Action"], ["Roguelike"]]);
+  assert.equal(idf.Action, Math.log(2 / 1));
+});
+
+test("applyIdf: multiplies each tag's weight by its idf, then L2-normalises", () => {
+  const weighted = applyIdf({ A: 1, B: 1 }, { A: 3, B: 1 });
+  // Raw-weighted: A=3, B=1 -> normalised to unit magnitude.
+  const magnitude = Math.sqrt(3 * 3 + 1 * 1);
+  assert.ok(Math.abs(weighted.A - 3 / magnitude) < 1e-9);
+  assert.ok(Math.abs(weighted.B - 1 / magnitude) < 1e-9);
+});
+
+test("applyIdf: a tag absent from idfMap is treated as idf 0 (contributes nothing)", () => {
+  const weighted = applyIdf({ A: 1, Unknown: 1 }, { A: 1 });
+  assert.equal(weighted.Unknown, 0);
+  assert.ok(Math.abs(weighted.A - 1) < 1e-9);
+});
+
+test("applyIdf: every tag zeroed out (all idf 0, e.g. a uniform/generic tag) collapses to {}", () => {
+  assert.deepEqual(applyIdf({ Action: 1 }, { Action: 0 }), {});
+});
+
+// ---------------------------------------------------------------------------
 // buildProfile — the full pipeline: selection, <30min skip, missing/no-tags
 // skip, weighted sum, L2 normalisation, and the why.js contributions payload.
 // ---------------------------------------------------------------------------
@@ -238,6 +301,22 @@ test("buildProfile: returns per-game contributions with appid/name/hours/tagWeig
   assert.equal(contributions[0].name, "Balatro");
   assert.equal(contributions[0].hours, 42);
   assert.ok(contributions[0].tagWeights.Roguelike > 0);
+});
+
+test("buildProfile: an idfMap zeroing a tag out drops it from the resulting profile", () => {
+  const games = [game({ appid: 1, playtime_forever: 600 })];
+  const spy = new Map([[1, { tags: { Roguelike: 100, Action: 100 }, median: 100, reviews: {} }]]);
+  const idfMap = { Roguelike: 2, Action: 0 }; // Action is generic (in every doc) -> weight 0
+  const { profile } = buildProfile(games, spy, 12, NOW, idfMap);
+  assert.equal(profile.Action, 0);
+  assert.ok(profile.Roguelike > 0);
+});
+
+test("buildProfile: without an idfMap, behaves exactly as before (plain L2-normalised sum)", () => {
+  const games = [game({ appid: 1, playtime_forever: 600 })];
+  const spy = new Map([[1, { tags: { Roguelike: 100 }, median: 100, reviews: {} }]]);
+  const { profile } = buildProfile(games, spy, 12, NOW);
+  assert.ok(Math.abs(profile.Roguelike - 1) < 1e-9);
 });
 
 test("buildProfile: games beyond the top-200-by-inc-1-weight cutoff never contribute", () => {

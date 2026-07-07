@@ -1,106 +1,89 @@
-# Increment 3 — Taste profile + scoring engine v1 + ranked recs
+# Increment 4 — Quality metrics + smarter similarity (kill the shovelware)
 
-**Project:** Steam Sale Scout · **Phase 1, slice 3 of 3 — THE CORE INCREMENT**
+**Project:** Steam Sale Scout · **Phase 1 gate response — gate stays open until this passes**
 **PRD:** `PRDs/2-in-progress/2026-07-04-steam-sale-recommender.md`
-**Base:** `main` @ `e842ca8` (inc 2) · **Status:** Build-ready (scoped 2026-07-06)
-**Inc-2 handoff consumed:** `session-2026-07-06-increment-2-built.md` — its three
-flags (null appids, degraded-mode exclusion, stale library cache) are handled below.
+**Base:** `main` @ `a79a426` (inc 3) · **Status:** Build-ready (scoped 2026-07-06)
 
-## Goal
+## Why (James's ⛩ gate verdict, 2026-07-06)
 
-Rank every on-sale unowned game by "how much would James actually like this",
-with a *why* per pick. **This increment ends at the ⛩ Phase 1 gate:** James runs
-it against a real sale week and judges the top 20. Nothing in Phase 2 gets built
-until the recs feel right.
+Recs work but **shovelware ranks high**. Two confirmed drivers (inc-3 save-down
+called both): (1) the 0.75 neutral quality default means near-reviewless junk
+pays no penalty; (2) generic tags (Action/Adventure/Strategy) create false
+similarity. Constant-tweaks alone won't fix it — this increment builds real
+quality metrics into the engine. The planned filters slice shifts to inc 5.
 
-## Data: SteamSpy per-app fetch + persistent tag cache
+## Build
 
-One SteamSpy `appdetails` call per appid supplies everything the engine needs:
-`tags` (with votes), `median_forever`, `positive`/`negative`. 1 req/sec limit →
-the design problem is the **cold-start fetch**, not the maths.
+### 1. Quality = Wilson lower bound (replaces the clamp + neutral default)
 
-1. **Tag cache:** KV (local via `wrangler dev`), key = appid, TTL 30 days
-   (tags/medians are near-static). Store the trimmed trio: tags, median, review
-   counts. Failed/empty responses cached 24h as `null` (DLC/bundles often have
-   no tags — they simply never get scored).
-2. **Fetch queue in the Worker:** strict 1 req/sec, needed appids =
-   **top 200 owned games by inc-1 weight** (the tail is noise) + all candidate
-   appids from `/api/deals` (cut ≥ current threshold). Cold start at Summer-Sale
-   scale ≈ ~1,200 appids ≈ ~20 min — hence:
-3. **Progressive results:** `/api/recs` never blocks. Response:
-   `{ready, fetched, total, recs:[...]}` — recs computed from whatever is cached
-   so far; UI polls, shows a progress bar, and the list fills in/re-ranks live.
-   Warm runs are instant.
+`quality = wilsonLowerBound(positive, negative, z=1.96)` — the lower bound of
+the 95% confidence interval on the true positive-review ratio.
 
-## Engine (pure modules, unit-tested)
+- A 92%-positive game with 12 reviews scores ~0.64; with 4,000 reviews ~0.91.
+  Thin-review shovelware **cannot** free-ride: no reviews → quality ≈ 0.
+- No clamping, no neutral default. Delete `QUALITY_NEUTRAL` /
+  `REVIEW_NEUTRAL_THRESHOLD` config.
+- `rankScore = similarity × quality × (atHistoricalLow ? LOW_BONUS : 1)` —
+  formula shape unchanged, quality term now honest.
 
-### `profile.js` — build the taste vector
+### 2. Hard quality floors (config, applied before ranking)
 
-1. Per owned game (top 200 by inc-1 weight, skip < 30 min played):
-   `gameWeight = playtimeNorm × recencyMult` where
-   `playtimeNorm = clamp(playtime_forever / median_forever, 0.1, 4)` (median
-   from SteamSpy; if median missing/0, fall back to inc-1's log-hours term) and
-   `recencyMult` = the existing banded multiplier from `weight.js`
-   (windowMonths setting, default 12). **This replaces the log-hours seam
-   flagged in `weight.js`.**
-2. Per-game tag vector: top 15 tags by votes, values = votes normalised to sum
-   to 1 for that game, minus the **stoplist** (configurable constant; defaults:
-   `Singleplayer, Multiplayer, Great Soundtrack, Early Access, Free to Play,
-   Controller, Steam Achievements, Atmospheric`) — SteamPeek-style troll/generic
-   suppression, tune at the gate.
-3. `profile = L2-normalise( Σ gameWeight × gameTagVector )`.
+- `MIN_REVIEWS` default **50** total reviews.
+- `MIN_QUALITY` default **0.70** Wilson score (≈ "clearly well-reviewed").
+- `MIN_OWNERS` default **5,000** (SteamSpy owners-range midpoint) — shovelware
+  rarely clears it; genuinely obscure gems on deep sale usually do.
+- Floored-out candidates → `qualityExcludedCount`, surfaced in the UI footnote
+  (distinct from tagless/pending), so we can see what the floors are eating.
 
-### `score.js` — rank the candidates
+### 3. IDF tag weighting (fixes generic-tag similarity properly)
 
-1. `similarity = cosine(profile, candidateTagVector)` → shown as a % (this is
-   the "% of similar" number the Phase-2 filter will use).
-2. `quality = positive/(positive+negative)` clamped to [0.5, 1]; neutral 0.75
-   if < 50 total reviews.
-3. `rankScore = similarity × quality × (atHistoricalLow ? 1.15 : 1)`.
-   (Deal depth already gated by minCut; don't double-count discount.)
-4. **`appid: null` or tagless candidates: excluded from recs** (still visible in
-   the Deals tab); show an excluded-count line so nothing silently vanishes.
+- Compute document frequency per tag across the working corpus (cached tag sets:
+  top-200 owned + current candidates); `idf(tag) = ln(N / df)`.
+- Apply `idf` to tag values in **both** profile and candidate vectors before
+  normalisation/cosine. "Action" (in everything) → near-zero weight;
+  "Roguelike Deckbuilder" → high weight. The principled fix — the stoplist
+  stays only as a small backstop (keep current entries, expect to shrink it).
+- Recompute IDF per recs run (cheap — it's a count over cached data).
+- Why-lines automatically improve: contributions are now IDF-weighted, so the
+  named tags become the distinctive ones.
 
-### `why.js` — the explanation line
+### 4. Cache schema: add `owners` to the SteamSpy trio
 
-Per rec: top 3 overlapping tags by contribution to the cosine + the 2 owned
-games that contributed most weight to those tags, with hours. Format:
-_"Roguelike Deckbuilder, Turn-Based, Strategy — because Slay the Spire (180h)
-and Balatro (42h)"_.
+- Trimmed entry becomes `{tags, median, reviews, owners}` — **bump the KV cache
+  version** (`TAG_CACHE` key prefix `v2:`); old entries lazily refetched, which
+  means one more cold crawl (~20 min, overnight-friendly). Same-call data, no
+  new requests.
 
-## UI — third tab: **Recs**
+### 5. Small fixes pulled in from the inc-3 save-down flags
 
-1. Progress state while the tag cache builds (fetched/total, partial list
-   fills in live).
-2. Ranked cards/rows: name, **similarity %**, AUD price + struck regular,
-   % off badge, HISTORICAL LOW badge, the *why* line, Steam store link.
-   Sorted by rankScore.
-3. Controls: reuses the deals min-discount control; **recency window setting
-   now also recomputes the profile** (client re-request, profile rebuild is
-   cheap once tags are cached). Excluded-count footnote.
-4. No filters beyond that (Phase 2), no dismissals (Phase 2), diagnostic styling.
+- **Failure-TTL split (flag 4):** network/5xx errors cached 1h, genuine
+  empty/no-tags responses keep 24h `null` — a SteamSpy blip can no longer
+  strand good games for a day.
+- **`pendingCount` split (flag 3):** separate "not yet fetched" from
+  "permanently tagless" in the API response + UI footnote.
 
-## Inc-2 flag handling (for the record)
+### 6. UI (Recs tab)
 
-1. Null-appid deals → excluded from recs, counted (above).
-2. Degraded-mode owned-exclusion (missing Steam key) → recs must **refuse to
-   run** in this state (a recommender that suggests owned games is broken):
-   `/api/recs` returns a clear error if the library fetch failed.
-3. Library cache staleness (≤24h) is fine for scoring; `?refresh=1` on
-   `/api/recs` refreshes library + deals + recomputes (not the 30-day tag KV).
+- Each rec row adds: **review % + count** (e.g. "94% · 12,410") and an owners
+  bracket on hover/small text — so quality is eyeballable at the gate.
+- Footnote now itemises: pending / tagless / below-quality-floor counts.
+- No new controls (floors are config this increment; they become user-facing
+  filters in inc 5 alongside price/similarity/genre).
 
 ## Out of scope
 
-Phase-2 filters (price cap, min-similarity, genre), wishlist lane, dismissals,
-LLM re-rank, any deploy. Local-only stands.
+Inc-5 filters (price cap, min-similarity, genre — floors become user-facing
+there), wishlist lane, dismissals, LLM re-rank, external quality sources
+(Metacritic/SteamDB ratings — Wilson on Steam reviews should suffice; revisit
+only if the gate still fails).
 
 ## Testing
 
-- Unit (fixtures shaped from real SteamSpy payloads): playtimeNorm incl. median
-  fallback + clamps, profile normalisation, stoplist, cosine, quality clamps,
-  historical-low bonus, why-line selection, null/tagless exclusion, partial-
-  cache ranking (recs from 40% of tags ≠ crash), refuse-on-degraded-library.
-- Queue: 1 req/sec pacing, null-caching of empty responses, 30d/24h TTLs.
-- Manual acceptance = **⛩ Phase 1 gate (James, on a real sale week):** let the
-  cache build, then judge the top 20 — "would I click buy on most of these?"
-  Tune weights/stoplist in-loop if close; park cheaply if fundamentally off.
+- Unit: Wilson bound (known values, 0-review, extreme n), floors incl.
+  owners-midpoint parsing ("10,000 .. 20,000" strings), IDF (uniform tag →
+  ~0 weight; unique tag → max; N=1 corpus edge), v2 cache versioning + lazy
+  refetch, error-vs-empty TTLs, pending/tagless/floored count separation.
+- Regression: inc-3 suites stay green (update fixtures for the v2 trio).
+- Manual acceptance = **⛩ Phase 1 gate, take 2 (James):** rebuild cache, then
+  the top-20 test again — shovelware gone, hidden gems intact. If floors are
+  eating good games, tune `MIN_*` config in-loop before touching the engine.

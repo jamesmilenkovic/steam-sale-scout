@@ -1,5 +1,6 @@
 // Steam Sale Scout — SteamSpy tag cache (KV) + strict-1req/sec background
-// fetch queue (Increment 3).
+// fetch queue (Increment 3; owners field + v2 cache key + error/empty TTL
+// split added in Increment 4).
 //
 // Lives in its own module (separate from src/worker.js) for a load-bearing
 // reason, not just tidiness: src/worker.js is wrangler's `main` entry
@@ -17,13 +18,21 @@ const STEAMSPY_API_URL = "https://steamspy.com/api.php";
 /** Tag/median data is near-static — cache a successful lookup for 30 days. */
 export const TAG_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60;
 
-/** A failed/empty (no-tags) lookup is retried sooner — 24h — in case it was
+/** A genuinely empty/no-tags response (a 2xx with no usable tags — DLC,
+ * bundle, unknown appid) is retried sooner — 24h — in case it was
  * transient, without hammering SteamSpy on every /api/recs poll meanwhile. */
 export const TAG_CACHE_FAIL_TTL_SECONDS = 24 * 60 * 60;
 
-/** KV key for one appid's cached SteamSpy trio. */
+/** A network error or non-2xx response gets only 1h — much shorter than the
+ * 24h empty-response TTL, so a SteamSpy blip can't strand an otherwise-good
+ * game out of recs for a whole day (Increment 4, inc-3 flag 4). */
+export const TAG_CACHE_ERROR_TTL_SECONDS = 60 * 60;
+
+/** KV key for one appid's cached SteamSpy trio. Prefixed `v2:` (Increment 4
+ * added `owners` to the cached trio) so old `spytag:`-keyed entries are
+ * simply missed and lazily refetched rather than misread. */
 function spyCacheKey(appid) {
-  return `spytag:${appid}`;
+  return `v2:spytag:${appid}`;
 }
 
 /**
@@ -48,13 +57,32 @@ async function setCachedSpy(env, appid, data, ttlSeconds) {
 }
 
 /**
+ * Parse SteamSpy's `owners` range string (e.g. `"10,000 .. 20,000"` or
+ * `"10,000 - 20,000"`) into a single midpoint number. Returns 0 if `owners`
+ * is missing or doesn't match the expected shape, rather than throwing —
+ * used as a hard quality-floor input (src/score.js's MIN_OWNERS), so an
+ * unparseable value should fail that floor, not crash the request.
+ * @param {string|undefined|null} owners
+ * @returns {number}
+ */
+export function parseOwnersMidpoint(owners) {
+  if (typeof owners !== "string") return 0;
+  const match = owners.replace(/,/g, "").match(/(\d+)\s*(?:\.\.|-)\s*(\d+)/);
+  if (!match) return 0;
+  const low = Number(match[1]);
+  const high = Number(match[2]);
+  if (!Number.isFinite(low) || !Number.isFinite(high)) return 0;
+  return (low + high) / 2;
+}
+
+/**
  * Classify a raw SteamSpy `appdetails` response into the trimmed trio the
  * engine needs, or `null` if it carries no usable tags. SteamSpy returns an
  * empty array (not object) for `tags` on apps it has nothing for — DLC,
  * bundles, and unknown appids commonly land here; they simply never get
  * scored.
  * @param {object} raw
- * @returns {{tags: Object<string,number>, median: number, reviews: {positive: number, negative: number}}|null}
+ * @returns {{tags: Object<string,number>, median: number, reviews: {positive: number, negative: number}, owners: number}|null}
  */
 export function classifySpyResponse(raw) {
   if (!raw || typeof raw !== "object") return null;
@@ -69,6 +97,7 @@ export function classifySpyResponse(raw) {
       positive: raw.positive ?? 0,
       negative: raw.negative ?? 0,
     },
+    owners: parseOwnersMidpoint(raw.owners),
   };
 }
 
@@ -110,10 +139,13 @@ function sleep(ms) {
 
 /**
  * Fetch + classify + cache one appid from SteamSpy, pacing to ≤1 req/sec
- * across the whole queue via the module-scoped `spyLastFetchAt`. Network
- * failures are treated the same as an empty/no-tags response (cached `null`,
- * 24h) rather than left unfetched, so one flaky appid can't get re-hit on
- * every single poll during a cold-start crawl.
+ * across the whole queue via the module-scoped `spyLastFetchAt`. A thrown
+ * network error or non-2xx response is cached `null` for only 1h
+ * (TAG_CACHE_ERROR_TTL_SECONDS) — likely transient, so it's retried soon
+ * without hammering SteamSpy on every /api/recs poll meanwhile. A genuine
+ * 2xx-but-no-usable-tags response is cached `null` for the longer 24h
+ * (TAG_CACHE_FAIL_TTL_SECONDS) — SteamSpy answered, it just has nothing for
+ * this appid, so there's less reason to expect a retry to help soon.
  */
 async function fetchAndCacheSpy(env, appid) {
   const wait = computeSpyWaitMs(spyLastFetchAt, Date.now(), spyMinIntervalMs);
@@ -121,6 +153,7 @@ async function fetchAndCacheSpy(env, appid) {
   spyLastFetchAt = Date.now();
 
   let classified = null;
+  let errored = false;
   try {
     const url = new URL(STEAMSPY_API_URL);
     url.searchParams.set("request", "appdetails");
@@ -128,12 +161,20 @@ async function fetchAndCacheSpy(env, appid) {
     const res = await fetch(url.toString());
     if (res.ok) {
       classified = classifySpyResponse(await res.json());
+    } else {
+      errored = true;
     }
   } catch {
     classified = null;
+    errored = true;
   }
 
-  await setCachedSpy(env, appid, classified, classified ? TAG_CACHE_TTL_SECONDS : TAG_CACHE_FAIL_TTL_SECONDS);
+  const ttl = classified
+    ? TAG_CACHE_TTL_SECONDS
+    : errored
+      ? TAG_CACHE_ERROR_TTL_SECONDS
+      : TAG_CACHE_FAIL_TTL_SECONDS;
+  await setCachedSpy(env, appid, classified, ttl);
 }
 
 async function pumpSpyQueue(env) {

@@ -143,6 +143,61 @@ export function l2Normalize(vector) {
 }
 
 /**
+ * Document frequency -> IDF (Increment 4). Given the working corpus of tag
+ * sets — one per document (game), each either an array of tag names or a
+ * SteamSpy-style tag object (tagname -> votes, in which case only the keys
+ * matter) — compute `idf(tag) = ln(N / df(tag))`, where N is the number of
+ * documents and df(tag) is how many of them contain it at least once.
+ *
+ * A tag in every document (df === N) gets idf 0 (ln(1) === 0) — maximally
+ * generic, contributes nothing. A tag in only one document out of many gets
+ * the highest idf. With a single-document corpus (N === 1), every tag it
+ * has gets idf 0 too (ln(1/1) === 0) — there's no basis yet to call
+ * anything distinctive.
+ * @param {Array<string[]|Object<string, number>>} tagSets
+ * @returns {Object<string, number>} tag -> idf weight.
+ */
+export function computeIdf(tagSets) {
+  const docs = (tagSets || []).map((doc) => {
+    if (!doc) return [];
+    return Array.isArray(doc) ? doc : Object.keys(doc);
+  });
+
+  const n = docs.length;
+  const idf = {};
+  if (n === 0) return idf;
+
+  const df = new Map();
+  for (const doc of docs) {
+    for (const tag of new Set(doc)) {
+      df.set(tag, (df.get(tag) || 0) + 1);
+    }
+  }
+
+  for (const [tag, count] of df) idf[tag] = Math.log(n / count);
+  return idf;
+}
+
+/**
+ * Apply IDF weights to a tag vector, multiplying each tag's value by its
+ * idf (0 for a tag absent from `idfMap` — i.e. absent from the corpus this
+ * idfMap was computed over) and L2-normalising the result. Used on both the
+ * profile vector and each candidate's tag vector before cosine similarity,
+ * so a generic tag (idf ~= 0) stops contributing to similarity on either
+ * side, while a distinctive tag (high idf) dominates it.
+ * @param {Object<string, number>} vector
+ * @param {Object<string, number>} idfMap
+ * @returns {Object<string, number>}
+ */
+export function applyIdf(vector, idfMap) {
+  const weighted = {};
+  for (const [tag, value] of Object.entries(vector)) {
+    weighted[tag] = value * (idfMap[tag] ?? 0);
+  }
+  return l2Normalize(weighted);
+}
+
+/**
  * Build the taste profile from an owned-games library and whatever SteamSpy
  * tag data is currently cached (partial cache is fine — a game with no
  * cached/usable tag data simply doesn't contribute, same as a game that
@@ -153,9 +208,13 @@ export function l2Normalize(vector) {
  *   appid -> SteamSpy trio, or `null` (fetched, no usable tags) or `undefined` (not fetched yet).
  * @param {number} windowMonths
  * @param {number} now - reference time in ms.
+ * @param {Object<string, number>|null} [idfMap] - tag -> idf weight (Increment 4, see computeIdf).
+ *   Applied to the summed profile vector before normalisation instead of
+ *   per-game (equivalent, since idf is a per-tag constant and summation is
+ *   linear). Omit to build the profile unweighted (pre-inc-4 behaviour).
  * @returns {{profile: Object<string, number>, contributions: Array<{appid: number, name: string, hours: number, tagWeights: Object<string, number>}>}}
  */
-export function buildProfile(ownedGames, spyDataByAppid, windowMonths = 12, now = Date.now()) {
+export function buildProfile(ownedGames, spyDataByAppid, windowMonths = 12, now = Date.now(), idfMap = null) {
   const topGames = selectTopOwnedGames(ownedGames, windowMonths, now, TOP_OWNED_GAMES);
   const summed = {};
   const contributions = [];
@@ -185,5 +244,6 @@ export function buildProfile(ownedGames, spyDataByAppid, windowMonths = 12, now 
     });
   }
 
-  return { profile: l2Normalize(summed), contributions };
+  const profile = idfMap ? applyIdf(summed, idfMap) : l2Normalize(summed);
+  return { profile, contributions };
 }

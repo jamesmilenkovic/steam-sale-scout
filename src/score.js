@@ -1,23 +1,19 @@
-// Steam Sale Scout — candidate ranking (Increment 3).
+// Steam Sale Scout — candidate ranking (Increment 4).
 //
 // Pure, dependency-free ESM (aside from profile.js's tag-vector builder) so
 // it can be imported both by src/worker.js and by `node --test`.
 
-import { buildTagVector } from "./profile.js";
-
-/** Review-quality clamp bounds. */
-export const QUALITY_MIN = 0.5;
-export const QUALITY_MAX = 1;
-
-/** Quality assumed for a game with too few reviews to trust the ratio. */
-export const NEUTRAL_QUALITY = 0.75;
-
-/** Below this many total (positive+negative) reviews, use NEUTRAL_QUALITY
- * instead of the raw ratio. */
-export const NEUTRAL_REVIEW_THRESHOLD = 50;
+import { buildTagVector, applyIdf } from "./profile.js";
 
 /** Multiplier applied to rankScore when a deal is at its historical low. */
 export const HISTORICAL_LOW_BONUS = 1.15;
+
+/** Hard quality floors, applied after scoring but before a candidate is
+ * allowed into `recs` (Increment 4 — kills shovelware that the Wilson bound
+ * alone doesn't zero out, e.g. a game with exactly 51 mixed reviews). */
+export const MIN_REVIEWS = 50;
+export const MIN_QUALITY = 0.7;
+export const MIN_OWNERS = 5000;
 
 /**
  * Cosine similarity between two sparse tag vectors (tag -> weight). Returns
@@ -43,17 +39,35 @@ export function cosineSimilarity(a, b) {
 }
 
 /**
- * Review-quality score, clamped to [0.5, 1], falling back to a neutral 0.75
- * when there are too few total reviews to trust the ratio.
+ * The lower bound of the 95% Wilson confidence interval on the true
+ * positive-review ratio, given `pos` positive and `neg` negative reviews.
+ * Unlike a raw ratio, this is naturally punishing when there are few
+ * reviews (wide interval -> low bound) and converges toward the ratio as
+ * reviews pile up (narrow interval) — so thin-review shovelware can't
+ * free-ride on a lucky 100% ratio from three reviews.
+ * @param {number} pos
+ * @param {number} neg
+ * @param {number} z - the confidence z-score (1.96 = 95%).
+ * @returns {number}
+ */
+export function wilsonLowerBound(pos, neg, z = 1.96) {
+  const n = pos + neg;
+  if (n === 0) return 0;
+  const phat = pos / n;
+  const z2 = z * z;
+  return (phat + z2 / (2 * n) - z * Math.sqrt((phat * (1 - phat) + z2 / (4 * n)) / n)) / (1 + z2 / n);
+}
+
+/**
+ * Review-quality score: the Wilson lower bound on the positive-review
+ * ratio. No clamping, no neutral default for thin-review games — a game
+ * with 0 reviews scores 0.
  * @param {number|undefined} positive
  * @param {number|undefined} negative
  * @returns {number}
  */
 export function quality(positive, negative) {
-  const total = (positive || 0) + (negative || 0);
-  if (total < NEUTRAL_REVIEW_THRESHOLD) return NEUTRAL_QUALITY;
-  const ratio = positive / total;
-  return Math.min(QUALITY_MAX, Math.max(QUALITY_MIN, ratio));
+  return wilsonLowerBound(positive || 0, negative || 0);
 }
 
 /**
@@ -76,29 +90,48 @@ export function rankScore(similarity, qualityValue, atHistoricalLow) {
  * missing/empty — whether because they genuinely have none, e.g. a
  * DLC/bundle, or because their tag data simply hasn't been fetched yet by
  * the background queue) are excluded from `recs` and counted in
- * `excludedCount`. During a cold-start cache build this means the excluded
- * count temporarily includes "not yet fetched" candidates alongside
- * permanently-tagless ones — it self-corrects as the queue completes
- * (tracked separately by /api/recs's fetched/total).
+ * `excludedCount`. Callers that need to tell "not yet fetched" apart from
+ * "permanently tagless" (e.g. for a UI footnote) should filter those out
+ * before calling scoreCandidates — see src/worker.js's `pendingCount`.
  *
- * @param {Object<string, number>} profile - L2-normalised taste profile.
- * @param {Array<{appid: number|null, tags?: Object<string,number>, reviews?: {positive?: number, negative?: number}, atHistoricalLow?: boolean}>} candidates
- * @returns {{recs: Array<object>, excludedCount: number}}
+ * Scoreable candidates that clear the tag check but fail any of the hard
+ * quality floors (MIN_REVIEWS total reviews, MIN_QUALITY Wilson score,
+ * MIN_OWNERS SteamSpy owners-midpoint) are excluded from `recs` and counted
+ * separately in `qualityExcludedCount`, so the two exclusion reasons don't
+ * get conflated. A candidate with no owners data at all (`owners`
+ * undefined) is treated as failing MIN_OWNERS (0) — see src/worker.js,
+ * which only calls scoreCandidates with cached (fetched) SteamSpy entries,
+ * so a candidate with tags will also have an owners value; missing owners
+ * alongside present tags should be rare in practice.
+ *
+ * @param {Object<string, number>} profile - taste profile (L2-normalised, or IDF-weighted if idfMap given).
+ * @param {Array<{appid: number|null, tags?: Object<string,number>, reviews?: {positive?: number, negative?: number}, owners?: number, atHistoricalLow?: boolean}>} candidates
+ * @param {Object<string, number>|null} [idfMap] - tag -> idf weight, applied to each candidate's tag vector before cosine similarity. Omit to score unweighted (pre-inc-4 behaviour).
+ * @returns {{recs: Array<object>, excludedCount: number, qualityExcludedCount: number}}
  */
-export function scoreCandidates(profile, candidates) {
+export function scoreCandidates(profile, candidates, idfMap = null) {
   let excludedCount = 0;
+  let qualityExcludedCount = 0;
   const scored = [];
 
   for (const candidate of candidates) {
-    const tagVector = candidate.appid != null ? buildTagVector(candidate.tags) : {};
-    if (candidate.appid == null || Object.keys(tagVector).length === 0) {
+    const rawTagVector = candidate.appid != null ? buildTagVector(candidate.tags) : {};
+    if (candidate.appid == null || Object.keys(rawTagVector).length === 0) {
       excludedCount++;
       continue;
     }
 
-    const similarity = cosineSimilarity(profile, tagVector);
     const reviews = candidate.reviews || {};
+    const totalReviews = (reviews.positive || 0) + (reviews.negative || 0);
     const qualityValue = quality(reviews.positive, reviews.negative);
+    const owners = candidate.owners || 0;
+    if (totalReviews < MIN_REVIEWS || qualityValue < MIN_QUALITY || owners < MIN_OWNERS) {
+      qualityExcludedCount++;
+      continue;
+    }
+
+    const tagVector = idfMap ? applyIdf(rawTagVector, idfMap) : rawTagVector;
+    const similarity = cosineSimilarity(profile, tagVector);
     const score = rankScore(similarity, qualityValue, Boolean(candidate.atHistoricalLow));
 
     scored.push({
@@ -111,5 +144,5 @@ export function scoreCandidates(profile, candidates) {
   }
 
   scored.sort((a, b) => b.rankScore - a.rankScore);
-  return { recs: scored, excludedCount };
+  return { recs: scored, excludedCount, qualityExcludedCount };
 }
