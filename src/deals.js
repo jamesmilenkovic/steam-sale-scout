@@ -28,6 +28,38 @@ export const MIN_CUT_DEFAULT = 60;
 export const MIN_CUT_MIN = 40;
 export const MIN_CUT_MAX = 90;
 
+// ---------------------------------------------------------------------------
+// Best of Steam candidate sourcing (Increment 5.5). A dedicated pool, decoupled
+// from the Deals feed above — see src/worker.js's fetchBestOfPages/
+// buildBestOfPool header comment for why. Live probe (2026-07-08) found ITAD
+// /deals/v2 carries no rating field and rejects `filter=rating` (400), so the
+// server-side-rating tier is unavailable; `sort=rank` (ascending = most-
+// popular-first) works and surfaces all-timers in the first pages. Do NOT
+// switch this to `-rank` (descending) — that's a shovelware-first sort, the
+// same failure mode this fix exists to avoid.
+// ---------------------------------------------------------------------------
+
+/** Popularity sort axis for the Best-of pool — ASCENDING `rank` (most popular
+ * first). Never `-cut` (that's the Deals axis) and never `-rank` (shovelware). */
+export const BESTOF_SORT = "rank";
+
+/** Sourcing floor for the Best-of pool (config, not the bar filter — see
+ * SPEC.md §1). Deliberately low so shallow-cut qualifiers still enter the
+ * pool; the filter bar's min-discount control (§2) tightens client-side. */
+export const BESTOF_MIN_CUT = 10;
+
+/** Max ITAD game ids to fetch from /deals/v2 for the Best-of pool across all
+ * pages — independent of, and much larger than, DEALS_FETCH_CAP. */
+export const BESTOF_FETCH_CAP = 5000;
+
+/** Deals-per-page requested for the Best-of pool (same as DEALS_PAGE_LIMIT). */
+export const BESTOF_PAGE_LIMIT = 200;
+
+/** Safety bound on page count when paging the Best-of pool (100 x 200/page =
+ * 20,000 deals-worth of requests, well under the BESTOF_FETCH_CAP in practice
+ * since paging stops once the cap is reached). */
+export const BESTOF_MAX_PAGES = 100;
+
 /**
  * A deal counts as "at its historical low" if its price is at or below the
  * recorded low plus this many cents — absorbs cent-level rounding/timing

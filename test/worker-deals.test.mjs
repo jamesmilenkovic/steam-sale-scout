@@ -15,6 +15,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import worker from "../src/worker.js";
 import { __setSpyMinIntervalMsForTests, __resetSpyQueueForTests } from "../src/spyQueue.js";
+import { BESTOF_FETCH_CAP, BESTOF_SORT, DEALS_FETCH_CAP } from "../src/deals.js";
 
 const originalFetch = globalThis.fetch;
 const originalCaches = globalThis.caches;
@@ -578,6 +579,40 @@ test("a deal with appid == null is handled cleanly: no deck fetch, no crash", as
   assert.equal(enriched.batteryFriendly, false);
   assert.deepEqual(enriched.deck, { deck: 0, os: 0, frame: 0 });
   assert.equal(getItemsCalls, 0, "a null-appid deal must never trigger a Deck compat fetch");
+});
+
+// ---------------------------------------------------------------------------
+// Increment 5.5 regression: /api/deals' own sourcing (sort=-cut, cap=1000)
+// must stay byte-identical now that /api/best-of has a separate pool with
+// its own sort/cap (see src/deals.js's BESTOF_* config, test/worker-hof.
+// test.mjs's sourcing tests). The two configs must coexist without either
+// bleeding into the other.
+// ---------------------------------------------------------------------------
+
+test("Deals-pool-unchanged regression: /api/deals still sources sort=-cut, independent of the Best-of config", async () => {
+  const capturedSorts = [];
+  globalThis.fetch = makeItadFetch({
+    dealsPagesByOffset: { 0: { list: [rawDeal("itad-1", "A Deal", 70, 10)], hasMore: false } },
+    appIdsById: { "itad-1": ["app/1"] },
+    onCall: (u) => {
+      if (u.pathname === "/deals/v2") capturedSorts.push(u.searchParams.get("sort"));
+    },
+  });
+  globalThis.caches = { default: makeMockCache() };
+
+  const env = makeEnv();
+  const ctx = makeCtx();
+  const res = await worker.fetch(new Request("https://x/api/deals?minCut=60"), env, ctx);
+  await ctx.flush();
+
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.minCut, 60);
+  assert.deepEqual(capturedSorts, ["-cut"]);
+  assert.notEqual(BESTOF_SORT, "-cut");
+  assert.notEqual(BESTOF_SORT, capturedSorts[0]); // the two pools' sort axes never collide
+  assert.equal(DEALS_FETCH_CAP, 1000);
+  assert.notEqual(DEALS_FETCH_CAP, BESTOF_FETCH_CAP); // the two pools' caps coexist independently
 });
 
 test("/api/deals response carries the restored cache-control: public, max-age=21600 header", async () => {

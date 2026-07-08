@@ -137,20 +137,22 @@
 </nav>
 
 <!--
-  Filter bar (Increment 5). One shared bar, applied to the sale tabs (Deals,
-  Recs, Best of Steam) — not Library, which is owned games with no
-  price/deal/tags in the same shape (see public/filters.js's header FLAGGED
-  note). Min discount is the pre-existing per-tab control, consolidated here
-  per spec ("existing control, moves into the bar") — it's still a SERVER
-  parameter (?minCut=) shared by all three sale tabs, not a client-only
-  filter. Every other field here is a client-side filter applied to whatever
-  the active tab already fetched, via public/filters.js's applyFilters().
+  Filter bar (Increment 5; min-discount retired from a server param to a
+  client-side filter in Increment 5.5). One shared bar, applied to the sale
+  tabs (Deals, Recs, Best of Steam) — not Library, which is owned games with
+  no price/deal/tags in the same shape (see public/filters.js's header
+  FLAGGED note). Every field here, including Min discount, is a client-side
+  filter applied to whatever the active tab already fetched, via
+  public/filters.js's applyFilters() — none of them re-fetch. Deals/Recs
+  still send a fixed server minCut for SOURCING (see DEALS_SOURCING_MIN_CUT
+  in the script below); Best-of no longer sends minCut at all (its own
+  sourcing floor is a server-side config, not a query param — see SPEC.md §1).
 -->
 <div id="filter-bar" class="filter-bar" hidden>
   <div class="filter-row">
     <label>
       Min discount (%):
-      <input type="number" id="min-cut" min="40" max="90" step="1" />
+      <input type="number" id="filter-min-discount" min="0" max="100" step="1" placeholder="any" />
     </label>
     <label>
       Max price (AUD):
@@ -542,15 +544,17 @@
     });
   });
 
-  // --- Filter bar (Increment 5) --------------------------------------------
+  // --- Filter bar (Increment 5; min-discount client-sided in 5.5) ----------
   // One shared bar (see the HTML comment above #filter-bar) driving
   // public/filters.js's pure predicates. `filters` is the persisted state;
-  // every input below updates it, saves it, and re-renders whichever sale
-  // tab is currently active — cheap, since filtering runs client-side over
-  // data already fetched. Only Min discount (the pre-existing `min-cut`
-  // control) is a SERVER parameter — changing it re-fetches.
+  // every input below (including Min discount, as of 5.5) updates it, saves
+  // it, and re-renders whichever sale tab is currently active — cheap, since
+  // filtering runs client-side over data already fetched. Nothing in this
+  // bar re-fetches; Deals/Recs sourcing uses its own fixed server minCut
+  // (DEALS_SOURCING_MIN_CUT, below), untouched by this bar.
 
   const filterBarEl = document.getElementById("filter-bar");
+  const filterMinDiscountInput = document.getElementById("filter-min-discount");
   const filterMaxPriceInput = document.getElementById("filter-max-price");
   const filterMinSimilarityInput = document.getElementById("filter-min-similarity");
   const filterDeckModeSelect = document.getElementById("filter-deck-mode");
@@ -572,6 +576,7 @@
   }
 
   function applyFilterInputsToUi() {
+    filterMinDiscountInput.value = filters.minDiscount || "";
     filterMaxPriceInput.value = filters.maxPrice ?? "";
     filterMinSimilarityInput.value = filters.minSimilarity || "";
     filterDeckModeSelect.value = filters.deckMode;
@@ -641,6 +646,14 @@
       filterTagDatalistEl.appendChild(option);
     });
   }
+
+  filterMinDiscountInput.addEventListener("change", () => {
+    const raw = filterMinDiscountInput.value;
+    const value = Number(raw);
+    filters.minDiscount = raw === "" || !(value >= 0) ? 0 : value;
+    persistFilters();
+    rerenderActiveTab();
+  });
 
   filterMaxPriceInput.addEventListener("change", () => {
     const raw = filterMaxPriceInput.value;
@@ -746,28 +759,21 @@
 
   // --- Deals (Increment 2, filters/deck/battery added Increment 5) --------
 
-  const MIN_CUT_STORAGE_KEY = "steam-sale-scout.minCut";
-  const DEFAULT_MIN_CUT = 60;
-  const MIN_CUT_MIN = 40;
-  const MIN_CUT_MAX = 90;
+  // Increment 5.5: min-discount is now a client-side bar filter (see the
+  // filter bar wiring above) — Deals/Recs sourcing still needs a fixed
+  // server minCut floor (the pool has to be fetched at SOME discount depth),
+  // so this constant keeps /api/deals?minCut=60 byte-identical to inc-5's
+  // default rather than exposing it as a user control.
+  const DEALS_SOURCING_MIN_CUT = 60;
 
   const dealsStatusEl = document.getElementById("deals-status");
   const dealsTotalsEl = document.getElementById("deals-totals");
   const dealsTableEl = document.getElementById("deals-table");
   const dealsTableBodyEl = document.getElementById("deals-table-body");
-  const minCutInput = document.getElementById("min-cut"); // now lives in the shared filter bar
   const dealsSortSelect = document.getElementById("deals-sort");
   const dealsRefreshBtn = document.getElementById("deals-refresh-btn");
 
   let deals = [];
-
-  function loadMinCut() {
-    const stored = Number(localStorage.getItem(MIN_CUT_STORAGE_KEY));
-    if (stored >= MIN_CUT_MIN && stored <= MIN_CUT_MAX) return stored;
-    return DEFAULT_MIN_CUT;
-  }
-
-  minCutInput.value = loadMinCut();
 
   function renderDeals() {
     const filtered = applyFilters(deals, filters);
@@ -843,8 +849,7 @@
 
     const atLowCount = filtered.filter((d) => d.atHistoricalLow).length;
     dealsTotalsEl.textContent =
-      `${filtered.length} of ${deals.length} deals at ≥${minCutInput.value}% off shown ` +
-      `(filters applied) · ${atLowCount} at historical low`;
+      `${filtered.length} of ${deals.length} deals shown (filters applied) · ${atLowCount} at historical low`;
 
     dealsTableEl.hidden = false;
   }
@@ -855,8 +860,7 @@
     dealsTableEl.hidden = true;
     dealsStatusEl.className = "status";
 
-    const minCut = loadMinCut();
-    const params = new URLSearchParams({ minCut: String(minCut) });
+    const params = new URLSearchParams({ minCut: String(DEALS_SOURCING_MIN_CUT) });
     if (refresh) params.set("refresh", "1");
 
     try {
@@ -874,24 +878,6 @@
       dealsStatusEl.className = "status error";
     }
   }
-
-  /** Reloads whichever sale tabs have already been visited/loaded — the
-   * min-discount control is now shared across all three (Increment 5), so
-   * changing it should refresh every tab it affects, not just the one
-   * that's currently active. */
-  function reloadLoadedSaleTabs() {
-    if (dealsLoaded) loadDeals();
-    if (recsLoaded) loadRecs();
-    if (hofLoaded) loadHof();
-  }
-
-  minCutInput.addEventListener("change", () => {
-    let value = Number(minCutInput.value);
-    if (!(value >= MIN_CUT_MIN && value <= MIN_CUT_MAX)) value = DEFAULT_MIN_CUT;
-    minCutInput.value = value;
-    localStorage.setItem(MIN_CUT_STORAGE_KEY, String(value));
-    reloadLoadedSaleTabs();
-  });
 
   dealsSortSelect.addEventListener("change", renderDeals);
 
@@ -1029,9 +1015,8 @@
     recsStatusEl.hidden = false;
     recsStatusEl.className = "status";
 
-    const minCut = loadMinCut();
     const windowMonths = loadWindowMonths();
-    const params = new URLSearchParams({ minCut: String(minCut), windowMonths: String(windowMonths) });
+    const params = new URLSearchParams({ minCut: String(DEALS_SOURCING_MIN_CUT), windowMonths: String(windowMonths) });
     if (refresh) params.set("refresh", "1");
 
     try {
@@ -1184,9 +1169,12 @@
     hofStatusEl.hidden = false;
     hofStatusEl.className = "status";
 
-    const minCut = loadMinCut();
+    // Increment 5.5: Best-of no longer sends minCut — its sourcing floor is
+    // the server-side BESTOF_MIN_CUT config, not a query param (see SPEC.md
+    // §1). Min-discount in the bar is a client-side filter (applyFilters)
+    // applied below in renderHof, same as the other two sale tabs.
     const windowMonths = loadWindowMonths();
-    const params = new URLSearchParams({ minCut: String(minCut), windowMonths: String(windowMonths) });
+    const params = new URLSearchParams({ windowMonths: String(windowMonths) });
     if (refresh) params.set("refresh", "1");
 
     try {

@@ -9,6 +9,11 @@
 
 import {
   BATCH_SIZE,
+  BESTOF_FETCH_CAP,
+  BESTOF_MAX_PAGES,
+  BESTOF_MIN_CUT,
+  BESTOF_PAGE_LIMIT,
+  BESTOF_SORT,
   DEALS_FETCH_CAP,
   DEALS_PAGE_LIMIT,
   applyHistoricalLow,
@@ -754,7 +759,113 @@ async function handleRecs(request, env, ctx) {
 // (spec §4: "show similarity % as a secondary column ... without ranking on
 // it") — this reuses the same profile/idfMap buildCandidatePool already
 // built, so it's the same number /api/recs would show for the same game.
+//
+// INCREMENT 5.5 FIX: Best-of's candidate pool used to reuse the Deals feed
+// (buildDealsFeed, sorted -cut, capped at DEALS_FETCH_CAP=1000). During a
+// sale that cap saturates at 92-95% off (pure shovelware), so famous
+// all-timers on a real-but-shallower discount (Portal 2 at 80%, Hades at
+// 75%...) never made it into the pool at all — Best-of qualified ~0 games by
+// construction. fetchBestOfPages/buildBestOfPool/loadBestOfPool below are a
+// dedicated sourcing path with its own sort axis, cap, and cache key; the
+// Deals path above (fetchDealsPages/buildDealsFeed/loadDealsForRecs) is
+// untouched and still backs /api/deals and /api/recs exactly as before.
 // ---------------------------------------------------------------------------
+
+/** Cache key for the Best-of candidate pool — its own dedicated key, entirely
+ * separate from dealsCacheKey() above, so building/refreshing this pool never
+ * reads or writes the Deals pool. SPEC.md's prose says "KV cache"; this
+ * mirrors loadDealsForRecs's Cache-API pattern instead (own key, same 6h TTL)
+ * for consistency with the rest of this file and lower risk — a distinct key
+ * still keeps the two pools fully independent, which is the actual
+ * requirement. Flagging the deviation here per the build note. */
+function bestOfPoolCacheKey() {
+  return new Request("https://steam-sale-scout.cache/api/best-of/pool");
+}
+
+/**
+ * Page through ITAD /deals/v2 (Steam shop, AUD) sorted by BESTOF_SORT
+ * (ascending popularity rank — most popular first), capped at
+ * BESTOF_FETCH_CAP and BESTOF_MAX_PAGES. Unlike fetchDealsPages, this does
+ * NOT stop early on a low-cut item: the rank order isn't cut-sorted, so a
+ * shallow discount mid-page doesn't mean every later item is also shallow.
+ * @returns {Promise<Array<{list?: Array, hasMore?: boolean}>>} raw pages
+ */
+async function fetchBestOfPages(env) {
+  const pages = [];
+  let offset = 0;
+  let pageCount = 0;
+
+  while (offset < BESTOF_FETCH_CAP && pageCount < BESTOF_MAX_PAGES) {
+    const url = new URL(`${ITAD_API_BASE}/deals/v2`);
+    url.searchParams.set("key", env.ITAD_API_KEY);
+    url.searchParams.set("country", ITAD_COUNTRY);
+    url.searchParams.set("shops", String(ITAD_SHOP_ID_STEAM));
+    url.searchParams.set("sort", BESTOF_SORT);
+    url.searchParams.set("limit", String(BESTOF_PAGE_LIMIT));
+    url.searchParams.set("offset", String(offset));
+
+    const page = await fetchItadJson(url);
+    pages.push(page);
+    pageCount++;
+
+    const list = page.list || [];
+    offset += list.length;
+
+    const exhausted = page.hasMore === false || list.length < BESTOF_PAGE_LIMIT;
+    if (exhausted) break;
+  }
+
+  return pages;
+}
+
+/** Assemble the Best-of candidate pool: fetch (rank-sorted) -> merge/cap ->
+ * floor at BESTOF_MIN_CUT -> enrich (appid, historical low) -> exclude owned.
+ * Same deals-shaped output buildDealsFeed produces, so buildCandidatePool and
+ * everything downstream (scoring, response shape) needs no changes. */
+async function buildBestOfPool(env, ctx, refresh) {
+  const pages = await fetchBestOfPages(env);
+  const merged = mergeDealPages(pages, BESTOF_FETCH_CAP);
+  const filtered = filterByMinCut(merged, BESTOF_MIN_CUT);
+
+  const itadIds = filtered.map((item) => item.id);
+  const appIdMap = await resolveAppIds(env, ctx, itadIds, refresh);
+  const lowMap = await resolveHistoricalLows(env, ctx, itadIds, refresh);
+
+  const deals = filtered.map((item) => {
+    const deal = normalizeDeal(item, appIdMap.get(item.id) ?? null);
+    const low = lowMap.get(item.id);
+    return applyHistoricalLow(deal, low ? { price: low } : null);
+  });
+
+  const ownedAppIds = await getOwnedAppIds(env, ctx);
+  return excludeOwned(deals, ownedAppIds);
+}
+
+/** Load the Best-of candidate pool, cached under its own key (6h TTL, same
+ * cadence as the Deals pool). ?refresh=1 bypasses and repopulates. */
+async function loadBestOfPool(env, ctx, refresh) {
+  const cache = caches.default;
+  const cacheKey = bestOfPoolCacheKey();
+
+  if (!refresh) {
+    const cached = await cache.match(cacheKey);
+    if (cached) {
+      const body = await cached.clone().json();
+      return body.deals;
+    }
+  }
+
+  const deals = await buildBestOfPool(env, ctx, refresh);
+  const response = new Response(JSON.stringify({ deals }), {
+    status: 200,
+    headers: {
+      "content-type": "application/json",
+      "cache-control": `public, max-age=${DEALS_CACHE_TTL_SECONDS}`,
+    },
+  });
+  ctx.waitUntil(cache.put(cacheKey, response.clone()));
+  return deals;
+}
 
 async function handleHof(request, env, ctx) {
   if (!env.STEAM_API_KEY || !env.STEAM_ID) {
@@ -772,7 +883,6 @@ async function handleHof(request, env, ctx) {
 
   const url = new URL(request.url);
   const refresh = url.searchParams.get("refresh") === "1";
-  const minCut = clampMinCut(url.searchParams.get("minCut"));
   const windowMonthsParam = Number(url.searchParams.get("windowMonths"));
   const windowMonths = windowMonthsParam > 0 ? windowMonthsParam : 12;
 
@@ -786,9 +896,12 @@ async function handleHof(request, env, ctx) {
     );
   }
 
+  // Increment 5.5: Best-of no longer shares the Deals feed (loadDealsForRecs)
+  // — it sources its own pool (see loadBestOfPool above). No minCut param:
+  // the pool's floor is the BESTOF_MIN_CUT config, not a query param.
   let deals;
   try {
-    deals = await loadDealsForRecs(env, ctx, minCut, refresh);
+    deals = await loadBestOfPool(env, ctx, refresh);
   } catch (err) {
     return upstreamErrorResponse(err);
   }

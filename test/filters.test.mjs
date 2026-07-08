@@ -71,6 +71,16 @@ test("saveFilters + loadFilters: round-trips a full filters object", () => {
   assert.deepEqual(loadFilters(storage), filters);
 });
 
+// Increment 5.5: min-discount moved from a server ?minCut= param into this
+// bar's persisted filters (DEFAULT_FILTERS.minDiscount already existed, but
+// nothing previously exercised its own round-trip explicitly).
+test("saveFilters + loadFilters: minDiscount round-trips like every other filter field", () => {
+  const storage = makeMockStorage();
+  const filters = { ...DEFAULT_FILTERS, minDiscount: 45 };
+  saveFilters(filters, storage);
+  assert.equal(loadFilters(storage).minDiscount, 45);
+});
+
 test("loadFilters: a partial/older saved shape is merged over the defaults", () => {
   const storage = makeMockStorage();
   storage.setItem(FILTERS_STORAGE_KEY, JSON.stringify({ minDiscount: 75 }));
@@ -242,6 +252,21 @@ test("applyFilters: combines every filter (AND semantics)", () => {
     item({ appid: 3, price: 999 }), // fails max price
   ];
   const filters = { ...DEFAULT_FILTERS, minDiscount: 60, maxPrice: 20 };
+  const result = applyFilters(items, filters);
+  assert.deepEqual(
+    result.map((i) => i.appid),
+    [1],
+  );
+});
+
+test("applyFilters: minDiscount combines with maxPrice (bar filter wiring, Increment 5.5)", () => {
+  const items = [
+    item({ appid: 1, cut: 80, price: 15 }), // passes both
+    item({ appid: 2, cut: 30, price: 15 }), // fails minDiscount
+    item({ appid: 3, cut: 80, price: 25 }), // fails maxPrice
+    item({ appid: 4, cut: 30, price: 25 }), // fails both
+  ];
+  const filters = { ...DEFAULT_FILTERS, minDiscount: 50, maxPrice: 20 };
   const result = applyFilters(items, filters);
   assert.deepEqual(
     result.map((i) => i.appid),
