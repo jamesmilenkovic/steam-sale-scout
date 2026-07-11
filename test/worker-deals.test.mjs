@@ -107,7 +107,13 @@ function jsonResponse(body, status = 200, headers = {}) {
  * Builds a router-style mock `fetch` dispatching on the ITAD endpoints
  * worker.js hits. `dealsPagesByOffset` maps an offset (number) -> raw
  * /deals/v2 page. `appIdsById` maps itad id -> array of shop-native ids
- * (e.g. ["app/440"]). `lowsById` maps itad id -> `low` record or omits it.
+ * (e.g. ["app/440"]). `lowsById` maps itad id -> the `{amount, amountInt}`
+ * price of the recorded low, or omits it. The response nests that under
+ * `low.price` (`{shop, price: {amount, amountInt}, regular, cut,
+ * timestamp}`) — the REAL /games/historylow/v1 shape (verified live
+ * 2026-07-10; see src/worker.js's resolveHistoricalLows header comment) —
+ * so this mock actually exercises the `r.low?.price` unwrap instead of
+ * masking a shape bug the way a flat `low` object used to.
  */
 function makeItadFetch({
   dealsPagesByOffset = {},
@@ -136,7 +142,7 @@ function makeItadFetch({
       const ids = JSON.parse(options.body);
       const arr = ids
         .filter((id) => lowsById[id] !== undefined)
-        .map((id) => ({ id, low: lowsById[id] }));
+        .map((id) => ({ id, low: { shop: { id: 61 }, price: lowsById[id], regular: null, cut: null, timestamp: null } }));
       return jsonResponse(arr);
     }
 

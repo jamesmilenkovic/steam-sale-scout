@@ -6,6 +6,9 @@
 // and a strict-1req/sec background fetch queue. Non-asset requests reach
 // here; static files are served from ./public. Increment 4 adds Wilson-bound
 // quality + hard quality floors and IDF tag weighting to the scoring engine.
+// Increment 6 adds /api/wishlist: a fail-soft lane over James's own Steam
+// wishlist, resolved to current Steam prices/cuts + historical lows and
+// ranked by explicit intent rather than taste similarity.
 
 import {
   BATCH_SIZE,
@@ -33,6 +36,13 @@ import { getCachedSpy, enqueueSpyFetch } from "./spyQueue.js";
 import { resolveDeckCompat, DEFAULT_DECK_COMPAT } from "./deckCompat.js";
 import { batteryFriendly } from "./battery.js";
 import { buildHallOfFame } from "./hallOfFame.js";
+import {
+  fetchWishlist,
+  parseWishlist,
+  qualifiesForWishlistLane,
+  sortWishlistLane,
+  wishlistWhyLine,
+} from "./wishlist.js";
 
 const STEAM_API_URL =
   "https://api.steampowered.com/IPlayerService/GetOwnedGames/v1/";
@@ -225,10 +235,15 @@ function appIdCacheKey(itadId) {
   );
 }
 
-/** Cache key for one ITAD game id's historical-low record. */
+/** Cache key for one ITAD game id's historical-low record. Bumped to `v2`
+ * (mirrors spyQueue.js's `v2:` KV-key convention) because pre-bump cached
+ * entries held the OLD, buggy shape (see resolveHistoricalLows below) — the
+ * version bump makes old-shape entries simply miss and get refetched under
+ * the corrected shape, rather than relying on every caller passing
+ * ?refresh=1. */
 function historyLowCacheKey(itadId) {
   return new Request(
-    `https://steam-sale-scout.cache/itad/historylow?id=${encodeURIComponent(itadId)}&country=${ITAD_COUNTRY}`,
+    `https://steam-sale-scout.cache/itad/historylow/v2?id=${encodeURIComponent(itadId)}&country=${ITAD_COUNTRY}`,
   );
 }
 
@@ -353,7 +368,19 @@ async function resolveAppIds(env, ctx, itadIds, refresh) {
 /**
  * Resolve historical-low records for a list of ITAD game ids via
  * POST /games/historylow/v1, batched ≤200/call, with a 7-day per-id cache.
- * @returns {Promise<Map<string, object|null>>} id -> raw `low` record or null
+ *
+ * SHAPE FIX (verified live 2026-07-10): /games/historylow/v1 returns
+ * `low = {shop, price: {amount, amountInt}, regular, cut, timestamp}` — the
+ * comparable price is nested at `low.price`, not `low` itself. Every call
+ * site (buildDealsFeed, buildBestOfPool, buildWishlistCandidates) wraps this
+ * map's value as `{ price: low }` before handing it to src/deals.js's
+ * applyHistoricalLow(), which reads `lowRecord.price.amountInt`. Storing the
+ * whole `r.low` object here (the old, buggy behaviour) made that read
+ * `r.low.amountInt` — always undefined — so `atHistoricalLow` never fired in
+ * production. Storing `r.low.price` (the `{amount, amountInt}` sub-object)
+ * instead makes `lowRecord.price` resolve to exactly what applyHistoricalLow
+ * expects, with no changes needed at any call site.
+ * @returns {Promise<Map<string, {amount: number, amountInt: number}|null>>} id -> `low.price` sub-object or null
  */
 async function resolveHistoricalLows(env, ctx, itadIds, refresh) {
   const cache = caches.default;
@@ -375,7 +402,7 @@ async function resolveHistoricalLows(env, ctx, itadIds, refresh) {
     url.searchParams.set("key", env.ITAD_API_KEY);
     url.searchParams.set("country", ITAD_COUNTRY);
     const raw = (await fetchItadJson(url, { method: "POST", body: batch })) || [];
-    const byId = new Map(raw.map((r) => [r.id, r.low || null]));
+    const byId = new Map(raw.map((r) => [r.id, r.low?.price || null]));
 
     for (const id of batch) {
       const low = byId.get(id) ?? null;
@@ -945,6 +972,415 @@ async function handleHof(request, env, ctx) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// /api/wishlist (Increment 6) — "explicit intent" lane: wishlist games on
+// sale or at a historical low, top-billed above Recs. src/wishlist.js owns
+// the parse/qualify/sort/why-line logic (its own repair surface, per
+// SPEC.md); this section owns the fetch/cache/price-resolution wiring,
+// mirroring the Deals pipeline above (fetchDealsPages/buildDealsFeed).
+//
+// FAIL-SOFT IS THE HEADLINE REQUIREMENT HERE: unlike every other route in
+// this file, handleWishlist below never 500s or throws out — missing
+// secrets, a wishlist fetch/parse failure, or a price-resolution failure all
+// land on the same `{available: false}` 200 response, so a Valve/ITAD
+// hiccup only hides this one lane rather than taking the app down.
+// ---------------------------------------------------------------------------
+
+const WISHLIST_RAW_CACHE_TTL_SECONDS = 24 * 60 * 60; // same cadence as /api/library
+const WISHLIST_PRICES_CACHE_TTL_SECONDS = 6 * 60 * 60; // same cadence as /api/deals
+const WISHLIST_TITLE_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60; // titles are static, mirrors deckCompat's 30d
+const WISHLIST_TITLE_ERROR_TTL_SECONDS = 60 * 60;
+const WISHLIST_TITLE_BATCH_SIZE = 100; // mirrors deckCompat.js's DECK_BATCH_SIZE
+
+/** GetItems is also used by src/deckCompat.js, but this fetch/cache is kept
+ * deliberately separate (own URL constant, own cache key/shape) rather than
+ * reusing that module's internals — the build note calls out not touching
+ * resolveDeckCompat's shared cached shape, which other lanes depend on. */
+const STORE_BROWSE_GETITEMS_URL = "https://api.steampowered.com/IStoreBrowseService/GetItems/v1/";
+
+/** Cache key for the raw parsed wishlist (appid/priority/dateAdded only,
+ * pre price-resolution) — its own key, 24h TTL, mirroring libraryCacheKey. */
+function wishlistCacheKey(env) {
+  return new Request(
+    `https://steam-sale-scout.cache/api/wishlist/raw?steamid=${env.STEAM_ID}`,
+  );
+}
+
+/** Cache key for the price-resolved wishlist candidates (post price/history
+ * lookup, pre qualify/sort/enrich) — its own key, 6h TTL, mirroring
+ * dealsCacheKey's cadence. Qualify/sort/enrich are recomputed fresh on every
+ * request on top of this, same relationship enrichDeals has to dealsCacheKey
+ * above (see that function's header comment for why). */
+function wishlistPricesCacheKey(env) {
+  return new Request(
+    `https://steam-sale-scout.cache/api/wishlist/resolved?steamid=${env.STEAM_ID}`,
+  );
+}
+
+/** Cache key for one Steam appid's reverse-resolved ITAD id — the mirror of
+ * appIdCacheKey above (that one resolves ITAD id -> appid via
+ * /lookup/shop/61/id/v1; this resolves appid -> ITAD id via
+ * /lookup/id/shop/61/v1). Long-lived like appIdCacheKey — the mapping is
+ * effectively static. */
+function wishlistItadIdCacheKey(appid) {
+  return new Request(
+    `https://steam-sale-scout.cache/wishlist/itadid?appid=${appid}`,
+  );
+}
+
+/** Cache key for one appid's wishlist title, sourced from GetItems `name` —
+ * an isolated cache, deliberately separate from src/deckCompat.js's own
+ * GetItems cache/shape (see the build note above STORE_BROWSE_GETITEMS_URL). */
+function wishlistTitleCacheKey(appid) {
+  return new Request(
+    `https://steam-sale-scout.cache/wishlist/title?appid=${appid}`,
+  );
+}
+
+/**
+ * Resolve ITAD ids for a list of Steam appids via POST /lookup/id/shop/61/v1
+ * (the reverse of resolveAppIds above), batched ≤200/call, with a 7-day
+ * per-appid cache. Body must be the "app/<appid>" string form — ITAD returns
+ * null for bare integers (verified live, see probe-findings.md).
+ * @returns {Promise<Map<number, string|null>>}
+ */
+async function resolveWishlistItadIds(env, ctx, appids, refresh) {
+  const cache = caches.default;
+  const result = new Map();
+  const idsToFetch = [];
+
+  for (const appid of appids) {
+    const cached = refresh ? undefined : await cache.match(wishlistItadIdCacheKey(appid));
+    if (cached) {
+      const body = await cached.json();
+      result.set(appid, body.itadId);
+    } else {
+      idsToFetch.push(appid);
+    }
+  }
+
+  for (const batch of chunk(idsToFetch, BATCH_SIZE)) {
+    const url = new URL(`${ITAD_API_BASE}/lookup/id/shop/${ITAD_SHOP_ID_STEAM}/v1`);
+    url.searchParams.set("key", env.ITAD_API_KEY);
+    const body = batch.map((appid) => `app/${appid}`);
+    const raw = (await fetchItadJson(url, { method: "POST", body })) || {};
+
+    for (const appid of batch) {
+      const itadId = raw[`app/${appid}`] ?? null;
+      result.set(appid, itadId);
+      const cacheResponse = new Response(JSON.stringify({ itadId }), {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+          "cache-control": `public, max-age=${APPID_CACHE_TTL_SECONDS}`,
+        },
+      });
+      ctx.waitUntil(cache.put(wishlistItadIdCacheKey(appid), cacheResponse));
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Fetch current Steam price/cut for a batch of ITAD ids via
+ * POST /games/prices/v2 (country=AU, shops=61). Ids with no live Steam deal
+ * are OMITTED from the response (verified live) — that omission IS the "has
+ * a price" filter: such wishlist games can't be priced and simply don't
+ * qualify for the lane. Not cached here directly — it feeds the 6h
+ * wishlistPricesCacheKey blob built around it in loadWishlistCandidates.
+ * @returns {Promise<Map<string, {price: number|null, priceCents: number|null, regular: number|null, cut: number|null, expiry: string|null}>>}
+ */
+async function fetchWishlistPrices(env, itadIds) {
+  const result = new Map();
+  for (const batch of chunk(itadIds, BATCH_SIZE)) {
+    if (batch.length === 0) continue;
+    const url = new URL(`${ITAD_API_BASE}/games/prices/v2`);
+    url.searchParams.set("key", env.ITAD_API_KEY);
+    url.searchParams.set("country", ITAD_COUNTRY);
+    url.searchParams.set("shops", String(ITAD_SHOP_ID_STEAM));
+    const raw = (await fetchItadJson(url, { method: "POST", body: batch })) || [];
+
+    for (const entry of raw) {
+      const dealEntry = (entry.deals || []).find((d) => d.shop?.id === ITAD_SHOP_ID_STEAM);
+      if (!dealEntry) continue;
+      result.set(entry.id, {
+        price: dealEntry.price?.amount ?? null,
+        priceCents: dealEntry.price?.amountInt ?? null,
+        regular: dealEntry.regular?.amount ?? null,
+        cut: dealEntry.cut ?? null,
+        expiry: dealEntry.expiry ?? null,
+      });
+    }
+  }
+  return result;
+}
+
+/**
+ * Assemble the price-resolved wishlist candidates (before qualify/sort/
+ * enrich): parsed wishlist items -> reverse ITAD id lookup -> current
+ * price/cut (ids with no live Steam deal are dropped) -> historical low,
+ * reusing resolveHistoricalLows + applyHistoricalLow exactly as
+ * buildDealsFeed does above, so the 7-day low cache and atHistoricalLow
+ * tolerance are shared/identical across lanes -> wishlist fields
+ * (priority, dateAdded, why) attached.
+ * @returns {Promise<Array<object>>}
+ */
+async function buildWishlistCandidates(env, ctx, wishlistItems, refresh) {
+  const appids = wishlistItems.map((item) => item.appid);
+  const itadIdByAppid = await resolveWishlistItadIds(env, ctx, appids, refresh);
+
+  const itadIds = Array.from(
+    new Set(appids.map((appid) => itadIdByAppid.get(appid)).filter((id) => id != null)),
+  );
+  const priceByItadId = await fetchWishlistPrices(env, itadIds);
+  const pricedItadIds = itadIds.filter((id) => priceByItadId.has(id));
+  const lowMap = await resolveHistoricalLows(env, ctx, pricedItadIds, refresh);
+
+  const candidates = [];
+  for (const item of wishlistItems) {
+    const itadId = itadIdByAppid.get(item.appid);
+    if (itadId == null) continue; // no ITAD id resolved — can't be priced
+
+    const priced = priceByItadId.get(itadId);
+    if (!priced) continue; // no live Steam deal — can't be priced, doesn't qualify
+
+    let deal = {
+      itadId,
+      appid: item.appid,
+      title: null, // filled in by enrichWishlist below (GetItems name)
+      price: priced.price,
+      priceCents: priced.priceCents,
+      regular: priced.regular,
+      cut: priced.cut,
+      expiry: priced.expiry,
+      atHistoricalLow: false,
+      historicalLow: null,
+    };
+    const low = lowMap.get(itadId);
+    deal = applyHistoricalLow(deal, low ? { price: low } : null);
+
+    candidates.push({
+      ...deal,
+      priority: item.priority,
+      dateAdded: item.dateAdded,
+      why: wishlistWhyLine(item.dateAdded),
+    });
+  }
+  return candidates;
+}
+
+/** Load the raw parsed wishlist, cached under its own key (24h TTL,
+ * ?refresh=1 bypass), mirroring handleLibrary's cache pattern exactly. */
+async function loadWishlistRaw(env, ctx, refresh) {
+  const cache = caches.default;
+  const cacheKey = wishlistCacheKey(env);
+
+  if (!refresh) {
+    const cached = await cache.match(cacheKey);
+    if (cached) {
+      const body = await cached.clone().json();
+      return body.items;
+    }
+  }
+
+  const json = await fetchWishlist(env);
+  const items = parseWishlist(json);
+  const response = new Response(JSON.stringify({ items }), {
+    status: 200,
+    headers: {
+      "content-type": "application/json",
+      "cache-control": `public, max-age=${WISHLIST_RAW_CACHE_TTL_SECONDS}`,
+    },
+  });
+  ctx.waitUntil(cache.put(cacheKey, response.clone()));
+  return items;
+}
+
+/** Load the price-resolved wishlist candidates, cached under their own key
+ * (6h TTL, ?refresh=1 bypass), mirroring loadDealsForRecs/dealsCacheKey's
+ * cadence. */
+async function loadWishlistCandidates(env, ctx, refresh) {
+  const cache = caches.default;
+  const cacheKey = wishlistPricesCacheKey(env);
+
+  if (!refresh) {
+    const cached = await cache.match(cacheKey);
+    if (cached) {
+      const body = await cached.clone().json();
+      return body.candidates;
+    }
+  }
+
+  const items = await loadWishlistRaw(env, ctx, refresh);
+  const candidates = await buildWishlistCandidates(env, ctx, items, refresh);
+  const response = new Response(JSON.stringify({ candidates }), {
+    status: 200,
+    headers: {
+      "content-type": "application/json",
+      "cache-control": `public, max-age=${WISHLIST_PRICES_CACHE_TTL_SECONDS}`,
+    },
+  });
+  ctx.waitUntil(cache.put(cacheKey, response.clone()));
+  return candidates;
+}
+
+async function fetchWishlistTitlesBatch(appids) {
+  const url = new URL(STORE_BROWSE_GETITEMS_URL);
+  url.searchParams.set(
+    "input_json",
+    JSON.stringify({
+      ids: appids.map((appid) => ({ appid })),
+      context: { language: "english", country_code: ITAD_COUNTRY, steam_realm: 1 },
+      data_request: {},
+    }),
+  );
+  const res = await fetch(url.toString());
+  if (!res.ok) {
+    throw new Error(`GetItems returned ${res.status}`);
+  }
+  const body = await res.json();
+  return body?.response?.store_items || [];
+}
+
+/**
+ * Resolve wishlist titles for a set of appids via a batched GetItems call
+ * (≤100/call), KV-cached 30 days (titles are static) under an isolated key —
+ * see the build note above STORE_BROWSE_GETITEMS_URL for why this doesn't
+ * reuse src/deckCompat.js's own cache. A cold-cache upstream error caches
+ * `null` for a short 1h retry window, same rationale as spyQueue.js/
+ * deckCompat.js's error TTLs; the front end renders a null title as
+ * "(untitled)", same convention as Deals/Recs.
+ * @returns {Promise<Map<number, string|null>>}
+ */
+async function resolveWishlistTitles(env, ctx, appids, refresh) {
+  const cache = caches.default;
+  const result = new Map();
+  const idsToFetch = [];
+
+  for (const appid of appids) {
+    const cached = refresh ? undefined : await cache.match(wishlistTitleCacheKey(appid));
+    if (cached) {
+      const body = await cached.json();
+      result.set(appid, body.title);
+    } else {
+      idsToFetch.push(appid);
+    }
+  }
+
+  for (const batch of chunk(idsToFetch, WISHLIST_TITLE_BATCH_SIZE)) {
+    let items = [];
+    let errored = false;
+    try {
+      items = await fetchWishlistTitlesBatch(batch);
+    } catch {
+      errored = true;
+    }
+
+    const byAppid = new Map(items.map((item) => [item.appid, item.name]));
+    const ttl = errored ? WISHLIST_TITLE_ERROR_TTL_SECONDS : WISHLIST_TITLE_CACHE_TTL_SECONDS;
+    for (const appid of batch) {
+      const title = byAppid.get(appid) ?? null;
+      result.set(appid, title);
+      const cacheResponse = new Response(JSON.stringify({ title }), {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+          "cache-control": `public, max-age=${ttl}`,
+        },
+      });
+      ctx.waitUntil(cache.put(wishlistTitleCacheKey(appid), cacheResponse));
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Attach the display fields the wishlist lane needs to already-qualified/
+ * sorted candidates: title (GetItems name), Steam Deck badge
+ * (resolveDeckCompat, same shared pipeline the other lanes use), and
+ * tagNames/batteryFriendly (SteamSpy lazy-fill, same pattern as enrichDeals
+ * above). Runs only over qualifying candidates, not the whole wishlist —
+ * cheaper, and matches the "candidates only" cost-minimisation convention
+ * buildCandidatePool/resolveDeckCompat already use elsewhere in this file.
+ * @returns {Promise<Array<object>>}
+ */
+async function enrichWishlist(env, ctx, candidates, refresh) {
+  const appids = Array.from(new Set(candidates.map((c) => c.appid)));
+
+  const spyByAppid = new Map();
+  await Promise.all(
+    appids.map(async (appid) => {
+      spyByAppid.set(appid, await getCachedSpy(env, appid));
+    }),
+  );
+  const missingSpy = appids.filter((appid) => !spyByAppid.get(appid).cached);
+  if (missingSpy.length > 0) enqueueSpyFetch(env, ctx, missingSpy);
+
+  const deckByAppid = await resolveDeckCompat(env, appids);
+  const titleByAppid = await resolveWishlistTitles(env, ctx, appids, refresh);
+
+  return candidates.map((item) => {
+    const spyEntry = spyByAppid.get(item.appid);
+    const tags = spyEntry?.cached ? spyEntry.data?.tags || {} : {};
+    return {
+      ...item,
+      title: titleByAppid.get(item.appid) || null,
+      tagNames: Object.keys(tags),
+      batteryFriendly: batteryFriendly(tags),
+      deck: deckByAppid.get(item.appid) || DEFAULT_DECK_COMPAT,
+    };
+  });
+}
+
+function wishlistUnavailableResponse() {
+  return new Response(
+    JSON.stringify({ available: false, notice: "Wishlist unavailable" }),
+    { status: 200, headers: { "content-type": "application/json" } },
+  );
+}
+
+/**
+ * ASSUMPTION (flagged for the gate): unlike every other route in this file,
+ * missing secrets (STEAM_ID/ITAD_API_KEY) here return the SAME fail-soft 200
+ * `{available: false}` shape as an upstream failure, not a 500 — the spec's
+ * headline requirement for this lane is that it never breaks the rest of
+ * the app, and a missing-secret 500 would be indistinguishable from any
+ * other route's hard failure to the front end. The other routes' 500s are
+ * deliberately left untouched.
+ */
+async function handleWishlist(request, env, ctx) {
+  const url = new URL(request.url);
+  const refresh = url.searchParams.get("refresh") === "1";
+
+  if (!env.STEAM_ID || !env.ITAD_API_KEY) {
+    return wishlistUnavailableResponse();
+  }
+
+  let candidates;
+  try {
+    candidates = await loadWishlistCandidates(env, ctx, refresh);
+  } catch {
+    return wishlistUnavailableResponse();
+  }
+
+  const qualifying = candidates.filter((c) => qualifiesForWishlistLane(c));
+  const sorted = sortWishlistLane(qualifying);
+
+  let enriched;
+  try {
+    enriched = await enrichWishlist(env, ctx, sorted, refresh);
+  } catch {
+    return wishlistUnavailableResponse();
+  }
+
+  return new Response(
+    JSON.stringify({ available: true, count: enriched.length, wishlist: enriched }),
+    { status: 200, headers: { "content-type": "application/json" } },
+  );
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -959,6 +1395,9 @@ export default {
     }
     if (url.pathname === "/api/best-of") {
       return handleHof(request, env, ctx);
+    }
+    if (url.pathname === "/api/wishlist") {
+      return handleWishlist(request, env, ctx);
     }
     if (url.pathname.startsWith("/api/")) {
       return jsonError("not implemented", 501);

@@ -124,6 +124,19 @@
   .badge-deck-verified { background: #1a8a3c; color: #fff; }
   .badge-deck-playable { background: #b7860b; color: #fff; }
   .badge-battery { background: #2f7d6b; color: #fff; margin-left: 0.3rem; cursor: help; }
+  .wishlist-section {
+    margin-bottom: 1.25rem;
+    padding: 0.75rem;
+    background: #fbf7ec;
+    border: 1px solid #ecdfb8;
+    border-radius: 6px;
+  }
+  .wishlist-section summary {
+    cursor: pointer;
+    font-weight: 600;
+    color: #6b5a1f;
+  }
+  .wishlist-section table { margin-top: 0.5rem; }
 </style>
 
 <h1>Steam Sale Scout</h1>
@@ -272,6 +285,38 @@
 </section>
 
 <section id="tab-recs" class="tab-panel" hidden>
+  <!--
+    Wishlist lane (Increment 6): top-billed, above Recs (PRD placement).
+    Explicit intent (wishlist membership) beats similarity, so it gets its
+    own collapsible section and its own table — no Similarity column, since
+    src/wishlist.js's ranking doesn't use taste scoring at all. Fail-soft:
+    #wishlist-section stays hidden and #wishlist-notice shows instead
+    whenever /api/wishlist comes back unavailable or the fetch throws (see
+    loadWishlist() below) — the rest of the Recs tab must keep working.
+  -->
+  <div id="wishlist-notice" class="status" hidden>Wishlist unavailable</div>
+  <details id="wishlist-section" class="wishlist-section" open hidden>
+    <summary>Wishlist bargains <span id="wishlist-count-badge"></span></summary>
+    <div id="wishlist-status" class="status">Loading…</div>
+    <div id="wishlist-totals" class="totals" hidden></div>
+    <div id="wishlist-empty" class="status" hidden>Nothing on your wishlist is on sale today.</div>
+    <table id="wishlist-table" hidden>
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Price (AUD)</th>
+          <th>Regular</th>
+          <th>% off</th>
+          <th>Deck</th>
+          <th>Battery</th>
+          <th>Why</th>
+          <th>Store</th>
+        </tr>
+      </thead>
+      <tbody id="wishlist-table-body"></tbody>
+    </table>
+  </details>
+
   <div class="controls">
     <label>
       Recency window (months):
@@ -513,6 +558,7 @@
   let dealsLoaded = false;
   let recsLoaded = false;
   let hofLoaded = false;
+  let wishlistLoaded = false;
   let activeTab = "library";
 
   tabButtons.forEach((btn) => {
@@ -535,6 +581,10 @@
       if (tab === "recs" && !recsLoaded) {
         recsLoaded = true;
         loadRecs();
+      }
+      if (tab === "recs" && !wishlistLoaded) {
+        wishlistLoaded = true;
+        loadWishlist();
       }
       if (tab === "hof" && !hofLoaded) {
         hofLoaded = true;
@@ -600,6 +650,7 @@
   function rerenderActiveTab() {
     if (activeTab === "deals" && dealsLoaded) renderDeals();
     if (activeTab === "recs" && recsLoaded && lastRecsBody) renderRecs(lastRecsBody);
+    if (activeTab === "recs" && wishlistAvailable && lastWishlistBody) renderWishlist(lastWishlistBody);
     if (activeTab === "hof" && hofLoaded && lastHofBody) renderHof(lastHofBody);
   }
 
@@ -883,6 +934,139 @@
 
   dealsRefreshBtn.addEventListener("click", () => loadDeals(true));
 
+  // --- Wishlist (Increment 6) ----------------------------------------------
+  // Top-billed, above Recs (PRD placement) — explicit intent (being on the
+  // wishlist) beats taste similarity, so this lane has no Similarity column
+  // and isn't scored by src/score.js at all; /api/wishlist does its own
+  // qualify/sort server-side (src/wishlist.js). Fail-soft per spec: any
+  // `available:false` or a thrown fetch hides #wishlist-section entirely and
+  // shows #wishlist-notice instead — the rest of the Recs tab (and the app)
+  // must keep working regardless of Valve/ITAD wishlist trouble.
+
+  const wishlistNoticeEl = document.getElementById("wishlist-notice");
+  const wishlistSectionEl = document.getElementById("wishlist-section");
+  const wishlistCountBadgeEl = document.getElementById("wishlist-count-badge");
+  const wishlistStatusEl = document.getElementById("wishlist-status");
+  const wishlistTotalsEl = document.getElementById("wishlist-totals");
+  const wishlistEmptyEl = document.getElementById("wishlist-empty");
+  const wishlistTableEl = document.getElementById("wishlist-table");
+  const wishlistTableBodyEl = document.getElementById("wishlist-table-body");
+
+  let lastWishlistBody = null;
+  let wishlistAvailable = false;
+
+  /** Renders the wishlist lane from its last-fetched raw body, applying the
+   * shared filter bar with DEFAULT options (per spec §4) — min similarity
+   * and the quality floors are both exempt (this lane has neither a
+   * similarity score nor a quality/owners/reviews signal); min discount, max
+   * price, tag include/exclude, Deck, and battery all apply. Kept separate
+   * from the qualify/sort the server already did, so re-rendering on a
+   * filter-bar change never needs a refetch. */
+  function renderWishlist(body) {
+    lastWishlistBody = body;
+    const items = body.wishlist || [];
+    const filtered = applyFilters(items, filters);
+
+    wishlistCountBadgeEl.textContent = `(${items.length})`;
+
+    wishlistTableBodyEl.innerHTML = "";
+    filtered.forEach((item) => {
+      const tr = document.createElement("tr");
+
+      const nameTd = document.createElement("td");
+      nameTd.textContent = item.title || "(untitled)";
+      tr.appendChild(nameTd);
+
+      const priceTd = document.createElement("td");
+      priceTd.textContent = item.price != null ? `$${item.price.toFixed(2)}` : "—";
+      tr.appendChild(priceTd);
+
+      const regularTd = document.createElement("td");
+      if (item.regular != null) {
+        const s = document.createElement("s");
+        s.className = "regular-price";
+        s.textContent = `$${item.regular.toFixed(2)}`;
+        regularTd.appendChild(s);
+      }
+      tr.appendChild(regularTd);
+
+      const cutTd = document.createElement("td");
+      const cutBadge = document.createElement("span");
+      cutBadge.className = "badge badge-cut";
+      cutBadge.textContent = `-${item.cut}%`;
+      cutTd.appendChild(cutBadge);
+      if (item.atHistoricalLow) {
+        const lowBadge = document.createElement("span");
+        lowBadge.className = "badge badge-low";
+        lowBadge.textContent = "HISTORICAL LOW";
+        if (item.historicalLow != null) {
+          lowBadge.title = `Recorded low: $${item.historicalLow.toFixed(2)}`;
+        }
+        cutTd.appendChild(lowBadge);
+      }
+      tr.appendChild(cutTd);
+
+      const deckTd = document.createElement("td");
+      appendDeckBadge(deckTd, item.deck);
+      tr.appendChild(deckTd);
+
+      const batteryTd = document.createElement("td");
+      appendBatteryBadge(batteryTd, item);
+      tr.appendChild(batteryTd);
+
+      const whyTd = document.createElement("td");
+      whyTd.className = "why-line";
+      whyTd.textContent = item.why || "—";
+      tr.appendChild(whyTd);
+
+      const storeTd = document.createElement("td");
+      if (item.appid) {
+        const a = document.createElement("a");
+        a.href = `https://store.steampowered.com/app/${item.appid}`;
+        a.target = "_blank";
+        a.rel = "noopener";
+        a.textContent = "Steam";
+        storeTd.appendChild(a);
+      }
+      tr.appendChild(storeTd);
+
+      wishlistTableBodyEl.appendChild(tr);
+    });
+
+    wishlistTotalsEl.textContent = `${filtered.length} of ${items.length} wishlist bargains shown (filters applied)`;
+    wishlistTotalsEl.hidden = false;
+    wishlistEmptyEl.hidden = filtered.length !== 0;
+    wishlistTableEl.hidden = filtered.length === 0;
+  }
+
+  async function loadWishlist(refresh = false) {
+    wishlistNoticeEl.hidden = true;
+    wishlistSectionEl.hidden = false;
+    wishlistStatusEl.textContent = "Loading…";
+    wishlistStatusEl.hidden = false;
+    wishlistTotalsEl.hidden = true;
+    wishlistEmptyEl.hidden = true;
+    wishlistTableEl.hidden = true;
+
+    try {
+      const res = await fetch(refresh ? "/api/wishlist?refresh=1" : "/api/wishlist");
+      const body = await res.json();
+      if (!res.ok || body.available === false) {
+        wishlistAvailable = false;
+        wishlistSectionEl.hidden = true;
+        wishlistNoticeEl.hidden = false;
+        return;
+      }
+      wishlistAvailable = true;
+      wishlistStatusEl.hidden = true;
+      renderWishlist(body);
+    } catch (err) {
+      wishlistAvailable = false;
+      wishlistSectionEl.hidden = true;
+      wishlistNoticeEl.hidden = false;
+    }
+  }
+
   // --- Recs (Increment 3; filters/deck/battery added Increment 5) ---------
   // Reuses the shared min-discount control/storage (now in the filter bar)
   // and the same recency-window control/storage as the Library tab —
@@ -1046,7 +1230,10 @@
     loadRecs();
   });
 
-  recsRefreshBtn.addEventListener("click", () => loadRecs(true));
+  recsRefreshBtn.addEventListener("click", () => {
+    loadRecs(true);
+    loadWishlist(true);
+  });
 
   // --- Best of Steam (Increment 5) -----------------------------------------
   // Taste-agnostic Hall of Fame: same deals pool + polling shape as Recs,
