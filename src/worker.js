@@ -30,12 +30,12 @@ import {
   parseSteamAppId,
 } from "./deals.js";
 import { TOP_OWNED_GAMES, buildProfile, selectTopOwnedGames, computeIdf, buildTagVector, applyIdf } from "./profile.js";
-import { scoreCandidates, cosineSimilarity } from "./score.js";
+import { scoreCandidates, cosineSimilarity, quality } from "./score.js";
 import { buildWhy } from "./why.js";
 import { getCachedSpy, enqueueSpyFetch } from "./spyQueue.js";
 import { resolveDeckCompat, DEFAULT_DECK_COMPAT } from "./deckCompat.js";
 import { batteryFriendly } from "./battery.js";
-import { buildHallOfFame } from "./hallOfFame.js";
+import { buildHallOfFame, qualifiesForHof } from "./hallOfFame.js";
 import {
   fetchWishlist,
   parseWishlist,
@@ -43,6 +43,19 @@ import {
   sortWishlistLane,
   wishlistWhyLine,
 } from "./wishlist.js";
+import {
+  FPM_POOL_CAP,
+  FPM_LENGTH_FIELD,
+  hltbInit,
+  hltbLengthSeconds,
+  getCachedHltb,
+  enqueueHltbFetch,
+  fpmScore,
+  funPerHourDisplay,
+  qualifiesForFpm,
+  sortFpmLane,
+  fpmWhyLine,
+} from "./hltb.js";
 
 const STEAM_API_URL =
   "https://api.steampowered.com/IPlayerService/GetOwnedGames/v1/";
@@ -1381,6 +1394,178 @@ async function handleWishlist(request, env, ctx) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// /api/fpm (Increment 7) — "Fun per minute": Wilson quality ÷ HowLongToBeat
+// main-story hours, for players who'd rather have a quick, excellent game
+// than a long good one. Sources the top FPM_POOL_CAP entries of the SAME
+// rank-sorted Best-of pool as /api/best-of (loadBestOfPool, untouched) and
+// requires the SAME Hall-of-Fame quality floor (qualifiesForHof) so the
+// "quality" half of the ratio is trustworthy — no new sourcing, no changes
+// to that pool. Main-story length is resolved per-candidate from
+// HowLongToBeat via src/hltb.js's own throttled background queue, mirroring
+// src/spyQueue.js's progressive-fill pattern. src/hltb.js owns the
+// HLTB handshake/parse/match (its own repair surface, documented there) —
+// this section only owns the fetch/cache/pool wiring, the same split
+// /api/wishlist has with src/wishlist.js.
+//
+// FAIL-SOFT, SOURCE LEVEL (headline requirement, same as /api/wishlist):
+// missing secrets OR a failed hltbInit() handshake both return the same
+// {available:false} 200 the UI treats as "hide this tab" — a HowLongToBeat
+// outage or unofficial-endpoint drift must never take down the rest of the
+// app. The handshake itself is only attempted when there's fresh work to
+// resolve (toResolve.length > 0) — a fully-cached/warm lane is served
+// straight from KV and never calls hltbInit, so it stays available even if
+// HLTB is down (the UI polls this route every 2s while filling; calling
+// hltbInit unconditionally would fire needless handshakes on every poll and
+// let one transient blip wipe an already-resolved lane). Per-game fail-soft
+// (a search/parse/match failure for one candidate) is handled inside
+// src/hltb.js's queue and simply shows up here as a negative cached result
+// (counted in unmatchedCount).
+// ---------------------------------------------------------------------------
+
+function fpmUnavailableResponse() {
+  return new Response(
+    JSON.stringify({ available: false, notice: "Fun-per-minute unavailable" }),
+    { status: 200, headers: { "content-type": "application/json" } },
+  );
+}
+
+async function handleFpm(request, env, ctx) {
+  if (!env.STEAM_API_KEY || !env.STEAM_ID || !env.ITAD_API_KEY) {
+    return fpmUnavailableResponse();
+  }
+
+  const url = new URL(request.url);
+  const refresh = url.searchParams.get("refresh") === "1";
+  const windowMonthsParam = Number(url.searchParams.get("windowMonths"));
+  const windowMonths = windowMonthsParam > 0 ? windowMonthsParam : 12;
+
+  let libraryGames;
+  try {
+    libraryGames = await loadLibraryForRecs(env, ctx, refresh);
+  } catch {
+    return fpmUnavailableResponse();
+  }
+
+  let bestOfPool;
+  try {
+    bestOfPool = await loadBestOfPool(env, ctx, refresh);
+  } catch {
+    return fpmUnavailableResponse();
+  }
+
+  // The pool is already rank-sorted (most-popular-first) by loadBestOfPool —
+  // cap here, never reorder or otherwise touch it (build note: "no changes
+  // to the Best-of pool itself").
+  const capped = bestOfPool.slice(0, FPM_POOL_CAP);
+
+  const pool = await buildCandidatePool(env, ctx, libraryGames, capped, windowMonths);
+  const eligible = pool.candidates.filter((c) => c.appid != null && qualifiesForHof(c));
+
+  // ?refresh=1 bypasses the HLTB cache too (per build note) — every eligible
+  // candidate is treated as unresolved and re-queued rather than reading
+  // getCachedHltb at all.
+  const hltbByAppid = new Map();
+  const toResolve = [];
+  for (const candidate of eligible) {
+    if (!refresh) {
+      const { cached, data } = await getCachedHltb(env, candidate.appid);
+      if (cached) {
+        hltbByAppid.set(candidate.appid, data);
+        continue;
+      }
+    }
+    toResolve.push({ appid: candidate.appid, title: candidate.title });
+  }
+  // The HLTB handshake is only performed when there's genuinely fresh work
+  // to resolve — polling a warm/fully-cached lane must never touch HLTB, so
+  // a transient HLTB blip can't wipe already-resolved rows (see build note
+  // above the toResolve loop). A cold cache that can't reach HLTB genuinely
+  // can't build the lane, so that case still fails soft to {available:false}.
+  if (toResolve.length > 0) {
+    let tokens;
+    try {
+      tokens = await hltbInit();
+    } catch {
+      return fpmUnavailableResponse();
+    }
+    enqueueHltbFetch(env, ctx, toResolve, tokens);
+  }
+
+  const total = eligible.length;
+  const hltbPending = toResolve.length;
+  const fetched = total - hltbPending;
+  const ready = pool.ready && hltbPending === 0;
+
+  // unmatchedCount is ONLY resolved-but-negative candidates (matchMethod
+  // 'none') — the "n games had no length data" footer number. A resolved
+  // match that fails the FPM_MIN_LENGTH_HOURS floor is excluded silently
+  // (degenerate short entry, not "no length data").
+  let unmatchedCount = 0;
+  const rows = [];
+  for (const candidate of eligible) {
+    const record = hltbByAppid.get(candidate.appid);
+    if (record === undefined) continue; // still pending resolution
+    if (record === null) {
+      unmatchedCount++;
+      continue;
+    }
+
+    const lengthSeconds = hltbLengthSeconds(record, FPM_LENGTH_FIELD);
+    const mainHours = lengthSeconds / 3600;
+    if (!qualifiesForFpm({ compMain: lengthSeconds, mainHours })) continue;
+
+    const wilsonQuality = quality(candidate.reviews?.positive, candidate.reviews?.negative);
+    const funPerHour = funPerHourDisplay(wilsonQuality, mainHours);
+    const qualityPercent = Math.round(wilsonQuality * 100);
+
+    rows.push({
+      ...candidate,
+      fpm: fpmScore(wilsonQuality, mainHours),
+      funPerHour,
+      mainHours,
+      matchMethod: record.matchMethod,
+      quality: wilsonQuality,
+      why: fpmWhyLine(qualityPercent, mainHours, funPerHour),
+    });
+  }
+
+  const sorted = sortFpmLane(rows);
+
+  // Deck compat only for candidates that actually made it into the lane —
+  // cheaper, matches /api/recs's "candidates only" convention.
+  const fpmAppids = sorted.map((row) => row.appid);
+  const deckByAppid = await resolveDeckCompat(env, fpmAppids);
+
+  const fpm = sorted.map((row) => {
+    const { tags, reviews, owners, ...rest } = row;
+    const totalReviews = (reviews?.positive || 0) + (reviews?.negative || 0);
+    const reviewPercent = totalReviews > 0 ? Math.round((reviews.positive / totalReviews) * 100) : null;
+    return {
+      ...rest,
+      reviewPercent,
+      reviewCount: totalReviews,
+      owners,
+      tagNames: Object.keys(tags || {}),
+      batteryFriendly: batteryFriendly(tags),
+      deck: deckByAppid.get(rest.appid) || DEFAULT_DECK_COMPAT,
+    };
+  });
+
+  return new Response(
+    JSON.stringify({
+      available: true,
+      ready,
+      fetched,
+      total,
+      unmatchedCount,
+      count: fpm.length,
+      fpm,
+    }),
+    { status: 200, headers: { "content-type": "application/json" } },
+  );
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -1398,6 +1583,9 @@ export default {
     }
     if (url.pathname === "/api/wishlist") {
       return handleWishlist(request, env, ctx);
+    }
+    if (url.pathname === "/api/fpm") {
+      return handleFpm(request, env, ctx);
     }
     if (url.pathname.startsWith("/api/")) {
       return jsonError("not implemented", 501);

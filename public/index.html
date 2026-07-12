@@ -147,6 +147,7 @@
   <button type="button" class="tab-btn" data-tab="deals" aria-selected="false">Deals</button>
   <button type="button" class="tab-btn" data-tab="recs" aria-selected="false">Recs</button>
   <button type="button" class="tab-btn" data-tab="hof" aria-selected="false">Best of Steam</button>
+  <button type="button" class="tab-btn" data-tab="fpm" aria-selected="false">Fun per minute</button>
 </nav>
 
 <!--
@@ -383,6 +384,49 @@
   </table>
 </section>
 
+<!--
+  Fun per minute lane (Increment 7): Wilson quality ÷ HowLongToBeat
+  main-story hours — surfaces short, excellent games over long good ones.
+  Sourced from the same Best-of pool, so it needs the same progressive-fill
+  polling as #tab-hof. It also needs #tab-recs/#tab-hof-style fail-soft
+  (#fpm-notice) since it depends on an unofficial, no-API-key HowLongToBeat
+  handshake that can drift or go down without notice — a failure there hides
+  this tab only, same headline requirement as the Wishlist lane.
+-->
+<section id="tab-fpm" class="tab-panel" hidden>
+  <div id="fpm-notice" class="status" hidden>Fun-per-minute unavailable</div>
+
+  <div class="controls">
+    <button id="fpm-refresh-btn" type="button">Refresh library + deals</button>
+  </div>
+
+  <div id="fpm-status" class="status">Loading…</div>
+  <div id="fpm-progress-wrap" hidden>
+    <div class="progress-track">
+      <div id="fpm-progress-fill" class="progress-fill" style="width: 0%"></div>
+    </div>
+    <div id="fpm-progress-label" class="progress-label"></div>
+  </div>
+  <div id="fpm-totals" class="totals"></div>
+  <div id="fpm-empty" class="status" hidden>No length data yet — still matching…</div>
+  <table id="fpm-table" hidden>
+    <thead>
+      <tr>
+        <th>Name</th>
+        <th>Price (AUD)</th>
+        <th>Regular</th>
+        <th>% off</th>
+        <th>Fun/hr</th>
+        <th>Main story</th>
+        <th>Deck</th>
+        <th>Battery</th>
+        <th>Store</th>
+      </tr>
+    </thead>
+    <tbody id="fpm-table-body"></tbody>
+  </table>
+</section>
+
 <script type="module">
   import { weight } from "./weight.js";
   import {
@@ -554,11 +598,13 @@
     deals: document.getElementById("tab-deals"),
     recs: document.getElementById("tab-recs"),
     hof: document.getElementById("tab-hof"),
+    fpm: document.getElementById("tab-fpm"),
   };
   let dealsLoaded = false;
   let recsLoaded = false;
   let hofLoaded = false;
   let wishlistLoaded = false;
+  let fpmLoaded = false;
   let activeTab = "library";
 
   tabButtons.forEach((btn) => {
@@ -589,6 +635,10 @@
       if (tab === "hof" && !hofLoaded) {
         hofLoaded = true;
         loadHof();
+      }
+      if (tab === "fpm" && !fpmLoaded) {
+        fpmLoaded = true;
+        loadFpm();
       }
       renderTagChips(currentTabRawItems());
     });
@@ -644,6 +694,7 @@
     if (activeTab === "deals") return deals;
     if (activeTab === "recs") return lastRecsBody?.recs || [];
     if (activeTab === "hof") return lastHofBody?.hof || [];
+    if (activeTab === "fpm") return lastFpmBody?.fpm || [];
     return [];
   }
 
@@ -652,6 +703,7 @@
     if (activeTab === "recs" && recsLoaded && lastRecsBody) renderRecs(lastRecsBody);
     if (activeTab === "recs" && wishlistAvailable && lastWishlistBody) renderWishlist(lastWishlistBody);
     if (activeTab === "hof" && hofLoaded && lastHofBody) renderHof(lastHofBody);
+    if (activeTab === "fpm" && fpmAvailable && lastFpmBody) renderFpm(lastFpmBody);
   }
 
   function chipState(tagName) {
@@ -1384,4 +1436,176 @@
   }
 
   hofRefreshBtn.addEventListener("click", () => loadHof(true));
+
+  // --- Fun per minute (Increment 7) ---------------------------------------
+  // Wilson quality ÷ HowLongToBeat main-story hours, over the same
+  // rank-sorted Best-of pool as Best of Steam — same progressive-fill
+  // polling pattern as loadHof/renderHof above. Also needs /api/wishlist's
+  // fail-soft convention: the HowLongToBeat handshake is an unofficial,
+  // no-API-key endpoint that can drift or go down without notice, so
+  // `{available:false}` hides this tab behind #fpm-notice instead of
+  // breaking it — the rest of the app must keep working regardless.
+  //
+  // Bar filters apply EXCEPT min similarity (this lane has no similarity
+  // signal, same as Wishlist) AND the quality floors (Recs + Best-of only
+  // per spec) — applyFilters is called with includeQualityFloors:false and
+  // no includeSimilarity flag at all (its default is already false).
+
+  const FPM_POLL_MS = 2000;
+
+  const fpmNoticeEl = document.getElementById("fpm-notice");
+  const fpmStatusEl = document.getElementById("fpm-status");
+  const fpmProgressWrapEl = document.getElementById("fpm-progress-wrap");
+  const fpmProgressFillEl = document.getElementById("fpm-progress-fill");
+  const fpmProgressLabelEl = document.getElementById("fpm-progress-label");
+  const fpmTotalsEl = document.getElementById("fpm-totals");
+  const fpmEmptyEl = document.getElementById("fpm-empty");
+  const fpmTableEl = document.getElementById("fpm-table");
+  const fpmTableBodyEl = document.getElementById("fpm-table-body");
+  const fpmRefreshBtn = document.getElementById("fpm-refresh-btn");
+
+  let fpmPollTimer = null;
+  let lastFpmBody = null;
+  let fpmAvailable = false;
+
+  function renderFpm(body) {
+    lastFpmBody = body;
+    const items = applyFilters(body.fpm || [], filters, { includeQualityFloors: false });
+
+    fpmTableBodyEl.innerHTML = "";
+    items.forEach((entry) => {
+      const tr = document.createElement("tr");
+
+      const nameTd = document.createElement("td");
+      nameTd.textContent = entry.title || "(untitled)";
+      tr.appendChild(nameTd);
+
+      const priceTd = document.createElement("td");
+      priceTd.textContent = entry.price != null ? `$${entry.price.toFixed(2)}` : "—";
+      tr.appendChild(priceTd);
+
+      const regularTd = document.createElement("td");
+      if (entry.regular != null) {
+        const s = document.createElement("s");
+        s.className = "regular-price";
+        s.textContent = `$${entry.regular.toFixed(2)}`;
+        regularTd.appendChild(s);
+      }
+      tr.appendChild(regularTd);
+
+      const cutTd = document.createElement("td");
+      const cutBadge = document.createElement("span");
+      cutBadge.className = "badge badge-cut";
+      cutBadge.textContent = `-${entry.cut}%`;
+      cutTd.appendChild(cutBadge);
+      if (entry.atHistoricalLow) {
+        const lowBadge = document.createElement("span");
+        lowBadge.className = "badge badge-low";
+        lowBadge.textContent = "HISTORICAL LOW";
+        cutTd.appendChild(lowBadge);
+      }
+      tr.appendChild(cutTd);
+
+      const funPerHourTd = document.createElement("td");
+      funPerHourTd.textContent = entry.funPerHour != null ? entry.funPerHour.toFixed(1) : "—";
+      if (entry.why) funPerHourTd.title = entry.why;
+      tr.appendChild(funPerHourTd);
+
+      const mainHoursTd = document.createElement("td");
+      mainHoursTd.textContent = entry.mainHours != null ? `${entry.mainHours.toFixed(1)}h` : "—";
+      tr.appendChild(mainHoursTd);
+
+      const deckTd = document.createElement("td");
+      appendDeckBadge(deckTd, entry.deck);
+      tr.appendChild(deckTd);
+
+      const batteryTd = document.createElement("td");
+      appendBatteryBadge(batteryTd, entry);
+      tr.appendChild(batteryTd);
+
+      const storeTd = document.createElement("td");
+      if (entry.appid) {
+        const a = document.createElement("a");
+        a.href = `https://store.steampowered.com/app/${entry.appid}`;
+        a.target = "_blank";
+        a.rel = "noopener";
+        a.textContent = "Steam";
+        storeTd.appendChild(a);
+      }
+      tr.appendChild(storeTd);
+
+      fpmTableBodyEl.appendChild(tr);
+    });
+
+    fpmTotalsEl.textContent =
+      `${items.length} of ${(body.fpm || []).length} quick wins shown (filters applied) · ${body.unmatchedCount ?? 0} games had no length data`;
+    // Per SPEC.md §4: while the queue is still resolving lengths and nothing
+    // has landed yet, show the "still matching" empty state instead of a
+    // bare 0-row table.
+    const stillMatching = !body.ready && (body.fpm || []).length === 0;
+    fpmEmptyEl.hidden = !stillMatching;
+    fpmTableEl.hidden = false;
+
+    if (body.ready) {
+      fpmProgressWrapEl.hidden = true;
+    } else {
+      fpmProgressWrapEl.hidden = false;
+      const pct = body.total > 0 ? Math.round((body.fetched / body.total) * 100) : 0;
+      fpmProgressFillEl.style.width = `${pct}%`;
+      fpmProgressLabelEl.textContent = `Matching main-story lengths: ${body.fetched}/${body.total} games (${pct}%) — quick wins fill in as it goes`;
+    }
+  }
+
+  function stopFpmPoll() {
+    if (fpmPollTimer) {
+      clearTimeout(fpmPollTimer);
+      fpmPollTimer = null;
+    }
+  }
+
+  async function loadFpm(refresh = false) {
+    stopFpmPoll();
+    fpmNoticeEl.hidden = true;
+    fpmStatusEl.textContent = "Loading…";
+    fpmStatusEl.hidden = false;
+    fpmStatusEl.className = "status";
+
+    const windowMonths = loadWindowMonths();
+    const params = new URLSearchParams({ windowMonths: String(windowMonths) });
+    if (refresh) params.set("refresh", "1");
+
+    try {
+      const res = await fetch(`/api/fpm?${params}`);
+      const body = await res.json();
+      if (!res.ok) {
+        throw new Error(body.error || `Request failed with status ${res.status}`);
+      }
+
+      if (!body.available) {
+        fpmAvailable = false;
+        fpmStatusEl.hidden = true;
+        fpmTableEl.hidden = true;
+        fpmProgressWrapEl.hidden = true;
+        fpmEmptyEl.hidden = true;
+        fpmTotalsEl.textContent = "";
+        fpmNoticeEl.textContent = body.notice || "Fun-per-minute unavailable";
+        fpmNoticeEl.hidden = false;
+        return;
+      }
+
+      fpmAvailable = true;
+      fpmStatusEl.hidden = true;
+      renderFpm(body);
+      if (activeTab === "fpm") renderTagChips(currentTabRawItems());
+      if (!body.ready) {
+        fpmPollTimer = setTimeout(() => loadFpm(false), FPM_POLL_MS);
+      }
+    } catch (err) {
+      fpmStatusEl.textContent = err.message;
+      fpmStatusEl.className = "status error";
+      fpmProgressWrapEl.hidden = true;
+    }
+  }
+
+  fpmRefreshBtn.addEventListener("click", () => loadFpm(true));
 </script>
