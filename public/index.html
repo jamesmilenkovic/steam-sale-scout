@@ -398,6 +398,22 @@
 
   <div class="controls">
     <button id="fpm-refresh-btn" type="button">Refresh library + deals</button>
+    <label>
+      Ranking:
+      <select id="fpm-formula">
+        <option value="linear">Linear (quality ÷ hours)</option>
+        <option value="sqrt" selected>Sqrt (default — tapers length penalty)</option>
+        <option value="log">Log (gentlest on long games)</option>
+      </select>
+    </label>
+    <label>
+      Quality exponent:
+      <input id="fpm-qexp" type="number" min="0" max="10" step="0.5" value="2" />
+    </label>
+    <label>
+      Breadth weight:
+      <input id="fpm-breadth" type="number" min="0" max="5" step="0.5" value="0" />
+    </label>
   </div>
 
   <div id="fpm-status" class="status">Loading…</div>
@@ -417,6 +433,8 @@
         <th>Regular</th>
         <th>% off</th>
         <th>Fun/hr</th>
+        <th title="Relative to the top-ranked game in this view (100 = best)">Score</th>
+        <th>Reviews</th>
         <th>Main story</th>
         <th>Deck</th>
         <th>Battery</th>
@@ -1463,6 +1481,9 @@
   const fpmTableEl = document.getElementById("fpm-table");
   const fpmTableBodyEl = document.getElementById("fpm-table-body");
   const fpmRefreshBtn = document.getElementById("fpm-refresh-btn");
+  const fpmFormulaSelect = document.getElementById("fpm-formula");
+  const fpmQexpInput = document.getElementById("fpm-qexp");
+  const fpmBreadthInput = document.getElementById("fpm-breadth");
 
   let fpmPollTimer = null;
   let lastFpmBody = null;
@@ -1471,6 +1492,10 @@
   function renderFpm(body) {
     lastFpmBody = body;
     const items = applyFilters(body.fpm || [], filters, { includeQualityFloors: false });
+    // Normalized 0-100 "Score" column (Increment 7.5.1): relative to the
+    // top-ranked item's actual sort score (entry.fpm) in this filtered view —
+    // recomputed per render since the filtered list/order can change.
+    const maxFpmScore = Math.max(...items.map((i) => i.fpm ?? 0), 0);
 
     fpmTableBodyEl.innerHTML = "";
     items.forEach((entry) => {
@@ -1510,6 +1535,19 @@
       funPerHourTd.textContent = entry.funPerHour != null ? entry.funPerHour.toFixed(1) : "—";
       if (entry.why) funPerHourTd.title = entry.why;
       tr.appendChild(funPerHourTd);
+
+      const scoreTd = document.createElement("td");
+      scoreTd.textContent =
+        maxFpmScore > 0 && entry.fpm != null ? String(Math.round((entry.fpm / maxFpmScore) * 100)) : "—";
+      tr.appendChild(scoreTd);
+
+      const reviewsTd = document.createElement("td");
+      reviewsTd.textContent =
+        entry.reviewCount > 0 ? `${entry.reviewPercent}% · ${entry.reviewCount.toLocaleString()}` : "—";
+      if (entry.owners > 0) {
+        reviewsTd.title = `~${entry.owners.toLocaleString()} owners`;
+      }
+      tr.appendChild(reviewsTd);
 
       const mainHoursTd = document.createElement("td");
       mainHoursTd.textContent = entry.mainHours != null ? `${entry.mainHours.toFixed(1)}h` : "—";
@@ -1573,6 +1611,11 @@
     const windowMonths = loadWindowMonths();
     const params = new URLSearchParams({ windowMonths: String(windowMonths) });
     if (refresh) params.set("refresh", "1");
+    // Formula picker overrides (Increment 7.5) — re-rank already-cached
+    // candidates only, never trigger new HLTB queue activity server-side.
+    params.set("formula", fpmFormulaSelect.value);
+    params.set("qexp", fpmQexpInput.value);
+    params.set("breadth", fpmBreadthInput.value);
 
     try {
       const res = await fetch(`/api/fpm?${params}`);
@@ -1608,4 +1651,7 @@
   }
 
   fpmRefreshBtn.addEventListener("click", () => loadFpm(true));
+  fpmFormulaSelect.addEventListener("change", () => loadFpm(false));
+  fpmQexpInput.addEventListener("change", () => loadFpm(false));
+  fpmBreadthInput.addEventListener("change", () => loadFpm(false));
 </script>

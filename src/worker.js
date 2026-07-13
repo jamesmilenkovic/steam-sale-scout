@@ -46,6 +46,9 @@ import {
 import {
   FPM_POOL_CAP,
   FPM_LENGTH_FIELD,
+  FPM_FORMULA,
+  FPM_QUALITY_EXP,
+  FPM_BREADTH_WEIGHT,
   hltbInit,
   hltbLengthSeconds,
   getCachedHltb,
@@ -53,6 +56,7 @@ import {
   fpmScore,
   funPerHourDisplay,
   qualifiesForFpm,
+  qualifiesForFpmFloor,
   sortFpmLane,
   fpmWhyLine,
 } from "./hltb.js";
@@ -1395,13 +1399,17 @@ async function handleWishlist(request, env, ctx) {
 }
 
 // ---------------------------------------------------------------------------
-// /api/fpm (Increment 7) — "Fun per minute": Wilson quality ÷ HowLongToBeat
-// main-story hours, for players who'd rather have a quick, excellent game
-// than a long good one. Sources the top FPM_POOL_CAP entries of the SAME
-// rank-sorted Best-of pool as /api/best-of (loadBestOfPool, untouched) and
-// requires the SAME Hall-of-Fame quality floor (qualifiesForHof) so the
-// "quality" half of the ratio is trustworthy — no new sourcing, no changes
-// to that pool. Main-story length is resolved per-candidate from
+// /api/fpm (Increment 7, tuned in 7.5) — "Fun per minute": Wilson quality
+// (raised to a configurable exponent) ÷ a configurable function of
+// HowLongToBeat main-story hours, for players who'd rather have a quick,
+// excellent game than a long good one. Sources the top FPM_POOL_CAP entries
+// of the SAME rank-sorted Best-of pool as /api/best-of (loadBestOfPool,
+// untouched) — no new sourcing, no changes to that pool. Eligibility uses
+// this lane's OWN floor, qualifiesForFpmFloor (Increment 7.5 — deliberately
+// NOT qualifiesForHof; the 10k-review/95%-positive Best-of bar left only
+// ~9-10 games in the whole pool eligible, too strict for a "quick wins"
+// lane). Best-of itself (handleHof, above) is untouched and still enforces
+// qualifiesForHof. Main-story length is resolved per-candidate from
 // HowLongToBeat via src/hltb.js's own throttled background queue, mirroring
 // src/spyQueue.js's progressive-fill pattern. src/hltb.js owns the
 // HLTB handshake/parse/match (its own repair surface, documented there) —
@@ -1421,6 +1429,14 @@ async function handleWishlist(request, env, ctx) {
 // (a search/parse/match failure for one candidate) is handled inside
 // src/hltb.js's queue and simply shows up here as a negative cached result
 // (counted in unmatchedCount).
+//
+// SCORING OVERRIDES (Increment 7.5): ?formula=/?qexp=/?breadth= let the UI's
+// formula picker re-rank ALREADY-CACHED candidates for live A/B comparison,
+// with zero new HLTB queue/network activity — they're parsed once up front
+// and only read at the final per-row score/why-line/sort step, well after
+// the eligibility filter and toResolve/queue logic above have already run.
+// Bad values never throw; they silently fall back to the hltb.js config
+// defaults (parseFpmFormula/parseFpmScoreParam below).
 // ---------------------------------------------------------------------------
 
 function fpmUnavailableResponse() {
@@ -1428,6 +1444,31 @@ function fpmUnavailableResponse() {
     JSON.stringify({ available: false, notice: "Fun-per-minute unavailable" }),
     { status: 200, headers: { "content-type": "application/json" } },
   );
+}
+
+const FPM_VALID_FORMULAS = new Set(["linear", "sqrt", "log"]);
+// Sane bounds for the ?qexp=/?breadth= overrides — generous enough for James
+// to A/B freely, tight enough to keep Math.pow from producing something
+// silly (Infinity/NaN-adjacent) off a garbage query value. Not asserted by
+// SPEC.md as "the" right numbers, just a guardrail; flagged to the PO.
+const FPM_QEXP_MIN = 0;
+const FPM_QEXP_MAX = 10;
+const FPM_BREADTH_MIN = 0;
+const FPM_BREADTH_MAX = 5;
+
+/** `?formula=` override: falls back to FPM_FORMULA on anything not exactly
+ * 'linear'/'sqrt'/'log' (missing, typo'd, or otherwise malformed). */
+function parseFpmFormula(raw) {
+  return FPM_VALID_FORMULAS.has(raw) ? raw : FPM_FORMULA;
+}
+
+/** `?qexp=`/`?breadth=` override: falls back to `fallback` on missing,
+ * non-numeric, or out-of-[min,max]-range input. Never throws. */
+function parseFpmScoreParam(raw, fallback, min, max) {
+  if (raw == null || raw === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < min || n > max) return fallback;
+  return n;
 }
 
 async function handleFpm(request, env, ctx) {
@@ -1439,6 +1480,13 @@ async function handleFpm(request, env, ctx) {
   const refresh = url.searchParams.get("refresh") === "1";
   const windowMonthsParam = Number(url.searchParams.get("windowMonths"));
   const windowMonths = windowMonthsParam > 0 ? windowMonthsParam : 12;
+
+  // Scoring overrides (Increment 7.5) — parsed up front, but only read at
+  // the final per-row score/why-line/sort step below. Never affects
+  // eligibility, caching, or the HLTB queue.
+  const formula = parseFpmFormula(url.searchParams.get("formula"));
+  const qualityExp = parseFpmScoreParam(url.searchParams.get("qexp"), FPM_QUALITY_EXP, FPM_QEXP_MIN, FPM_QEXP_MAX);
+  const breadthWeight = parseFpmScoreParam(url.searchParams.get("breadth"), FPM_BREADTH_WEIGHT, FPM_BREADTH_MIN, FPM_BREADTH_MAX);
 
   let libraryGames;
   try {
@@ -1460,7 +1508,9 @@ async function handleFpm(request, env, ctx) {
   const capped = bestOfPool.slice(0, FPM_POOL_CAP);
 
   const pool = await buildCandidatePool(env, ctx, libraryGames, capped, windowMonths);
-  const eligible = pool.candidates.filter((c) => c.appid != null && qualifiesForHof(c));
+  // Increment 7.5: this lane's OWN floor (50 reviews / 0.7 Wilson quality /
+  // 5000 owners), not qualifiesForHof — see the section comment above.
+  const eligible = pool.candidates.filter((c) => c.appid != null && qualifiesForFpmFloor(c));
 
   // ?refresh=1 bypasses the HLTB cache too (per build note) — every eligible
   // candidate is treated as unresolved and re-queued rather than reading
@@ -1516,17 +1566,21 @@ async function handleFpm(request, env, ctx) {
     if (!qualifiesForFpm({ compMain: lengthSeconds, mainHours })) continue;
 
     const wilsonQuality = quality(candidate.reviews?.positive, candidate.reviews?.negative);
+    // funPerHour (the displayed "fun/hr" number) stays the honest raw
+    // quality÷hours figure regardless of formula — only the sort score below
+    // is formula-aware (Increment 7.5).
     const funPerHour = funPerHourDisplay(wilsonQuality, mainHours);
     const qualityPercent = Math.round(wilsonQuality * 100);
+    const reviewCount = (candidate.reviews?.positive || 0) + (candidate.reviews?.negative || 0);
 
     rows.push({
       ...candidate,
-      fpm: fpmScore(wilsonQuality, mainHours),
+      fpm: fpmScore(wilsonQuality, mainHours, { reviewCount, formula, qualityExp, breadthWeight }),
       funPerHour,
       mainHours,
       matchMethod: record.matchMethod,
       quality: wilsonQuality,
-      why: fpmWhyLine(qualityPercent, mainHours, funPerHour),
+      why: fpmWhyLine(qualityPercent, mainHours, funPerHour, formula),
     });
   }
 

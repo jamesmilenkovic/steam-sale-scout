@@ -380,10 +380,12 @@ test("fully warm cache: /api/fpm serves cached rows without ever calling hltbIni
 });
 
 // ---------------------------------------------------------------------------
-// Eligibility: only candidates clearing qualifiesForHof are even considered.
+// Eligibility (Increment 7.5): only candidates clearing THIS lane's own
+// qualifiesForFpmFloor (50 reviews / 0.7 Wilson quality / 5000 owners) are
+// even considered — deliberately NOT qualifiesForHof (10k/95%) anymore.
 // ---------------------------------------------------------------------------
 
-test("a candidate failing the Hall-of-Fame quality floor is never queried against HLTB at all", async () => {
+test("a candidate failing the FPM quality floor is never queried against HLTB at all", async () => {
   const cache = makeMockCache();
   globalThis.caches = { default: cache };
   const env = makeEnv();
@@ -391,8 +393,11 @@ test("a candidate failing the Hall-of-Fame quality floor is never queried agains
   primeLibrary(cache, env, [ownedGame({ appid: 1 })]);
   primeBestOfPool(cache, [deal({ itadId: "itad-weak", appid: 200, title: "Portal 2" })]);
   env.TAG_CACHE.store.set(v2Key(1), JSON.stringify(goodSpyEntry()));
-  // Thin reviews -> fails HOF_MIN_REVIEWS, never becomes "eligible".
-  env.TAG_CACHE.store.set(v2Key(200), JSON.stringify(goodSpyEntry({ reviews: { positive: 90, negative: 10 } })));
+  // Thin reviews -> fails FPM_MIN_REVIEWS (50) outright, never becomes
+  // "eligible" — note this candidate would ALSO have failed the old
+  // qualifiesForHof bar, but the point of this test post-7.5 is that it
+  // fails the lane's OWN (much lower) floor, not the retired one.
+  env.TAG_CACHE.store.set(v2Key(200), JSON.stringify(goodSpyEntry({ reviews: { positive: 18, negative: 2 } })));
 
   let hltbCalls = 0;
   globalThis.fetch = async (url) => {
@@ -416,6 +421,39 @@ test("a candidate failing the Hall-of-Fame quality floor is never queried agains
   assert.equal(body.total, 0);
   assert.equal(body.fpm.length, 0);
   assert.equal(hltbCalls, 0, "a non-qualifying candidate must never reach the HLTB search queue");
+});
+
+test("a candidate clearing FPM's own floor (50/0.7/5000) but failing Best-of's 10k/95% floor now qualifies for FPM", async () => {
+  const cache = makeMockCache();
+  globalThis.caches = { default: cache };
+  const env = makeEnv();
+
+  primeLibrary(cache, env, [ownedGame({ appid: 1 })]);
+  primeBestOfPool(cache, [deal({ itadId: "itad-fpm-only", appid: 200, title: "Portal 2" })]);
+  env.TAG_CACHE.store.set(v2Key(1), JSON.stringify(goodSpyEntry()));
+  // 400 total reviews (>= FPM_MIN_REVIEWS, << HOF_MIN_REVIEWS), 80% positive
+  // (wilson comfortably >= FPM_MIN_QUALITY, well under HOF_MIN_RATIO's 95%),
+  // 50000 owners (>= FPM_MIN_OWNERS). Clears FPM, would never clear Best-of.
+  env.TAG_CACHE.store.set(
+    v2Key(200),
+    JSON.stringify(goodSpyEntry({ reviews: { positive: 320, negative: 80 }, owners: 50000 })),
+  );
+  env.TAG_CACHE.store.set(deckKey(200), JSON.stringify({ deck: 0, os: 0, frame: 0 }));
+
+  globalThis.fetch = makeHltbFetch({
+    searchResultsByQuery: { "Portal 2": [rawHltbEntry({ comp_main: 23400 })] }, // 6.5h
+  });
+
+  const ctx = makeCtx();
+  await worker.fetch(new Request("https://x/api/fpm"), env, ctx);
+  await ctx.flush();
+  const res = await worker.fetch(new Request("https://x/api/fpm"), env, ctx);
+  await ctx.flush();
+  const body = await res.json();
+
+  assert.equal(body.total, 1);
+  assert.equal(body.fpm.length, 1);
+  assert.equal(body.fpm[0].appid, 200);
 });
 
 // ---------------------------------------------------------------------------
@@ -464,8 +502,13 @@ test("happy path: an eligible, matched candidate carries fpm/funPerHour/mainHour
   assert.equal(entry.matchMethod, "name");
   assert.equal(entry.quality, expectedQuality);
   assert.equal(entry.funPerHour, Math.round(((entry.quality * 100) / 6.5) * 10) / 10);
-  assert.ok(Math.abs(entry.fpm - entry.quality / 6.5) < 1e-9);
-  assert.equal(entry.why, `${Math.round(entry.quality * 100)}% quality ÷ 6.5h main story — ${entry.funPerHour.toFixed(1)} fun/hr`);
+  // Default scoring is sqrt+qexp=2 (Increment 7.5) — quality^2 / sqrt(hours),
+  // not the old plain quality/hours.
+  assert.ok(Math.abs(entry.fpm - (entry.quality ** 2) / Math.sqrt(6.5)) < 1e-9);
+  assert.equal(
+    entry.why,
+    `${Math.round(entry.quality * 100)}% quality ÷ 6.5h main story — ${entry.funPerHour.toFixed(1)} fun/hr · sqrt ranking`,
+  );
   assert.deepEqual(entry.deck, { deck: 3, os: 3, frame: 0 });
   assert.deepEqual(entry.tagNames, ["Puzzle"]);
   assert.equal(typeof entry.batteryFriendly, "boolean");
@@ -795,4 +838,122 @@ test("only the top FPM_POOL_CAP entries of the Best-of pool are considered", asy
   // otherwise it keeps running into the next test with a 1000ms/item pace
   // once afterEach restores the real interval, which looks like a hang.
   await ctx.flush();
+});
+
+// ---------------------------------------------------------------------------
+// Scoring overrides (Increment 7.5): ?formula=/?qexp=/?breadth= re-rank
+// already-cached candidates only — never trigger new HLTB queue activity,
+// and bad values fall back to config defaults rather than ever 500ing.
+// ---------------------------------------------------------------------------
+
+/** Primes one fully-resolved, eligible candidate (appid 200, "Portal 2",
+ * 6.5h main story) so every test below can hit /api/fpm purely from cache —
+ * any HLTB search call at all is a bug regardless of which query params are
+ * used. */
+function primeWarmFpmCandidate(cache, env) {
+  primeLibrary(cache, env, [ownedGame({ appid: 1 })]);
+  primeBestOfPool(cache, [deal({ itadId: "itad-warm", appid: 200, title: "Portal 2", cut: 80 })]);
+  env.TAG_CACHE.store.set(v2Key(1), JSON.stringify(goodSpyEntry()));
+  env.TAG_CACHE.store.set(
+    v2Key(200),
+    JSON.stringify(goodSpyEntry({ tags: { Puzzle: 50 }, reviews: { positive: 96000, negative: 4000 } })),
+  );
+  env.TAG_CACHE.store.set(deckKey(200), JSON.stringify({ deck: 0, os: 0, frame: 0 }));
+  env.TAG_CACHE.store.set(
+    hltbKey(200),
+    JSON.stringify({ hltbId: 7231, compMain: 23400, compPlus: 40000, comp100: 50000, matchMethod: "name" }), // 6.5h
+  );
+}
+
+test("an unrecognized ?formula= falls back to the sqrt default, never a 500", async () => {
+  const cache = makeMockCache();
+  globalThis.caches = { default: cache };
+  const env = makeEnv();
+  primeWarmFpmCandidate(cache, env);
+
+  let searchCalls = 0;
+  globalThis.fetch = makeHltbFetch({
+    onCall: (u) => {
+      if (u.hostname === "howlongtobeat.com" && u.pathname === "/api/bleed") searchCalls++;
+    },
+  });
+
+  const ctx = makeCtx();
+  const bogusRes = await worker.fetch(new Request("https://x/api/fpm?formula=not-a-real-formula"), env, ctx);
+  assert.equal(bogusRes.status, 200);
+  const bogusBody = await bogusRes.json();
+  assert.equal(bogusBody.available, true);
+
+  const sqrtRes = await worker.fetch(new Request("https://x/api/fpm?formula=sqrt"), env, ctx);
+  const sqrtBody = await sqrtRes.json();
+
+  assert.equal(bogusBody.fpm[0].fpm, sqrtBody.fpm[0].fpm, "an unrecognized formula must score identically to explicit 'sqrt' (the config default)");
+  assert.equal(bogusBody.fpm[0].why, sqrtBody.fpm[0].why);
+  assert.equal(searchCalls, 0, "a fully-cached candidate must never trigger an HLTB search, regardless of query params");
+});
+
+test("non-numeric ?qexp=/?breadth= fall back to config defaults, never a 500", async () => {
+  const cache = makeMockCache();
+  globalThis.caches = { default: cache };
+  const env = makeEnv();
+  primeWarmFpmCandidate(cache, env);
+  globalThis.fetch = makeHltbFetch({});
+
+  const ctx = makeCtx();
+  const defaultRes = await worker.fetch(new Request("https://x/api/fpm"), env, ctx);
+  const defaultBody = await defaultRes.json();
+
+  const garbageRes = await worker.fetch(new Request("https://x/api/fpm?qexp=banana&breadth=nope"), env, ctx);
+  assert.equal(garbageRes.status, 200);
+  const garbageBody = await garbageRes.json();
+
+  assert.equal(garbageBody.available, true);
+  assert.equal(garbageBody.fpm[0].fpm, defaultBody.fpm[0].fpm, "non-numeric qexp/breadth must score identically to omitting them entirely");
+});
+
+test("out-of-sane-range ?qexp=/?breadth= fall back to config defaults, never a 500", async () => {
+  const cache = makeMockCache();
+  globalThis.caches = { default: cache };
+  const env = makeEnv();
+  primeWarmFpmCandidate(cache, env);
+  globalThis.fetch = makeHltbFetch({});
+
+  const ctx = makeCtx();
+  const defaultRes = await worker.fetch(new Request("https://x/api/fpm"), env, ctx);
+  const defaultBody = await defaultRes.json();
+
+  const outOfRangeRes = await worker.fetch(new Request("https://x/api/fpm?qexp=9999&breadth=-5"), env, ctx);
+  assert.equal(outOfRangeRes.status, 200);
+  const outOfRangeBody = await outOfRangeRes.json();
+
+  assert.equal(outOfRangeBody.available, true);
+  assert.equal(outOfRangeBody.fpm[0].fpm, defaultBody.fpm[0].fpm, "out-of-range qexp/breadth must score identically to the config defaults");
+});
+
+test("?formula= flip re-ranks an already-cached candidate's score/why-line instantly with zero new HLTB requests", async () => {
+  const cache = makeMockCache();
+  globalThis.caches = { default: cache };
+  const env = makeEnv();
+  primeWarmFpmCandidate(cache, env);
+
+  let searchCalls = 0;
+  globalThis.fetch = makeHltbFetch({
+    onCall: (u) => {
+      if (u.hostname === "howlongtobeat.com" && u.pathname === "/api/bleed") searchCalls++;
+    },
+  });
+
+  const ctx = makeCtx();
+  const linearRes = await worker.fetch(new Request("https://x/api/fpm?formula=linear"), env, ctx);
+  const linearBody = await linearRes.json();
+  const logRes = await worker.fetch(new Request("https://x/api/fpm?formula=log"), env, ctx);
+  const logBody = await logRes.json();
+
+  assert.equal(linearBody.fpm[0].why.endsWith("fun/hr"), true, "formula 'linear' keeps the why-line suffix-free");
+  assert.equal(logBody.fpm[0].why.endsWith("· log ranking"), true);
+  // funPerHour (the honest raw display number) never changes with formula...
+  assert.equal(linearBody.fpm[0].funPerHour, logBody.fpm[0].funPerHour);
+  // ...but the sort score does.
+  assert.notEqual(linearBody.fpm[0].fpm, logBody.fpm[0].fpm);
+  assert.equal(searchCalls, 0, "re-ranking a cached candidate must never touch the HLTB queue");
 });

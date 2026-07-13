@@ -17,11 +17,18 @@ import {
   FPM_MATCH_THRESHOLD,
   FPM_MIN_LENGTH_HOURS,
   FPM_LENGTH_FIELD,
+  FPM_MIN_REVIEWS,
+  FPM_MIN_QUALITY,
+  FPM_MIN_OWNERS,
+  FPM_FORMULA,
+  FPM_QUALITY_EXP,
+  FPM_BREADTH_WEIGHT,
   parseHltbSearch,
   hltbLengthSeconds,
   normalizeTitle,
   titleSimilarity,
   matchHltbEntry,
+  qualifiesForFpmFloor,
   fpmScore,
   funPerHourDisplay,
   qualifiesForFpm,
@@ -29,6 +36,7 @@ import {
   fpmWhyLine,
   getCachedHltb,
 } from "../src/hltb.js";
+import { wilsonLowerBound } from "../src/score.js";
 
 // ---------------------------------------------------------------------------
 // parseHltbSearch — THE repair surface.
@@ -225,19 +233,118 @@ test("matchHltbEntry: empty entries array returns null", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Qualification — qualifiesForFpmFloor (Increment 7.5). This lane's OWN
+// floor, deliberately NOT hallOfFame.js's qualifiesForHof (10k reviews/95%
+// ratio) — the floor matrix below proves a candidate that clears THIS floor
+// but fails the stricter Hall-of-Fame one now qualifies for FPM, while
+// hallOfFame.js's own qualifiesForHof (tested in test/hallOfFame.test.mjs)
+// stays completely untouched.
+// ---------------------------------------------------------------------------
+
+test("FPM_MIN_REVIEWS/FPM_MIN_QUALITY/FPM_MIN_OWNERS default config", () => {
+  assert.equal(FPM_MIN_REVIEWS, 50);
+  assert.equal(FPM_MIN_QUALITY, 0.7);
+  assert.equal(FPM_MIN_OWNERS, 5000);
+});
+
+test("qualifiesForFpmFloor: a candidate clearing 50/0.7/5000 but failing Hall-of-Fame's 10k/95% now qualifies", () => {
+  // 400 total reviews (>=50), 80% positive, wilson well above 0.7; 50000
+  // owners (>=5000) — clears every FPM floor, but 400 total reviews is far
+  // below HOF_MIN_REVIEWS (10000), so this candidate would NOT qualify for
+  // Best-of.
+  const candidate = { reviews: { positive: 320, negative: 80 }, owners: 50000 };
+  assert.ok(wilsonLowerBound(320, 80) >= FPM_MIN_QUALITY);
+  assert.equal(qualifiesForFpmFloor(candidate), true);
+});
+
+test("qualifiesForFpmFloor: sub-floor junk fails on reviews alone even with perfect ratio/owners", () => {
+  const candidate = { reviews: { positive: 30, negative: 0 } /* 30 < 50 */, owners: 50000 };
+  assert.equal(qualifiesForFpmFloor(candidate), false);
+});
+
+test("qualifiesForFpmFloor: sub-floor junk fails on Wilson quality alone even with plenty of reviews/owners", () => {
+  const candidate = { reviews: { positive: 60, negative: 40 } /* 100 total, 60% -> wilson well under 0.7 */, owners: 50000 };
+  assert.ok(wilsonLowerBound(60, 40) < FPM_MIN_QUALITY);
+  assert.equal(qualifiesForFpmFloor(candidate), false);
+});
+
+test("qualifiesForFpmFloor: sub-floor junk fails on owners alone even with reviews/quality clearing", () => {
+  const candidate = { reviews: { positive: 400, negative: 20 }, owners: 4999 /* < 5000 */ };
+  assert.ok(wilsonLowerBound(400, 20) >= FPM_MIN_QUALITY);
+  assert.equal(qualifiesForFpmFloor(candidate), false);
+});
+
+test("qualifiesForFpmFloor: missing/empty reviews or owners is false, not a throw", () => {
+  assert.equal(qualifiesForFpmFloor({}), false);
+  assert.equal(qualifiesForFpmFloor({ reviews: {} }), false);
+  assert.equal(qualifiesForFpmFloor({ reviews: undefined, owners: undefined }), false);
+});
+
+// ---------------------------------------------------------------------------
 // Lane math — fpmScore / funPerHourDisplay / qualifiesForFpm / sortFpmLane /
 // fpmWhyLine.
 // ---------------------------------------------------------------------------
 
-test("fpmScore: quality / mainHours", () => {
-  assert.equal(fpmScore(0.9, 6), 0.15);
-  assert.equal(fpmScore(0.5, 2), 0.25);
+test("FPM_FORMULA/FPM_QUALITY_EXP/FPM_BREADTH_WEIGHT default config", () => {
+  assert.equal(FPM_FORMULA, "sqrt");
+  assert.equal(FPM_QUALITY_EXP, 2);
+  assert.equal(FPM_BREADTH_WEIGHT, 0);
+});
+
+test("fpmScore: 'linear' formula is quality^qexp / hours", () => {
+  assert.equal(fpmScore(0.9, 6, { formula: "linear", qualityExp: 1 }), 0.15);
+  assert.equal(fpmScore(0.5, 2, { formula: "linear", qualityExp: 1 }), 0.25);
+  assert.ok(Math.abs(fpmScore(0.9, 6, { formula: "linear", qualityExp: 2 }) - 0.9 ** 2 / 6) < 1e-12);
+});
+
+test("fpmScore: 'sqrt' formula is quality^qexp / sqrt(hours)", () => {
+  const expected = 0.9 ** 2 / Math.sqrt(6);
+  assert.ok(Math.abs(fpmScore(0.9, 6, { formula: "sqrt", qualityExp: 2 }) - expected) < 1e-12);
+});
+
+test("fpmScore: 'log' formula is quality^qexp / log2(hours + 1)", () => {
+  const expected = 0.9 ** 2 / Math.log2(7);
+  assert.ok(Math.abs(fpmScore(0.9, 6, { formula: "log", qualityExp: 2 }) - expected) < 1e-12);
+});
+
+test("fpmScore: default options (no override) use the FPM_FORMULA/FPM_QUALITY_EXP/FPM_BREADTH_WEIGHT config constants", () => {
+  const expected = 0.9 ** FPM_QUALITY_EXP / Math.sqrt(6); // FPM_FORMULA is 'sqrt'
+  assert.ok(Math.abs(fpmScore(0.9, 6) - expected) < 1e-12);
+});
+
+test("fpmScore: breadthWeight=0 (the default) is EXACTLY x1 — no floating-point drift regardless of reviewCount", () => {
+  const noBreadthArg = fpmScore(0.9, 6, { formula: "linear", qualityExp: 1 });
+  // Math.pow(x, 0) === 1 exactly for any finite x, including reviewCount:0,
+  // a huge count, or omitting reviewCount entirely — assert bitwise/exact
+  // equality, not just "close", per the spec's w=0 identity requirement.
+  assert.equal(fpmScore(0.9, 6, { formula: "linear", qualityExp: 1, reviewCount: 0, breadthWeight: 0 }), noBreadthArg);
+  assert.equal(fpmScore(0.9, 6, { formula: "linear", qualityExp: 1, reviewCount: 500000, breadthWeight: 0 }), noBreadthArg);
+  assert.equal(fpmScore(0.9, 6, { formula: "linear", qualityExp: 1, breadthWeight: 0 }), noBreadthArg);
+});
+
+test("fpmScore: breadthWeight > 0 scales the score up by log10(max(reviewCount,10))^w", () => {
+  const base = fpmScore(0.9, 6, { formula: "linear", qualityExp: 1 });
+  const withBreadth = fpmScore(0.9, 6, { formula: "linear", qualityExp: 1, reviewCount: 100000, breadthWeight: 1 });
+  const expectedBreadthTerm = Math.log10(100000); // = 5
+  assert.ok(Math.abs(withBreadth - base * expectedBreadthTerm) < 1e-12);
+});
+
+test("fpmScore: breadthWeight > 0 with reviewCount below 10 clamps to log10(10)=1, never negative/undefined", () => {
+  const base = fpmScore(0.9, 6, { formula: "linear", qualityExp: 1 });
+  const withBreadth = fpmScore(0.9, 6, { formula: "linear", qualityExp: 1, reviewCount: 3, breadthWeight: 1 });
+  assert.ok(Math.abs(withBreadth - base * 1) < 1e-12); // log10(max(3,10)) = log10(10) = 1
 });
 
 test("fpmScore: mainHours missing/zero/negative returns 0 rather than Infinity/NaN", () => {
   assert.equal(fpmScore(0.9, 0), 0);
   assert.equal(fpmScore(0.9, undefined), 0);
   assert.equal(fpmScore(0.9, -1), 0);
+});
+
+test("fpmScore: an unrecognized formula string falls back to 'sqrt' behaviour rather than throwing", () => {
+  const sqrtScore = fpmScore(0.9, 6, { formula: "sqrt", qualityExp: 2 });
+  const bogusScore = fpmScore(0.9, 6, { formula: "not-a-real-formula", qualityExp: 2 });
+  assert.equal(bogusScore, sqrtScore);
 });
 
 test("funPerHourDisplay: matches the spec worked example (94% quality, 6.5h -> 14.5 fun/hr)", () => {
@@ -296,8 +403,71 @@ test("sortFpmLane does not mutate the input array", () => {
   assert.deepEqual(items, copy);
 });
 
-test("fpmWhyLine: matches the spec worked example exactly", () => {
+test("fpmWhyLine: matches the spec worked example exactly (default formula 'linear', no suffix)", () => {
   assert.equal(fpmWhyLine(94, 6.5, 14.5), "94% quality ÷ 6.5h main story — 14.5 fun/hr");
+});
+
+test("fpmWhyLine: formula 'linear' explicitly is behavior-identical to Increment 7's why-line (no suffix)", () => {
+  assert.equal(fpmWhyLine(94, 6.5, 14.5, "linear"), "94% quality ÷ 6.5h main story — 14.5 fun/hr");
+});
+
+test("fpmWhyLine: a non-linear formula appends '· <formula> ranking' (Increment 7.5)", () => {
+  assert.equal(fpmWhyLine(94, 6.5, 14.5, "sqrt"), "94% quality ÷ 6.5h main story — 14.5 fun/hr · sqrt ranking");
+  assert.equal(fpmWhyLine(94, 6.5, 14.5, "log"), "94% quality ÷ 6.5h main story — 14.5 fun/hr · log ranking");
+});
+
+// ---------------------------------------------------------------------------
+// Ordering fixture (Increment 7.5) — curated real-ish games from SPEC.md,
+// proving the formula/qexp levers actually move what James flagged: pure
+// quality/hours (linear, k=1) ranks purely by brevity; sqrt+qexp=2 (the new
+// default) pulls that gap hard toward rewarding sustained quality.
+//
+// JUDGMENT CALL (flagged to the PO): with real "quick wins"-tier candidates,
+// Wilson quality clusters within ~1 percentage point of each other (that's
+// what the floor is FOR) — a ~25x hours range (1.8h to 45.9h) mathematically
+// dwarfs a ~1-point quality spread for ANY qualityExp inside the sane [0,10]
+// bound (flipping Gorogoa out of #1 here would need qualityExp > ~35). So
+// this fixture asserts the honest, achievable version of "no longer purely
+// brevity-driven": the score gap between the shortest and longest game
+// collapses hard (>20x under linear down to <10x under sqrt+qexp=2), rather
+// than a literal reordering of the curated set. If a literal top-spot flip
+// is what's wanted, breadth weight (rewarding broadly-loved games) or a much
+// higher FPM_QUALITY_EXP is the lever — not qexp=2 alone.
+// ---------------------------------------------------------------------------
+
+const CURATED_GAMES = [
+  { title: "Gorogoa", quality: 0.973, hours: 1.8 },
+  { title: "Portal", quality: 0.98, hours: 3 },
+  { title: "Celeste", quality: 0.97, hours: 8 },
+  { title: "Hades", quality: 0.98, hours: 23 },
+  { title: "Euro Truck Simulator 2", quality: 0.973, hours: 45.9 },
+];
+
+function rankCuratedGames(options) {
+  return CURATED_GAMES.map((g) => ({ ...g, score: fpmScore(g.quality, g.hours, options) })).sort(
+    (a, b) => b.score - a.score,
+  );
+}
+
+test("ordering fixture: linear (k=1) ranks purely by brevity — Gorogoa first, ETS2 last", () => {
+  const ranked = rankCuratedGames({ formula: "linear", qualityExp: 1 });
+  assert.deepEqual(
+    ranked.map((g) => g.title),
+    ["Gorogoa", "Portal", "Celeste", "Hades", "Euro Truck Simulator 2"],
+  );
+});
+
+test("ordering fixture: sqrt+qexp=2 collapses the brevity-driven gap hard toward sustained quality", () => {
+  const linear = rankCuratedGames({ formula: "linear", qualityExp: 1 });
+  const sqrt2 = rankCuratedGames({ formula: "sqrt", qualityExp: 2 });
+
+  const byTitle = (ranked, title) => ranked.find((g) => g.title === title).score;
+  const ratioLinear = byTitle(linear, "Gorogoa") / byTitle(linear, "Euro Truck Simulator 2");
+  const ratioSqrt = byTitle(sqrt2, "Gorogoa") / byTitle(sqrt2, "Euro Truck Simulator 2");
+
+  assert.ok(ratioLinear > 20, `expected a huge brevity-driven blowout under linear, got ${ratioLinear.toFixed(1)}x`);
+  assert.ok(ratioSqrt < 10, `expected sqrt+qexp=2 to collapse the gap well under 10x, got ${ratioSqrt.toFixed(1)}x`);
+  assert.ok(ratioSqrt < ratioLinear / 2, "sqrt+qexp=2 must shrink the Gorogoa/ETS2 gap by at least half vs linear");
 });
 
 // ---------------------------------------------------------------------------

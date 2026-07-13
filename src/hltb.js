@@ -41,6 +41,18 @@
 // level — fetchAndCacheHltb below never throws out of the queue: a
 // search/parse/match failure for one game just caches a negative result and
 // the pump moves on to the next game.
+//
+// INCREMENT 7.5 (2026-07-12) — FPM lane tuning. Two product-model problems
+// James flagged after a live review of Increment 7: (1) the lane inherited
+// hallOfFame.js's qualifiesForHof floor (10k reviews / 95% positive), which
+// only ~9-10 games in the whole pool could ever clear — far too strict for a
+// "quick wins" lane; (2) pure quality÷hours scoring let ultra-short games
+// dominate on brevity alone. This module now owns its OWN qualification
+// floor (qualifiesForFpmFloor, below) and a config-selectable scoring
+// formula (fpmScore, in the Lane math section) instead of a single hardcoded
+// quality÷hours ratio.
+
+import { quality } from "./score.js";
 
 /** Cap the Best-of pool at this many (already rank-sorted) candidates before
  * resolving lengths — keeps a cold refresh to a bounded ~5 min of lazy-fill
@@ -71,6 +83,45 @@ export const HLTB_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60;
  * it just has nothing usable for this title; less reason to expect a
  * same-day retry to help). */
 export const HLTB_CACHE_NEGATIVE_TTL_SECONDS = 7 * 24 * 60 * 60;
+
+// ---------------------------------------------------------------------------
+// Qualification — the FPM lane's OWN floor (Increment 7.5). Deliberately NOT
+// hallOfFame.js's qualifiesForHof (10,000 reviews / 95% positive) — that bar
+// only let ~9-10 games in the whole pool ever reach this lane. These three
+// numbers start at the same values as score.js's Recs-tier floors
+// (MIN_REVIEWS/MIN_QUALITY/MIN_OWNERS) but are copied, not imported — this
+// lane, Recs, and Best-of must each be tunable independently later without
+// moving the others.
+// ---------------------------------------------------------------------------
+
+/** Minimum total reviews (positive + negative) to qualify for FPM. */
+export const FPM_MIN_REVIEWS = 50;
+
+/** Minimum Wilson lower-bound quality (score.js's `quality()`) to qualify. */
+export const FPM_MIN_QUALITY = 0.7;
+
+/** Minimum SteamSpy owners-midpoint to qualify. */
+export const FPM_MIN_OWNERS = 5000;
+
+/**
+ * Whether a candidate clears the FPM lane's own quality floor: at least
+ * FPM_MIN_REVIEWS total reviews, at least FPM_MIN_OWNERS owners, and at
+ * least FPM_MIN_QUALITY Wilson lower bound. Mirrors qualifiesForHof's shape
+ * (same candidate fields: reviews.positive/negative, owners) but checks the
+ * FPM-tier thresholds instead of the stricter Hall-of-Fame ones.
+ * @param {{reviews?: {positive?: number, negative?: number}, owners?: number}} candidate
+ * @returns {boolean}
+ */
+export function qualifiesForFpmFloor(candidate) {
+  const reviews = candidate?.reviews || {};
+  const positive = reviews.positive || 0;
+  const negative = reviews.negative || 0;
+  const total = positive + negative;
+  const owners = candidate?.owners || 0;
+  if (total < FPM_MIN_REVIEWS) return false;
+  if (owners < FPM_MIN_OWNERS) return false;
+  return quality(positive, negative) >= FPM_MIN_QUALITY;
+}
 
 const HLTB_INIT_URL = "https://howlongtobeat.com/api/bleed/init";
 const HLTB_SEARCH_URL = "https://howlongtobeat.com/api/bleed";
@@ -364,11 +415,71 @@ export function matchHltbEntry(candidateTitle, parsedEntries, threshold = FPM_MA
 // Lane math — pure, testable.
 // ---------------------------------------------------------------------------
 
-/** fpm = Wilson quality ÷ main-story hours. 0 if mainHours is missing/≤0
- * (never divide by zero / return Infinity). */
-export function fpmScore(wilsonQuality, mainHours) {
+/**
+ * Which length-vs-quality formula fpmScore uses. `'linear'` (q^k / h) is the
+ * old Increment 7 behaviour, kept for comparison; `'sqrt'` (q^k / sqrt(h),
+ * the default) and `'log'` (q^k / log2(h + 1)) both taper off how hard
+ * length punishes a long, excellent game, per James's Increment 7.5 review
+ * (pure linear made ultra-short games dominate on brevity alone).
+ * @type {'linear'|'sqrt'|'log'}
+ */
+export const FPM_FORMULA = "sqrt";
+
+/** Exponent applied to Wilson quality before dividing by the length term —
+ * biases the score toward the genuinely great (97% vs 90% separates much
+ * harder than linearly) independent of which length formula is active. */
+export const FPM_QUALITY_EXP = 2;
+
+/** Exponent on the optional breadth term (log10(max(reviews,10))^w). 0 (the
+ * default) means the term is exactly ×1 — off. >0 lets a broadly-loved game
+ * outrank an obscure short one at equal quality %; exposed for James to A/B,
+ * not asserted as correct. */
+export const FPM_BREADTH_WEIGHT = 0;
+
+/**
+ * FPM sort score: quality^qualityExp ÷ a length term that depends on
+ * `formula`, times an optional breadth term. 0 if mainHours is missing/≤0
+ * (never divide by zero / return Infinity) — same guard as before.
+ *
+ * `reviewCount` (total positive+negative reviews) only affects the score via
+ * the breadth term; at the default breadthWeight of 0,
+ * `Math.pow(x, 0) === 1` exactly for any x, so the breadth term is a true
+ * no-op with no floating-point drift regardless of reviewCount.
+ *
+ * @param {number} wilsonQuality - 0-1, score.js's quality().
+ * @param {number} mainHours
+ * @param {object} [options]
+ * @param {number} [options.reviewCount] - total reviews, for the breadth term.
+ * @param {'linear'|'sqrt'|'log'} [options.formula] - defaults to FPM_FORMULA.
+ * @param {number} [options.qualityExp] - defaults to FPM_QUALITY_EXP.
+ * @param {number} [options.breadthWeight] - defaults to FPM_BREADTH_WEIGHT.
+ * @returns {number}
+ */
+export function fpmScore(wilsonQuality, mainHours, options = {}) {
   if (!(mainHours > 0)) return 0;
-  return wilsonQuality / mainHours;
+
+  const {
+    reviewCount = 0,
+    formula = FPM_FORMULA,
+    qualityExp = FPM_QUALITY_EXP,
+    breadthWeight = FPM_BREADTH_WEIGHT,
+  } = options;
+
+  const q = Math.pow(wilsonQuality, qualityExp);
+  let lengthTerm;
+  if (formula === "linear") {
+    lengthTerm = mainHours;
+  } else if (formula === "log") {
+    lengthTerm = Math.log2(mainHours + 1);
+  } else {
+    // 'sqrt' (the default) and the fallback for any unrecognized value —
+    // callers (src/worker.js) are responsible for validating `formula`
+    // before it gets here, but this keeps the function itself safe too.
+    lengthTerm = Math.sqrt(mainHours);
+  }
+
+  const breadthTerm = Math.pow(Math.log10(Math.max(reviewCount, 10)), breadthWeight);
+  return (q / lengthTerm) * breadthTerm;
 }
 
 /** Display value: fun/hr = round(quality% ÷ hours, 1dp). */
@@ -408,13 +519,19 @@ export function sortFpmLane(items) {
 
 /**
  * Deterministic why-line, e.g. "94% quality ÷ 6.5h main story — 14.5 fun/hr".
+ * When `formula` is anything other than `'linear'`, appends the formula name
+ * so the sort order is never mysterious, e.g. "… — 14.5 fun/hr · sqrt
+ * ranking" (Increment 7.5). Defaults to `'linear'` (no suffix) so this stays
+ * behavior-identical to Increment 7's why-line when a formula isn't passed.
  * @param {number} qualityPercent - 0-100, already rounded by the caller.
  * @param {number} mainHours
  * @param {number} funPerHour
+ * @param {'linear'|'sqrt'|'log'} [formula] - defaults to 'linear' (no suffix).
  * @returns {string}
  */
-export function fpmWhyLine(qualityPercent, mainHours, funPerHour) {
-  return `${qualityPercent}% quality ÷ ${mainHours.toFixed(1)}h main story — ${funPerHour.toFixed(1)} fun/hr`;
+export function fpmWhyLine(qualityPercent, mainHours, funPerHour, formula = "linear") {
+  const base = `${qualityPercent}% quality ÷ ${mainHours.toFixed(1)}h main story — ${funPerHour.toFixed(1)} fun/hr`;
+  return formula === "linear" ? base : `${base} · ${formula} ranking`;
 }
 
 // ---------------------------------------------------------------------------

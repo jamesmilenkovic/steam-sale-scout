@@ -1,122 +1,105 @@
-# Increment 7 — Fun-per-minute lane (FPM)
+# Increment 7.5 — FPM lane tuning (qualification + scoring)
 
-**Project:** Steam Sale Scout · **Phase 2, slice 3** (the FPM merge, decided 2026-07-07)
+**Project:** Steam Sale Scout · **Phase 2, slice 3.5** (the inc-7 follow-ups, James 2026-07-12)
 **PRD:** `PRDs/2-in-progress/2026-07-04-steam-sale-recommender.md`
-**Base:** `main` @ inc-6 (`bcc34be`) · **Status:** Build-ready (scoped 2026-07-11)
+**Base:** `main` @ inc-7 (`ec92b99`) · **Status:** Build-ready (scoped 2026-07-12)
 
 ## Why
 
-The old Fun Per Minute idea (Mar 2026): with limited play time, a short
-brilliant game beats a long good one. FPM = Wilson quality ÷ main-story length
-— a lane where quick wins surface. Merged into Sale Scout as increment 7
-because everything except the length signal already exists here.
+Inc-7 shipped correct to its own spec (352/352, live-proof passed) but James's
+live review flagged two product-model problems, deferred to here:
 
-**Scoping decisions (James, 2026-07-11):** pure FPM only — price plays no role
-in the ranking (it's on every row anyway). Denominator = HLTB **Main Story**
-(`comp_main`), config-exposed. FPM is a **new top-level lane** (like
-Best-of/Wishlist), sourced from the existing Best-of pool. Games with no HLTB
-match are **excluded, with a count** shown ("n games had no length data").
+1. **The lane is too small.** Measured funnel 2026-07-12: pool ~4,800 → top
+   `FPM_POOL_CAP=300` → only ~10 pass the inherited Best-of floor
+   (`qualifiesForHof`: ≥10,000 reviews AND ≥95% positive) → 9 matched. Across
+   the whole pool only 14 games clear 10k/95% — the floor, not the HLTB match
+   rate, is the dominant cull. Far stricter than a "quick wins" lane wants.
+2. **The scoring over-rewards ultra-short games.** Pure `quality ÷ hours`
+   makes 1.8h Gorogoa #1 on brevity alone (54.2 fun/hr) while identical-quality
+   45.9h ETS2 comes last. James's instinct: Portal/Celeste-class games should
+   be top scorers — reward sustained delight, not just density. Explore, don't
+   just tweak.
+
+This is a 5.5-style tuning increment: no new data sources, no new lanes.
+Inc 8 (settings + dismissals) is unchanged and stays next.
 
 ## Build
 
-### 1. HLTB adapter (the risky bit — isolate it)
+### 1. Qualification — swap the floor, keep a floor (fix 3a)
 
-- **Source:** HowLongToBeat — **no official API.** Current unofficial shape
-  (verified via maintained wrappers, Jul 2026): the search endpoint has moved
-  repeatedly (`/api/search` → `/api/seek` → now `/api/s/…`, with the path
-  embedded in the site's JS bundle); auth = GET `/api/s/init` returning
-  token headers (`x-auth-token`, `x-hp-key`, `x-hp-val`); requests need
-  browser-like `User-Agent` + `Referer`/`Origin: https://howlongtobeat.com`.
-  Response entries carry `game_id`, `game_name`, lengths in **seconds**
-  (`comp_main`, `comp_plus`, `comp_100`), and (to confirm live) a
-  `profile_steam` field holding the Steam appid.
-- **FIRST STEP — live probe before building** (the wishlist/best-of
-  discipline): from the repo, hit `/api/s/init`, then run 2–3 real searches
-  with the tokens. Confirm: exact endpoint path (and whether it must be
-  scraped from the JS bundle or a static path works), auth handshake, response
-  shape, presence/reliability of `profile_steam`. **Record findings in the
-  save-down.** If the handshake can't be made to work from the Worker, STOP —
-  fallback decision (IGDB `game_time_to_beat`, needs Twitch OAuth secrets from
-  James) is a James call, not a build call.
-- **Isolation:** own module (`src/hltb.js`) — handshake + fetch + **one parse
-  function** = the single repair surface when HLTB drifts. Mirror the
-  howlongtobeatpy approach, minimally (only what the probe proves necessary).
-- **Fail-soft, two levels:** (a) source level — init/search/parse failure hides
-  the lane with a notice ("Fun-per-minute unavailable"), app never breaks;
-  (b) per-game level — no/ambiguous match just excludes that game and
-  increments the unmatched count.
-- **Cache:** length is near-static — per-appid resolved record
-  `{hltbId, compMain, matchMethod}` cached **30d**; negative results (no match)
-  cached **7d**; `?refresh=1` bypass. Own cache keys.
-- **Throttle + cost:** one search per unmatched game → reuse the spyQueue
-  pattern: own queue, ~1 req/sec, progressive lane fill (like `/api/recs`).
-  Cap the pool at `FPM_POOL_CAP = 300` (config) top rank-sorted candidates so
-  a cold refresh is ~5 min of lazy-fill once, then cache-warm. Polite by
-  design (throttle + long TTL) — it's an unofficial endpoint.
+- Replace the FPM lane's use of `qualifiesForHof` with **FPM-specific floors
+  defaulting to the Recs-tier values that already exist in `src/score.js`**:
+  `FPM_MIN_REVIEWS = 50`, `FPM_MIN_QUALITY = 0.7` (Wilson lower bound),
+  `FPM_MIN_OWNERS = 5000` — all config in `src/hltb.js`, independent of both
+  the Recs constants and Best-of (so any lane can be tuned without moving the
+  others).
+- **Do NOT drop the floor to zero:** `fpm = quality ÷ hours` divides by a
+  small number — a 2h game with a handful of lucky reviews would top the lane
+  on garbage data. The Wilson lower bound + review/owner minimums stay the
+  guard.
+- **Best-of lane is untouched** — it keeps `qualifiesForHof` (10k/95%). Only
+  the FPM route's qualification changes.
+- **Pool cap, data-driven:** keep `FPM_POOL_CAP = 300` for the build. At
+  live-proof, measure lane size with the new floors; if still under ~30 games,
+  flip the config to 1000 (cold fill ≈ 15 min at ~1 req/sec, one-time, then
+  cache-warm — acceptable). Record the measured funnel either way in the
+  save-down.
 
-### 2. appid → length matching
+### 2. Scoring — config-selectable formulas + live comparison (fix 3b)
 
-- **Primary:** `profile_steam` == appid, if the probe confirms the field.
-- **Fallback:** normalized-title similarity (existing GetItems `name`, cached
-  30d) vs `game_name`, threshold `FPM_MATCH_THRESHOLD = 0.75` (config);
-  below threshold = unmatched (never a wrong-game length — a bad match is
-  worse than no match).
-- Store `matchMethod` (`steam-id` / `name` / `none`) in the cached record so
-  the save-down and any later debugging can see match quality.
-
-### 3. Lane rules
-
-- **Pool:** reuse `loadBestOfPool` (rank-sorted most-popular, cut ≥ 10,
-  owned excluded) — top `FPM_POOL_CAP` entries. **No new sourcing, no changes
-  to the Best-of pool itself.**
-- **Qualify:** matched with `compMain > 0` AND main-story hours ≥
-  `FPM_MIN_LENGTH_HOURS = 1` (config — blocks degenerate sub-hour entries) AND
-  the existing Best-of quality floors (Wilson numerator must be trustworthy).
-- **Score:** `fpm = wilsonQuality / mainStoryHours`, displayed as
-  `fun/hr = round(wilsonQuality × 100 / mainStoryHours, 1)`. Denominator field
-  = `FPM_LENGTH_FIELD = 'comp_main'` (config; switching to `comp_plus` later
-  is one line).
-- **Sort:** fpm desc; at-historical-low as tiebreak.
-- **Why-line (deterministic):** "94% quality ÷ 6.5h main story — 14.5 fun/hr"
-  + existing badges (low, Deck, battery).
-- Enrichment reuse: spyQueue tags/battery, `resolveDeckCompat`, historical-low
-  — same pipeline as other lanes.
-
-### 4. UI
-
-- New top-level tab **"Fun per minute"** alongside Best of Steam, same
-  progressive-fill rendering as Recs (rows appear as the queue resolves).
-- **Footer count:** "n games had no length data" (per-game fail-soft made
-  visible, no fake numbers).
-- **Bar filters apply** (min discount — Best-of-style floor-10 semantics, max
-  price, tag include/exclude, Deck, battery) **except min similarity —
-  recs-only, per PRD.**
-- Rows link to the Steam store; fail-soft notice on source failure; empty
-  state: "No length data yet — still matching…" while the queue runs.
+- **`FPM_FORMULA`** (config, in `src/hltb.js`) selects the score function.
+  Ship all of these; each is a few lines:
+  - `'linear'` — `q^k / h` (current behaviour at k=1; kept for comparison)
+  - `'sqrt'` — `q^k / sqrt(h)` (**default**) — length matters, doesn't dominate
+  - `'log'` — `q^k / log2(h + 1)` — gentler still on long games
+- **`FPM_QUALITY_EXP = k`** (default 2) — biases toward the genuinely great:
+  at equal length, 97% vs 90% separates much harder than linearly.
+- **`FPM_BREADTH_WEIGHT = w`** (default 0) — optional breadth/delight term:
+  `score × log10(max(reviews, 10))^w`. At w=0 it's off (×1 semantics must hold
+  exactly); w=1 lets a broadly-loved game outrank an obscure short one at
+  equal quality %. Exposed so James can A/B it, not asserted as right.
+- **Live comparison, cache-only:** `/api/fpm` accepts `?formula=`, `?qexp=`,
+  `?breadth=` overrides (re-rank only — served entirely from already-cached
+  lengths, zero extra HLTB calls), plus a small formula picker in the FPM tab
+  header (local-only app; it's a real feature, not scaffolding). This is how
+  James runs the eye test — flip, look, decide.
+- **Display:** `fun/hr` stays the honest raw number
+  (`wilsonQuality × 100 / mainHours`); the why-line appends the active formula
+  when it isn't `linear` (e.g. "… — 14.5 fun/hr · sqrt ranking") so the sort
+  order is never mysterious. Sort by the formula score, at-historical-low
+  tiebreak unchanged.
+- **`FPM_LENGTH_FIELD`** stays a one-line lever (cache already holds all three
+  lengths — no migration): if main-story reads too short during the eye test,
+  `comp_plus` is the first thing to try.
+- Whatever James picks at acceptance becomes the shipped default in config —
+  record the choice + why in the save-down.
 
 ## Out of scope
 
-IGDB fallback build-out (contingency only, James-gated at the probe), fun-per-
-dollar / any price term in the score, FPM as a sort mode on other lanes,
-wishlist games in the FPM pool, settings + dismissals (inc 8), any change to
-existing lane qualification / sourcing pools / shared enrichment shapes, any
-deploy (local-only stands).
+Settings + dismissals (inc 8 — including persisting a formula choice via
+settings UI; for now the default lives in config), any pool-sourcing change,
+wishlist games in the FPM pool, new data sources / IGDB, any change to
+Best-of/Recs/Wishlist qualification or scoring, FPM as a sort mode on other
+lanes, deploy (local-only stands).
 
 ## Testing
 
-- **Fixtures must mirror the REAL probe-captured response shape** (nested
-  as-is — the inc-6 historical-low lesson; a flat "convenient" mock is a bug).
-- Unit: parse fn (real-shape fixture; drifted/missing fields → throw → lane
-  hides, app alive), matching (steam-id hit / fuzzy hit / below-threshold
-  miss), FPM math + min-length floor + missing-length exclusion + unmatched
-  count, sort + at-low tiebreak, filter matrix (similarity exempt, others
-  apply), cache round-trips incl. negative cache + `?refresh=1`.
-- Regression: full suites green (301 baseline).
-- **Live proof:** (a) spot-check 5 well-known lane entries' main-story hours
-  against howlongtobeat.com by hand — match within rounding; (b) a known-short
-  high-quality game on sale ranks above a similar-quality long game;
-  (c) unmatched count is plausible against the pool (indies missing, AAA
-  matched); (d) kill the HLTB handshake live → lane hides with notice, every
-  other tab keeps serving.
-- Manual (James, localhost): the lane reads as "quick wins" — short great
-  games on top; filters steer it; footer count sane.
+- Unit: floor matrix (game passing 50/0.7/5000 but failing 10k/95% now
+  qualifies; sub-floor junk still excluded; Best-of route still enforces
+  10k/95%); formula math per formula incl. `qexp`/`breadth` params and the
+  w=0 ×1 identity; override parsing (`?formula=` bad values → default, never
+  a 500); ordering fixture — curated known-games set with real-ish quality ×
+  hours (Gorogoa 1.8h/97.3%, Portal ~3h/98%, Celeste ~8h/97%, Hades
+  ~23h/98%, ETS2 45.9h/97.3%) asserting `sqrt`+k=2 no longer ranks purely by
+  brevity while `linear` does (proves the levers actually move the thing
+  James flagged).
+- Regression: full suites green (352 baseline).
+- **Live proof:** (a) lane size before/after floor swap measured and recorded
+  — expect ~9 → dozens+; (b) top-20 contains no thin-review junk (Wilson
+  floor holds on real data); (c) `?formula=` flip re-ranks instantly with
+  zero new HLTB requests (watch the queue); (d) Best-of lane byte-identical
+  before/after; (e) if lane < ~30, flip `FPM_POOL_CAP` to 1000 and record the
+  cold-fill time + final lane size.
+- Manual (James, localhost): the eye test — flip formulas in the tab header;
+  Portal/Celeste-class games read as top scorers under at least one setting;
+  pick the default. The lane finally reads as "quick wins with substance".
