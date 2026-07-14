@@ -124,7 +124,12 @@ export function computeAllTagNames(items) {
 // so they're independently unit-testable and combinable.
 // ---------------------------------------------------------------------------
 
+/** Owned rows (FPM only, Increment 7.6 — `item.owned === true`) carry no
+ * cut at all, so the discount bar exempts them rather than always failing
+ * them at any minDiscount > 0. No other tab's items ever set `owned`, so
+ * this is a no-op everywhere except FPM. */
 export function passesMinDiscount(item, minDiscount) {
+  if (item.owned) return true;
   return (item.cut ?? 0) >= (minDiscount || 0);
 }
 

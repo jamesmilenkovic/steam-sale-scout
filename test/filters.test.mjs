@@ -155,6 +155,14 @@ test("passesMinDiscount", () => {
   assert.equal(passesMinDiscount({ cut: 10 }, null), true); // no floor set
 });
 
+test("passesMinDiscount: an owned row (FPM, Increment 7.6) is exempt regardless of the bar setting, since it has no cut", () => {
+  assert.equal(passesMinDiscount({ owned: true, cut: null }, 60), true);
+  assert.equal(passesMinDiscount({ owned: true }, 100), true);
+  // A sub-10% (or any low-cut) DEAL row is NOT exempt — only owned rows are.
+  assert.equal(passesMinDiscount({ owned: false, cut: 5 }, 10), false);
+  assert.equal(passesMinDiscount({ cut: 5 }, 10), false);
+});
+
 test("passesMaxPrice", () => {
   assert.equal(passesMaxPrice({ price: 20 }, 20), true);
   assert.equal(passesMaxPrice({ price: 21 }, 20), false);

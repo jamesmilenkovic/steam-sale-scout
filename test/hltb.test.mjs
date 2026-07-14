@@ -471,6 +471,35 @@ test("ordering fixture: sqrt+qexp=2 collapses the brevity-driven gap hard toward
 });
 
 // ---------------------------------------------------------------------------
+// Curated-fixture pair fix (Increment 7.6, SPEC.md §4): the Gorogoa/ETS2 pair
+// above has IDENTICAL Wilson quality (0.973 each), so no quality exponent can
+// ever flip its order by construction — it can only demonstrate the score
+// gap collapsing, never a real reordering. This pair (live-verified
+// quality-gap shape; the underlying floats round to the displayed 96%/91%)
+// DOES flip under sqrt+qexp=2 (the shipped default) while staying
+// brevity-ordered under plain linear — proof the quality exponent lever can
+// actually reorder real candidates, not just narrow a gap that was never
+// going to reorder anything.
+// ---------------------------------------------------------------------------
+
+const THRONEFALL = { title: "Thronefall", quality: 0.964, hours: 7.9 };
+const LARA_CROFT = { title: "Lara Croft", quality: 0.91, hours: 6.3 };
+
+test("curated pair fix: linear ranks Lara Croft (shorter) over Thronefall — pure brevity, unflipped", () => {
+  assert.equal(Math.round(THRONEFALL.quality * 100), 96);
+  assert.equal(Math.round(LARA_CROFT.quality * 100), 91);
+  const linearThronefall = fpmScore(THRONEFALL.quality, THRONEFALL.hours, { formula: "linear", qualityExp: 1 });
+  const linearLara = fpmScore(LARA_CROFT.quality, LARA_CROFT.hours, { formula: "linear", qualityExp: 1 });
+  assert.ok(linearLara > linearThronefall, "linear must still favour the shorter game");
+});
+
+test("curated pair fix: sqrt+qexp=2 (the shipped default) flips the order — Thronefall overtakes Lara Croft on sustained quality", () => {
+  const sqrtThronefall = fpmScore(THRONEFALL.quality, THRONEFALL.hours, { formula: "sqrt", qualityExp: 2 });
+  const sqrtLara = fpmScore(LARA_CROFT.quality, LARA_CROFT.hours, { formula: "sqrt", qualityExp: 2 });
+  assert.ok(sqrtThronefall > sqrtLara, "sqrt+qexp=2 must flip Thronefall ahead of Lara Croft, not just narrow the gap");
+});
+
+// ---------------------------------------------------------------------------
 // getCachedHltb — cache-miss vs. cached-negative distinction (own KV key).
 // ---------------------------------------------------------------------------
 

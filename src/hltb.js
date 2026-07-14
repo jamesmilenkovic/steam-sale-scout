@@ -54,10 +54,17 @@
 
 import { quality } from "./score.js";
 
-/** Cap the Best-of pool at this many (already rank-sorted) candidates before
- * resolving lengths — keeps a cold refresh to a bounded ~5 min of lazy-fill
- * at the queue's ~1 req/sec pace. */
+/** Cap the deal side of the FPM pool at this many (already rank-sorted)
+ * candidates before resolving lengths — keeps a cold refresh to a bounded
+ * ~5 min of lazy-fill at the queue's ~1 req/sec pace. */
 export const FPM_POOL_CAP = 300;
+
+/** Cap on the OWNED side of the FPM pool (Increment 7.6) — 0 means no cap,
+ * every owned game is a candidate. The lever to pull if a cold fill of
+ * James's whole library turns out to be obnoxiously slow at the ~1 req/sec
+ * queue pace; left uncapped by default per the build note (record library
+ * size + cold-fill time in the save-down so the decision is data-driven). */
+export const FPM_OWNED_CAP = 0;
 
 /** Minimum Dice-bigram title-similarity score to accept an HLTB entry as a
  * match. Below this, a candidate is left unmatched rather than risk a

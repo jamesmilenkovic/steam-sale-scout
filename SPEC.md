@@ -1,105 +1,115 @@
-# Increment 7.5 — FPM lane tuning (qualification + scoring)
+# Increment 7.6 — FPM independent pool + owned games
 
-**Project:** Steam Sale Scout · **Phase 2, slice 3.5** (the inc-7 follow-ups, James 2026-07-12)
+**Project:** Steam Sale Scout · **Phase 2, slice 3.6** (the inc-7.5 follow-ups, James 2026-07-13)
 **PRD:** `PRDs/2-in-progress/2026-07-04-steam-sale-recommender.md`
-**Base:** `main` @ inc-7 (`ec92b99`) · **Status:** Build-ready (scoped 2026-07-12)
+**Base:** `main` @ inc-7.5 (`d9a4a1e`) · **Status:** Build-ready (scoped 2026-07-13)
 
 ## Why
 
-Inc-7 shipped correct to its own spec (352/352, live-proof passed) but James's
-live review flagged two product-model problems, deferred to here:
+7.5 fixed the floors and the formula, but James's eye test hit one root
+cause twice: **FPM sources from `loadBestOfPool`**, which applies two
+server-side exclusions before the client sees anything —
+`filterByMinCut(merged, BESTOF_MIN_CUT)` (fixed 10% discount floor,
+`src/deals.js:49`) and `excludeOwned(...)`. So the bar's "Any" discount can't
+surface sub-10% games (never fetched), owned games can never appear, and the
+eye test had no reference points (games James knows are all owned). The
+formula default (`sqrt`) shipped on Coder/Reviewer live evidence, pending
+James's re-test with owned games visible.
 
-1. **The lane is too small.** Measured funnel 2026-07-12: pool ~4,800 → top
-   `FPM_POOL_CAP=300` → only ~10 pass the inherited Best-of floor
-   (`qualifiesForHof`: ≥10,000 reviews AND ≥95% positive) → 9 matched. Across
-   the whole pool only 14 games clear 10k/95% — the floor, not the HLTB match
-   rate, is the dominant cull. Far stricter than a "quick wins" lane wants.
-2. **The scoring over-rewards ultra-short games.** Pure `quality ÷ hours`
-   makes 1.8h Gorogoa #1 on brevity alone (54.2 fun/hr) while identical-quality
-   45.9h ETS2 comes last. James's instinct: Portal/Celeste-class games should
-   be top scorers — reward sustained delight, not just density. Explore, don't
-   just tweak.
-
-This is a 5.5-style tuning increment: no new data sources, no new lanes.
-Inc 8 (settings + dismissals) is unchanged and stays next.
+**Scoping decisions (James, 2026-07-13):** owned games mixed into the lane
+with an **"Owned" badge**, shown **by default**, with a **filter-bar toggle
+to hide** — the lane doubles as buying guide and backlog prioritizer.
 
 ## Build
 
-### 1. Qualification — swap the floor, keep a floor (fix 3a)
+### 1. FPM's own candidate pool (decouple from Best-of)
 
-- Replace the FPM lane's use of `qualifiesForHof` with **FPM-specific floors
-  defaulting to the Recs-tier values that already exist in `src/score.js`**:
-  `FPM_MIN_REVIEWS = 50`, `FPM_MIN_QUALITY = 0.7` (Wilson lower bound),
-  `FPM_MIN_OWNERS = 5000` — all config in `src/hltb.js`, independent of both
-  the Recs constants and Best-of (so any lane can be tuned without moving the
-  others).
-- **Do NOT drop the floor to zero:** `fpm = quality ÷ hours` divides by a
-  small number — a 2h game with a handful of lucky reviews would top the lane
-  on garbage data. The Wilson lower bound + review/owner minimums stay the
-  guard.
-- **Best-of lane is untouched** — it keeps `qualifiesForHof` (10k/95%). Only
-  the FPM route's qualification changes.
-- **Pool cap, data-driven:** keep `FPM_POOL_CAP = 300` for the build. At
-  live-proof, measure lane size with the new floors; if still under ~30 games,
-  flip the config to 1000 (cold fill ≈ 15 min at ~1 req/sec, one-time, then
-  cache-warm — acceptable). Record the measured funnel either way in the
-  save-down.
+- New `loadFpmPool` alongside `loadBestOfPool` (`src/worker.js`): **same
+  ITAD rank-sorted sourcing** (rank ASC = most-popular-first, cap 5000 —
+  no new pagination), but **no `filterByMinCut`** for FPM's copy. Keep
+  `excludeOwned` on the deal side — owned games enter via §2, so no dupes
+  by construction.
+- **Not a shared-config change:** `BESTOF_MIN_CUT` and `loadBestOfPool` are
+  untouched — Best-of must stay byte-identical (7.5 discipline). No shared
+  constant may couple the two pools.
+- Own Cache-API key (`fpm-pool`, 6h) mirroring the Best-of pool cache.
+- `FPM_POOL_CAP = 300` still slices the top of the deal side (unchanged,
+  per the 7.5 pool-cap decision).
 
-### 2. Scoring — config-selectable formulas + live comparison (fix 3b)
+### 2. Owned games in the lane
 
-- **`FPM_FORMULA`** (config, in `src/hltb.js`) selects the score function.
-  Ship all of these; each is a few lines:
-  - `'linear'` — `q^k / h` (current behaviour at k=1; kept for comparison)
-  - `'sqrt'` — `q^k / sqrt(h)` (**default**) — length matters, doesn't dominate
-  - `'log'` — `q^k / log2(h + 1)` — gentler still on long games
-- **`FPM_QUALITY_EXP = k`** (default 2) — biases toward the genuinely great:
-  at equal length, 97% vs 90% separates much harder than linearly.
-- **`FPM_BREADTH_WEIGHT = w`** (default 0) — optional breadth/delight term:
-  `score × log10(max(reviews, 10))^w`. At w=0 it's off (×1 semantics must hold
-  exactly); w=1 lets a broadly-loved game outrank an obscure short one at
-  equal quality %. Exposed so James can A/B it, not asserted as right.
-- **Live comparison, cache-only:** `/api/fpm` accepts `?formula=`, `?qexp=`,
-  `?breadth=` overrides (re-rank only — served entirely from already-cached
-  lengths, zero extra HLTB calls), plus a small formula picker in the FPM tab
-  header (local-only app; it's a real feature, not scaffolding). This is how
-  James runs the eye test — flip, look, decide.
-- **Display:** `fun/hr` stays the honest raw number
-  (`wilsonQuality × 100 / mainHours`); the why-line appends the active formula
-  when it isn't `linear` (e.g. "… — 14.5 fun/hr · sqrt ranking") so the sort
-  order is never mysterious. Sort by the formula score, at-historical-low
-  tiebreak unchanged.
-- **`FPM_LENGTH_FIELD`** stays a one-line lever (cache already holds all three
-  lengths — no migration): if main-story reads too short during the eye test,
-  `comp_plus` is the first thing to try.
-- Whatever James picks at acceptance becomes the shipped default in config —
-  record the choice + why in the save-down.
+- **Source:** GetOwnedGames (already fetched for exclusion + Library) —
+  owned titles become FPM candidates: SteamSpy via the existing `spyQueue`
+  (quality/reviews/owners), HLTB via the existing `hltb` queue (match on the
+  owned game's name from GetOwnedGames `include_appinfo`). Both queues are
+  throttled + cached already; the fill is progressive like everything else.
+- **`FPM_OWNED_CAP = 0`** (config; 0 = no cap). If James's library makes the
+  first cold fill obnoxious, the cap is the lever — record library size +
+  cold-fill time in the save-down so the decision is data-driven.
+- **Qualification: the SAME FPM floors apply to owned games**
+  (`qualifiesForFpmFloor` — 50 reviews / 0.7 Wilson / 5000 owners). Decision
+  rationale: the floor guards the *score's data quality* (a Wilson numerator
+  on 12 reviews is noise, owned or not), not taste. An owned game below the
+  floors simply doesn't appear. James can veto at the diff gate.
+- **No price data, gracefully:** owned entries carry no
+  `price`/`cut`/`atHistoricalLow` — price/discount cells render `—`, an
+  **"Owned" badge** renders where the discount would, `atHistoricalLow`
+  treated as false (tiebreak unaffected), why-line unchanged otherwise.
+  Store-page link still works (appid known).
+- **Toggle:** "Show owned" checkbox in the FPM filter bar (FPM tab only —
+  must not leak to other lanes), **default ON**. Server param `?owned=0|1`
+  (default 1): at `owned=0` the owned side is not sourced at all (zero owned
+  queue work), not merely hidden client-side. Bad values → default, never a
+  500 (7.5 override discipline).
+- **Discount bar filter on FPM now genuinely spans from "Any"** — sub-10%
+  deals appear (pool no longer pre-floored); owned entries are exempt from
+  the discount filter (they have no cut) but respect tag/Deck/battery
+  filters via the shared enrichment they already get.
+
+### 3. Eye test + lock the formula default (carried from 7.5 §4)
+
+- With owned reference points visible, James re-runs the eye test via the
+  in-tab picker and **confirms or changes `FPM_FORMULA`'s shipped default**.
+  The pick + why go in the save-down. No formula code changes in scope.
+
+### 4. Curated-fixture pair fix (carried from 7.5 §2 flag)
+
+- SPEC's original Gorogoa/ETS2 pair has identical Wilson quality, so no
+  quality exponent can flip it by construction. Update the curated ordering
+  fixture to ALSO assert a real quality-gap flip, using the live-verified
+  pair shape (e.g. Thronefall 96%/7.9h overtakes Lara Croft 91%/6.3h under
+  `sqrt`+`qexp=2` but not under `linear`). Keep the existing
+  score-gap-collapse assertion.
 
 ## Out of scope
 
-Settings + dismissals (inc 8 — including persisting a formula choice via
-settings UI; for now the default lives in config), any pool-sourcing change,
-wishlist games in the FPM pool, new data sources / IGDB, any change to
-Best-of/Recs/Wishlist qualification or scoring, FPM as a sort mode on other
-lanes, deploy (local-only stands).
+Settings + dismissals (inc 8 — incl. persisting the toggle/formula choices;
+defaults live in config), any change to Best-of/Recs/Wishlist pools,
+qualification, or scoring, new formulas or formula-code changes, HLTB
+adapter changes (`src/hltb.js` handshake/matching untouched beyond reuse),
+owned games in any other lane, playtime-aware scoring ("remaining fun" —
+a later idea, not this slice), deploy (local-only stands).
 
 ## Testing
 
-- Unit: floor matrix (game passing 50/0.7/5000 but failing 10k/95% now
-  qualifies; sub-floor junk still excluded; Best-of route still enforces
-  10k/95%); formula math per formula incl. `qexp`/`breadth` params and the
-  w=0 ×1 identity; override parsing (`?formula=` bad values → default, never
-  a 500); ordering fixture — curated known-games set with real-ish quality ×
-  hours (Gorogoa 1.8h/97.3%, Portal ~3h/98%, Celeste ~8h/97%, Hades
-  ~23h/98%, ETS2 45.9h/97.3%) asserting `sqrt`+k=2 no longer ranks purely by
-  brevity while `linear` does (proves the levers actually move the thing
-  James flagged).
-- Regression: full suites green (352 baseline).
-- **Live proof:** (a) lane size before/after floor swap measured and recorded
-  — expect ~9 → dozens+; (b) top-20 contains no thin-review junk (Wilson
-  floor holds on real data); (c) `?formula=` flip re-ranks instantly with
-  zero new HLTB requests (watch the queue); (d) Best-of lane byte-identical
-  before/after; (e) if lane < ~30, flip `FPM_POOL_CAP` to 1000 and record the
-  cold-fill time + final lane size.
-- Manual (James, localhost): the eye test — flip formulas in the tab header;
-  Portal/Celeste-class games read as top scorers under at least one setting;
-  pick the default. The lane finally reads as "quick wins with substance".
+- Unit: pool independence (FPM pool has no min-cut while `loadBestOfPool` /
+  `BESTOF_MIN_CUT` are untouched and no constant is shared); owned merge
+  (badge + `—` price rendering fields, `atHistoricalLow` false, dedup by
+  construction — an owned appid never appears twice); `?owned=` matrix
+  (0 → zero owned rows AND zero owned queue enqueues; bad values → default);
+  floors applied to owned candidates (below-floor owned excluded); discount
+  filter exempts owned but applies to sub-10% deal rows; curated fixture
+  quality-gap flip (§4).
+- Regression: full suites green (375 baseline). Best-of route tests
+  unchanged and passing.
+- **Live proof:** (a) with bar at "Any", sub-10% deals appear in FPM while
+  Best-of still floors at 10; (b) owned games appear with the badge, `—`
+  price, correct HLTB hours (spot-check 3 against howlongtobeat.com);
+  (c) toggle off → owned rows gone AND no owned-side HLTB/SteamSpy traffic
+  in wrangler logs; (d) Best-of byte-identical (diff + live schema check,
+  7.5 method); (e) record the owned funnel: library size → floors → matched,
+  plus cold-fill time; (f) `hltb:` cache keys from 7.5 still hit (no
+  re-fetch of already-matched games).
+- Manual (James, localhost): eye test with real reference points → lock the
+  formula default; the lane reads as one honest list — "buy this" and "you
+  already own this, play it" side by side, steerable by the bar.

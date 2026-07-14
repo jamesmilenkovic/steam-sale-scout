@@ -45,6 +45,7 @@ import {
 } from "./wishlist.js";
 import {
   FPM_POOL_CAP,
+  FPM_OWNED_CAP,
   FPM_LENGTH_FIELD,
   FPM_FORMULA,
   FPM_QUALITY_EXP,
@@ -1399,22 +1400,43 @@ async function handleWishlist(request, env, ctx) {
 }
 
 // ---------------------------------------------------------------------------
-// /api/fpm (Increment 7, tuned in 7.5) — "Fun per minute": Wilson quality
-// (raised to a configurable exponent) ÷ a configurable function of
-// HowLongToBeat main-story hours, for players who'd rather have a quick,
-// excellent game than a long good one. Sources the top FPM_POOL_CAP entries
-// of the SAME rank-sorted Best-of pool as /api/best-of (loadBestOfPool,
-// untouched) — no new sourcing, no changes to that pool. Eligibility uses
-// this lane's OWN floor, qualifiesForFpmFloor (Increment 7.5 — deliberately
-// NOT qualifiesForHof; the 10k-review/95%-positive Best-of bar left only
-// ~9-10 games in the whole pool eligible, too strict for a "quick wins"
-// lane). Best-of itself (handleHof, above) is untouched and still enforces
-// qualifiesForHof. Main-story length is resolved per-candidate from
-// HowLongToBeat via src/hltb.js's own throttled background queue, mirroring
-// src/spyQueue.js's progressive-fill pattern. src/hltb.js owns the
-// HLTB handshake/parse/match (its own repair surface, documented there) —
-// this section only owns the fetch/cache/pool wiring, the same split
-// /api/wishlist has with src/wishlist.js.
+// /api/fpm (Increment 7, tuned in 7.5, given its own pool + owned games in
+// 7.6) — "Fun per minute": Wilson quality (raised to a configurable
+// exponent) ÷ a configurable function of HowLongToBeat main-story hours,
+// for players who'd rather have a quick, excellent game than a long good
+// one. Eligibility uses this lane's OWN floor, qualifiesForFpmFloor
+// (Increment 7.5 — deliberately NOT qualifiesForHof; the 10k-review/
+// 95%-positive Best-of bar left only ~9-10 games in the whole pool eligible,
+// too strict for a "quick wins" lane). Best-of itself (handleHof, above) is
+// untouched and still enforces qualifiesForHof over its own pool. Main-story
+// length is resolved per-candidate from HowLongToBeat via src/hltb.js's own
+// throttled background queue, mirroring src/spyQueue.js's progressive-fill
+// pattern. src/hltb.js owns the HLTB handshake/parse/match (its own repair
+// surface, documented there) — this section only owns the fetch/cache/pool
+// wiring, the same split /api/wishlist has with src/wishlist.js.
+//
+// INCREMENT 7.6 — FPM independent pool + owned games. Two root causes James's
+// eye test kept hitting: (1) FPM used to source from loadBestOfPool, which
+// applies filterByMinCut(merged, BESTOF_MIN_CUT) server-side — a sub-10%
+// discount could never even enter the pool, so the bar's "Any" discount
+// setting had nothing to surface. (2) the same pool also excludes owned
+// games, so the eye test had no reference points (games James actually
+// knows are all owned). Fix: loadFpmPool below is a dedicated sourcing path
+// (own Cache-API key, own build function) that reuses fetchBestOfPages'
+// sourcing (same rank-ASC axis, same BESTOF_FETCH_CAP) but skips
+// filterByMinCut entirely — loadBestOfPool/BESTOF_MIN_CUT above are
+// untouched, no constant is shared between the two pools. Owned games become
+// their own candidate stream (ownedFpmCandidate, sourced from the
+// libraryGames already fetched for the taste profile — no new Steam API
+// call) merged alongside the deal-side pool before buildCandidatePool, which
+// needs no changes at all: it already treats every deal-shaped candidate
+// identically regardless of where it came from. The SAME qualifiesForFpmFloor
+// applies to owned candidates (the floor guards score data quality, not
+// taste) and the SAME HLTB queue resolves their length by title match.
+// ?owned=0|1 (default 1, bad values -> default) gates whether the owned
+// candidate stream is even constructed — at owned=0 no owned appid is ever
+// added to the pool passed into buildCandidatePool, so zero owned-side spy/
+// HLTB queue work happens, not just a client-side hide.
 //
 // FAIL-SOFT, SOURCE LEVEL (headline requirement, same as /api/wishlist):
 // missing secrets OR a failed hltbInit() handshake both return the same
@@ -1438,6 +1460,100 @@ async function handleWishlist(request, env, ctx) {
 // Bad values never throw; they silently fall back to the hltb.js config
 // defaults (parseFpmFormula/parseFpmScoreParam below).
 // ---------------------------------------------------------------------------
+
+/** Cache key for FPM's own candidate pool — entirely separate from
+ * bestOfPoolCacheKey() above, so building/refreshing this pool never reads
+ * or writes the Best-of pool (or vice versa). */
+function fpmPoolCacheKey() {
+  return new Request("https://steam-sale-scout.cache/api/fpm/pool");
+}
+
+/**
+ * Assemble FPM's own deal-side candidate pool: fetch (same rank-sorted axis
+ * as Best-of, via fetchBestOfPages — no new pagination) -> merge/cap at
+ * BESTOF_FETCH_CAP -> enrich (appid, historical low) -> exclude owned (owned
+ * games enter separately via ownedFpmCandidate below, so no dupes by
+ * construction). Deliberately NO filterByMinCut call anywhere in this path —
+ * that omission is the entire point of this pool existing separately from
+ * buildBestOfPool's BESTOF_MIN_CUT floor.
+ */
+async function buildFpmPool(env, ctx, refresh) {
+  const pages = await fetchBestOfPages(env);
+  const merged = mergeDealPages(pages, BESTOF_FETCH_CAP);
+
+  const itadIds = merged.map((item) => item.id);
+  const appIdMap = await resolveAppIds(env, ctx, itadIds, refresh);
+  const lowMap = await resolveHistoricalLows(env, ctx, itadIds, refresh);
+
+  const deals = merged.map((item) => {
+    const deal = normalizeDeal(item, appIdMap.get(item.id) ?? null);
+    const low = lowMap.get(item.id);
+    return applyHistoricalLow(deal, low ? { price: low } : null);
+  });
+
+  const ownedAppIds = await getOwnedAppIds(env, ctx);
+  return excludeOwned(deals, ownedAppIds);
+}
+
+/** Load FPM's deal-side candidate pool, cached under its own key (6h TTL,
+ * same cadence as the Best-of pool). ?refresh=1 bypasses and repopulates. */
+async function loadFpmPool(env, ctx, refresh) {
+  const cache = caches.default;
+  const cacheKey = fpmPoolCacheKey();
+
+  if (!refresh) {
+    const cached = await cache.match(cacheKey);
+    if (cached) {
+      const body = await cached.clone().json();
+      return body.deals;
+    }
+  }
+
+  const deals = await buildFpmPool(env, ctx, refresh);
+  const response = new Response(JSON.stringify({ deals }), {
+    status: 200,
+    headers: {
+      "content-type": "application/json",
+      "cache-control": `public, max-age=${DEALS_CACHE_TTL_SECONDS}`,
+    },
+  });
+  ctx.waitUntil(cache.put(cacheKey, response.clone()));
+  return deals;
+}
+
+/**
+ * Build a deal-shaped FPM candidate for one owned library game (Increment
+ * 7.6) — same field shape normalizeDeal() produces, so buildCandidatePool
+ * needs no changes to accept it, but every price/deal field is null (owned
+ * games were never fetched from ITAD) and `owned: true` marks it so the
+ * response/UI can render an Owned badge + "—" price cells instead.
+ * atHistoricalLow stays false — no price to compare against a historical low.
+ * @param {{appid: number, name: string}} game - a trimmed library game.
+ */
+function ownedFpmCandidate(game) {
+  return {
+    itadId: null,
+    appid: game.appid,
+    title: game.name,
+    price: null,
+    priceCents: null,
+    regular: null,
+    cut: null,
+    expiry: null,
+    flag: null,
+    atHistoricalLow: false,
+    historicalLow: null,
+    tags: [],
+    owned: true,
+  };
+}
+
+/** `?owned=` override: only the literal string "0" turns the owned candidate
+ * stream off; missing, "1", or any other value defaults to on (owned=1) —
+ * bad values never 500, mirroring parseFpmFormula/parseFpmScoreParam. */
+function parseOwnedParam(raw) {
+  return raw !== "0";
+}
 
 function fpmUnavailableResponse() {
   return new Response(
@@ -1480,6 +1596,7 @@ async function handleFpm(request, env, ctx) {
   const refresh = url.searchParams.get("refresh") === "1";
   const windowMonthsParam = Number(url.searchParams.get("windowMonths"));
   const windowMonths = windowMonthsParam > 0 ? windowMonthsParam : 12;
+  const includeOwned = parseOwnedParam(url.searchParams.get("owned"));
 
   // Scoring overrides (Increment 7.5) — parsed up front, but only read at
   // the final per-row score/why-line/sort step below. Never affects
@@ -1495,19 +1612,27 @@ async function handleFpm(request, env, ctx) {
     return fpmUnavailableResponse();
   }
 
-  let bestOfPool;
+  let dealPool;
   try {
-    bestOfPool = await loadBestOfPool(env, ctx, refresh);
+    dealPool = await loadFpmPool(env, ctx, refresh);
   } catch {
     return fpmUnavailableResponse();
   }
 
-  // The pool is already rank-sorted (most-popular-first) by loadBestOfPool —
-  // cap here, never reorder or otherwise touch it (build note: "no changes
-  // to the Best-of pool itself").
-  const capped = bestOfPool.slice(0, FPM_POOL_CAP);
+  // The pool is already rank-sorted (most-popular-first) by loadFpmPool —
+  // cap here, never reorder or otherwise touch it.
+  const capped = dealPool.slice(0, FPM_POOL_CAP);
 
-  const pool = await buildCandidatePool(env, ctx, libraryGames, capped, windowMonths);
+  // Increment 7.6: owned games are their own candidate stream, sourced from
+  // the SAME libraryGames just fetched for the taste profile (no new Steam
+  // API call). Gated entirely behind includeOwned — at owned=0 no owned
+  // appid is ever added to poolCandidates below, so zero owned-side spy/HLTB
+  // queue work happens, not merely a client-side hide.
+  let ownedCandidates = includeOwned ? libraryGames.map(ownedFpmCandidate) : [];
+  if (FPM_OWNED_CAP > 0) ownedCandidates = ownedCandidates.slice(0, FPM_OWNED_CAP);
+
+  const poolCandidates = [...capped, ...ownedCandidates];
+  const pool = await buildCandidatePool(env, ctx, libraryGames, poolCandidates, windowMonths);
   // Increment 7.5: this lane's OWN floor (50 reviews / 0.7 Wilson quality /
   // 5000 owners), not qualifiesForHof — see the section comment above.
   const eligible = pool.candidates.filter((c) => c.appid != null && qualifiesForFpmFloor(c));
