@@ -16,3 +16,16 @@ binding = "ASSETS"
 [[kv_namespaces]]
 binding = "TAG_CACHE"
 id = "local-dev-tag-cache-placeholder"
+
+# FPM catalog (Increment 7.7) — the lane's own durable store, so the
+# multi-run HowLongToBeat fill survives `wrangler dev` restarts instead of
+# starting over each time. `database_id` is a placeholder, same convention
+# as TAG_CACHE above: `wrangler dev` simulates D1 entirely locally
+# (state lands under .wrangler/state/v3/d1/), no real Cloudflare account
+# needed. Schema is created on demand (CREATE TABLE IF NOT EXISTS in
+# src/catalog.js), not via `wrangler d1 migrations` — see that file's
+# ensureCatalogSchema for the reasoning.
+[[d1_databases]]
+binding = "FPM_DB"
+database_name = "fpm-catalog"
+database_id = "local-dev-fpm-catalog-placeholder"

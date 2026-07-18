@@ -23,6 +23,7 @@ import {
   passesQualityFloors,
   passesDeckFilter,
   passesBatteryFilter,
+  passesOnSaleOnly,
   applyFilters,
 } from "../public/filters.js";
 
@@ -158,9 +159,30 @@ test("passesMinDiscount", () => {
 test("passesMinDiscount: an owned row (FPM, Increment 7.6) is exempt regardless of the bar setting, since it has no cut", () => {
   assert.equal(passesMinDiscount({ owned: true, cut: null }, 60), true);
   assert.equal(passesMinDiscount({ owned: true }, 100), true);
-  // A sub-10% (or any low-cut) DEAL row is NOT exempt — only owned rows are.
+  // A sub-10% (or any low-cut) DEAL row is NOT exempt — only owned/no-deal rows are.
   assert.equal(passesMinDiscount({ owned: false, cut: 5 }, 10), false);
   assert.equal(passesMinDiscount({ cut: 5 }, 10), false);
+});
+
+test("passesMinDiscount: a catalog row with no deal annotation at all (cut == null, Increment 7.7) is exempt, same as an owned row", () => {
+  assert.equal(passesMinDiscount({ cut: null }, 60), true);
+  assert.equal(passesMinDiscount({}, 60), true); // cut undefined
+  // A real 0%-cut deal (cut is a number, just 0) is NOT the same as "no deal" — still evaluated normally.
+  assert.equal(passesMinDiscount({ cut: 0 }, 10), false);
+  assert.equal(passesMinDiscount({ cut: 0 }, 0), true);
+});
+
+test("passesOnSaleOnly (Increment 7.7, FPM-only): only rows with a real deal annotation pass when the toggle is on", () => {
+  assert.equal(passesOnSaleOnly({ cut: 50 }, true), true);
+  assert.equal(passesOnSaleOnly({ cut: null }, true), false);
+  assert.equal(passesOnSaleOnly({}, true), false);
+  assert.equal(passesOnSaleOnly({ owned: true, cut: null }, true), false, "owned isn't the same as on sale");
+  assert.equal(passesOnSaleOnly({ cut: 0 }, true), true, "a real 0% cut still counts as 'has a deal annotation'");
+});
+
+test("passesOnSaleOnly: toggle off is a no-op regardless of cut", () => {
+  assert.equal(passesOnSaleOnly({ cut: null }, false), true);
+  assert.equal(passesOnSaleOnly({}, false), true);
 });
 
 test("passesMaxPrice", () => {

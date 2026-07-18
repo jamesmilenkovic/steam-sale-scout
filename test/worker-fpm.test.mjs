@@ -1,35 +1,41 @@
-// Tests for src/worker.js — the /api/fpm route (Increment 7): "Fun per
-// minute", Wilson quality ÷ HowLongToBeat main-story hours over FPM's own
-// candidate pool (loadFpmPool — Increment 7.6 split this off from the
-// Best-of pool; see the "own pool" section below). Mirrors
-// test/worker-hof.test.mjs's mocking style (mocked ITAD/SteamSpy/GetItems/
-// HLTB upstream, mocked Steam library cache, mocked KV) plus
-// test/worker-wishlist.test.mjs's fail-soft conventions (this lane never
-// surfaces a non-200 — a HowLongToBeat problem hides the lane behind
-// {available:false} instead).
+// Tests for src/worker.js — the /api/fpm, /api/fpm/sync, and
+// /api/fpm/sync/status routes (Increment 7.7: FPM catalog re-source).
 //
-// Every pre-Increment-7.6 test below pins `?owned=0` on its /api/fpm
-// requests — they predate the owned-games feature and their assertions are
-// about the deal-side pool/eligibility/scoring mechanics, which would
-// otherwise be perturbed by the shared "Owned Game" (appid 1) library
-// fixture becoming an eligible FPM candidate itself (it clears
-// qualifiesForFpmFloor via goodSpyEntry()). The "own pool" and "owned games"
-// sections further down test the owned=1 default and the merge explicitly.
+// Increment 7.7 replaces FPM's old per-request pool+HLTB-queue sourcing with
+// a durable D1 catalog (src/catalog.js) filled by an explicit
+// POST /api/fpm/sync. GET /api/fpm is now a fast, static read: no HLTB
+// traffic, no eligibility computation — it just scores+annotates whatever's
+// already matched in D1. Priming env.FPM_DB directly via src/catalog.js's
+// own exported CRUD (ensureCatalogSchema/upsertCatalogRows/recordHltbResult/
+// markOwned/markDeal) is the fast path for GET-only tests; the /api/fpm/sync
+// section further down exercises the real pipeline end to end through the
+// route.
 //
-// NEVER makes a real network call. Spy-queue AND HLTB-queue pacing shrunk to
-// 0ms via their respective test seams.
+// NEVER makes a real network call. Spy-queue/HLTB-queue pacing and the
+// catalog crawl's pacing/backoff are all shrunk to 0ms via their test seams.
 
 import test from "node:test";
 import assert from "node:assert/strict";
 import worker from "../src/worker.js";
+import { makeMockD1 } from "./helpers/mockD1.mjs";
 import { __setSpyMinIntervalMsForTests, __resetSpyQueueForTests } from "../src/spyQueue.js";
-import {
-  __setHltbMinIntervalMsForTests,
-  __resetHltbQueueForTests,
-  FPM_POOL_CAP,
-  FPM_MIN_LENGTH_HOURS,
-} from "../src/hltb.js";
+import { __setHltbMinIntervalMsForTests, __resetHltbQueueForTests, FPM_MIN_LENGTH_HOURS, FPM_POOL_CAP } from "../src/hltb.js";
 import { quality } from "../src/score.js";
+import {
+  ensureCatalogSchema,
+  upsertCatalogRows,
+  recordHltbResult,
+  markOwned,
+  markDeal,
+  catalogRowFromBulk,
+  __setCatalogPacingMsForTests,
+  __setCatalogBackoffMsForTests,
+  __resetCatalogPacingForTests,
+  __setHltbPollingForTests,
+  __resetHltbPollingForTests,
+  __resetFpmSyncStateForTests,
+  isFpmSyncRunning,
+} from "../src/catalog.js";
 
 const originalFetch = globalThis.fetch;
 const originalCaches = globalThis.caches;
@@ -102,6 +108,7 @@ function makeEnv(overrides = {}) {
     STEAM_ID: "76561198000000000",
     ITAD_API_KEY: "test-itad-key",
     TAG_CACHE: makeMockKv(),
+    FPM_DB: makeMockD1(),
     ASSETS: { fetch: async () => new Response("not found", { status: 404 }) },
     ...overrides,
   };
@@ -112,9 +119,6 @@ function primeLibrary(cache, env, games) {
   cache.store.set(key, jsonResponse({ games }));
 }
 
-// Increment 7.6: FPM sources its own pool (loadFpmPool), no longer the
-// Best-of pool — own cache key, primed independently of test/worker-hof.test.mjs's
-// primeBestOfPool (which primes a different key this file never reads).
 function primeFpmPool(cache, deals) {
   const key = "https://steam-sale-scout.cache/api/fpm/pool";
   cache.store.set(key, jsonResponse({ deals }));
@@ -128,20 +132,6 @@ function deckKey(appid) {
   return `deck:${appid}`;
 }
 
-function hltbKey(appid) {
-  return `hltb:${appid}`;
-}
-
-function goodSpyEntry(overrides = {}) {
-  return {
-    tags: { Roguelike: 10 },
-    median: 300,
-    reviews: { positive: 95000, negative: 5000 }, // clears HOF_MIN_REVIEWS/HOF_MIN_RATIO by default
-    owners: 750000,
-    ...overrides,
-  };
-}
-
 function ownedGame(overrides = {}) {
   return {
     appid: 1,
@@ -150,6 +140,20 @@ function ownedGame(overrides = {}) {
     playtime_2weeks: 0,
     rtime_last_played: Math.floor(Date.now() / 1000) - 60 * 24 * 60 * 60,
     ...overrides,
+  };
+}
+
+/** A minimal fetch mock for tests that don't care about Deck-compat data —
+ * answers GetItems with an empty store_items list (DEFAULT_DECK_COMPAT gets
+ * cached) and throws on anything else, so a forgotten mock never silently
+ * falls through to a real network call. */
+function stubGetItemsFetch() {
+  return async (url) => {
+    const u = new URL(url);
+    if (u.hostname === "api.steampowered.com" && u.pathname.includes("GetItems")) {
+      return jsonResponse({ response: { store_items: [] } });
+    }
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
   };
 }
 
@@ -171,64 +175,15 @@ function deal(overrides = {}) {
   };
 }
 
-/** One raw /api/bleed search-result entry, mirroring the real live-probe
- * capture's field names (comp_main etc. in seconds). */
-function rawHltbEntry(overrides = {}) {
-  return {
-    game_id: 7231,
-    game_name: "Portal 2",
-    game_alias: "",
-    game_type: "game",
-    comp_main: 30743, // ~8.54h
-    comp_plus: 49416,
-    comp_100: 81139,
-    review_score: 90,
-    count_review: 8011,
-    ...overrides,
-  };
-}
-
-/**
- * Router-style mock `fetch` for the HowLongToBeat handshake+search only.
- * `searchResultsByQuery` maps the exact space-joined query string (title
- * split on spaces, rejoined — see src/hltb.js's buildSearchBody) to an array
- * of raw entries. `forbiddenOnceQueries` simulates a stale token: the first
- * search for that query 403s, then (after a re-init) succeeds.
- */
-function makeHltbFetch({
-  initOk = true,
-  initStatus = 200,
-  searchResultsByQuery = {},
-  forbiddenOnceQueries = new Set(),
-  onCall,
-} = {}) {
-  const seen403 = new Set();
-  let initCalls = 0;
-  return async (url, options = {}) => {
-    const u = new URL(url);
-    onCall?.(u, options);
-
-    if (u.hostname === "howlongtobeat.com" && u.pathname === "/api/bleed/init") {
-      initCalls++;
-      if (!initOk) return new Response("error", { status: initStatus });
-      return jsonResponse({ token: `tok-${initCalls}`, hpKey: "hpk", hpVal: "hpv" });
-    }
-
-    if (u.hostname === "howlongtobeat.com" && u.pathname === "/api/bleed") {
-      const body = JSON.parse(options.body);
-      assert.equal(body.hpk, "hpv", "search body must echo body[hpKey]=hpVal");
-      assert.equal(options.headers["x-auth-token"], `tok-${initCalls}`);
-      const query = body.searchTerms.join(" ");
-      if (forbiddenOnceQueries.has(query) && !seen403.has(query)) {
-        seen403.add(query);
-        return new Response("forbidden", { status: 403 });
-      }
-      const entries = searchResultsByQuery[query] ?? [];
-      return jsonResponse({ count: entries.length, data: entries });
-    }
-
-    throw new Error(`Unexpected fetch URL in test: ${url}`);
-  };
+/** Prime a matched (main_hours set), floor-passing catalog row directly via
+ * src/catalog.js's own CRUD — the fast path for GET /api/fpm tests, which
+ * shouldn't need to exercise the whole sync pipeline. */
+async function primeMatchedRow(env, { appid, name, positive = 96000, negative = 4000, owners = 750000, mainHours = 6.5, matchMethod = "name" }) {
+  await ensureCatalogSchema(env);
+  await upsertCatalogRows(env, [{ appid, name, owners, positive, negative, wilson: undefined }].map((r) => ({
+    ...catalogRowFromBulk({ appid: r.appid, name: r.name, positive: r.positive, negative: r.negative, owners: `${r.owners} .. ${r.owners}` }),
+  })), 1000);
+  await recordHltbResult(env, appid, { mainHours, matchMethod, checkedAtMs: 2000 });
 }
 
 test.beforeEach(() => {
@@ -236,16 +191,22 @@ test.beforeEach(() => {
   __resetSpyQueueForTests();
   __setHltbMinIntervalMsForTests(0);
   __resetHltbQueueForTests();
+  __setCatalogPacingMsForTests(0);
+  __setCatalogBackoffMsForTests(0, 0);
+  __setHltbPollingForTests(0, 50);
+  __resetFpmSyncStateForTests();
 });
 
 test.afterEach(() => {
   restoreGlobals();
   __setSpyMinIntervalMsForTests(1000);
   __setHltbMinIntervalMsForTests(1000);
+  __resetCatalogPacingForTests();
+  __resetHltbPollingForTests();
 });
 
 // ---------------------------------------------------------------------------
-// Fail-soft, source level.
+// GET /api/fpm — fail-soft, source level.
 // ---------------------------------------------------------------------------
 
 test("missing STEAM_API_KEY/STEAM_ID -> 200 {available:false}, without touching fetch", async () => {
@@ -258,7 +219,7 @@ test("missing STEAM_API_KEY/STEAM_ID -> 200 {available:false}, without touching 
 
   const env = makeEnv({ STEAM_API_KEY: undefined, STEAM_ID: undefined });
   const ctx = makeCtx();
-  const res = await worker.fetch(new Request("https://x/api/fpm?owned=0"), env, ctx);
+  const res = await worker.fetch(new Request("https://x/api/fpm"), env, ctx);
 
   assert.equal(res.status, 200);
   const body = await res.json();
@@ -273,261 +234,106 @@ test("missing ITAD_API_KEY -> 200 {available:false}", async () => {
 
   const env = makeEnv({ ITAD_API_KEY: undefined });
   const ctx = makeCtx();
-  const res = await worker.fetch(new Request("https://x/api/fpm?owned=0"), env, ctx);
+  const res = await worker.fetch(new Request("https://x/api/fpm"), env, ctx);
 
   assert.equal(res.status, 200);
   const body = await res.json();
   assert.equal(body.available, false);
 });
 
-test("hltbInit() network failure -> 200 {available:false}, library/pool never fetched", async () => {
-  const cache = makeMockCache();
-  globalThis.caches = { default: cache };
-  const env = makeEnv();
-
-  globalThis.fetch = async (url) => {
-    const u = new URL(url);
-    if (u.hostname === "howlongtobeat.com") throw new Error("network down");
-    throw new Error(`Unexpected fetch URL in test: ${url}`);
+test("missing FPM_DB binding -> 200 {available:false}, without touching fetch", async () => {
+  let fetchCalls = 0;
+  globalThis.fetch = async () => {
+    fetchCalls++;
+    return new Response("should not be called", { status: 200 });
   };
+  globalThis.caches = { default: makeMockCache() };
 
+  const env = makeEnv({ FPM_DB: undefined });
   const ctx = makeCtx();
-  const res = await worker.fetch(new Request("https://x/api/fpm?owned=0"), env, ctx);
+  const res = await worker.fetch(new Request("https://x/api/fpm"), env, ctx);
+
   assert.equal(res.status, 200);
   const body = await res.json();
   assert.equal(body.available, false);
-  assert.equal(body.notice, "Fun-per-minute unavailable");
+  assert.equal(fetchCalls, 0);
 });
 
-test("hltbInit() returns a bad shape (missing token) -> 200 {available:false}", async () => {
-  const cache = makeMockCache();
-  globalThis.caches = { default: cache };
-  const env = makeEnv();
-
-  globalThis.fetch = async (url) => {
-    const u = new URL(url);
-    if (u.hostname === "howlongtobeat.com" && u.pathname === "/api/bleed/init") {
-      return jsonResponse({ hpKey: "hpk", hpVal: "hpv" }); // no token
-    }
-    throw new Error(`Unexpected fetch URL in test: ${url}`);
-  };
-
-  const ctx = makeCtx();
-  const res = await worker.fetch(new Request("https://x/api/fpm?owned=0"), env, ctx);
-  const body = await res.json();
-  assert.equal(body.available, false);
-});
-
-test("cold cache + killed HLTB handshake hides only the FPM lane — /api/deals keeps serving 200 under the same mocked-HLTB-down fetch", async () => {
+test("an empty (never-synced) catalog returns available:true with an empty lane and total:0", async () => {
   const cache = makeMockCache();
   globalThis.caches = { default: cache };
   const env = makeEnv();
   primeLibrary(cache, env, [ownedGame({ appid: 1 })]);
-  // An eligible candidate with no cached HLTB record — toResolve > 0, so
-  // handleFpm still has to attempt the (killed) handshake and fail soft.
-  primeFpmPool(cache, [deal({ itadId: "itad-portal2", appid: 200, title: "Portal 2" })]);
-  env.TAG_CACHE.store.set(v2Key(1), JSON.stringify(goodSpyEntry()));
-  env.TAG_CACHE.store.set(v2Key(200), JSON.stringify(goodSpyEntry({ reviews: { positive: 96000, negative: 4000 } })));
 
   globalThis.fetch = async (url) => {
     const u = new URL(url);
-    if (u.hostname === "howlongtobeat.com") {
-      return new Response("service unavailable", { status: 503 });
-    }
-    if (u.pathname === "/deals/v2") {
-      return jsonResponse({ list: [], hasMore: false });
-    }
+    if (u.pathname === "/deals/v2") return jsonResponse({ list: [], hasMore: false });
     throw new Error(`Unexpected fetch URL in test: ${url}`);
   };
 
   const ctx = makeCtx();
-  const fpmRes = await worker.fetch(new Request("https://x/api/fpm?owned=0"), env, ctx);
-  assert.equal(fpmRes.status, 200);
-  const fpmBody = await fpmRes.json();
-  assert.equal(fpmBody.available, false);
-
-  const dealsRes = await worker.fetch(new Request("https://x/api/deals?minCut=60"), env, ctx);
-  assert.equal(dealsRes.status, 200);
-  const dealsBody = await dealsRes.json();
-  assert.deepEqual(dealsBody.deals, []);
-});
-
-test("fully warm cache: /api/fpm serves cached rows without ever calling hltbInit, even if the handshake would fail", async () => {
-  const cache = makeMockCache();
-  globalThis.caches = { default: cache };
-  const env = makeEnv();
-
-  primeLibrary(cache, env, [ownedGame({ appid: 1 })]);
-  primeFpmPool(cache, [deal({ itadId: "itad-portal2", appid: 200, title: "Portal 2", cut: 80 })]);
-  env.TAG_CACHE.store.set(v2Key(1), JSON.stringify(goodSpyEntry()));
-  env.TAG_CACHE.store.set(
-    v2Key(200),
-    JSON.stringify(goodSpyEntry({ tags: { Puzzle: 50 }, reviews: { positive: 96000, negative: 4000 } })),
-  );
-  env.TAG_CACHE.store.set(deckKey(200), JSON.stringify({ deck: 3, os: 3, frame: 0 }));
-  // The candidate's HLTB record is already cached — every eligible
-  // candidate is resolved, so toResolve is empty and hltbInit must never
-  // be reached.
-  env.TAG_CACHE.store.set(
-    hltbKey(200),
-    JSON.stringify({ hltbId: 7231, compMain: 23400, compPlus: 40000, comp100: 50000, matchMethod: "name" }),
-  );
-
-  globalThis.fetch = async (url) => {
-    const u = new URL(url);
-    if (u.hostname === "howlongtobeat.com") {
-      throw new Error("hltbInit must not be called on a fully-warm cache");
-    }
-    throw new Error(`Unexpected fetch URL in test: ${url}`);
-  };
-
-  const ctx = makeCtx();
-  const res = await worker.fetch(new Request("https://x/api/fpm?owned=0"), env, ctx);
-  await ctx.flush();
-  const body = await res.json();
-
-  assert.equal(body.available, true);
-  assert.equal(body.ready, true);
-  assert.equal(body.fpm.length, 1);
-  assert.equal(body.fpm[0].appid, 200);
-});
-
-// ---------------------------------------------------------------------------
-// Eligibility (Increment 7.5): only candidates clearing THIS lane's own
-// qualifiesForFpmFloor (50 reviews / 0.7 Wilson quality / 5000 owners) are
-// even considered — deliberately NOT qualifiesForHof (10k/95%) anymore.
-// ---------------------------------------------------------------------------
-
-test("a candidate failing the FPM quality floor is never queried against HLTB at all", async () => {
-  const cache = makeMockCache();
-  globalThis.caches = { default: cache };
-  const env = makeEnv();
-
-  primeLibrary(cache, env, [ownedGame({ appid: 1 })]);
-  primeFpmPool(cache, [deal({ itadId: "itad-weak", appid: 200, title: "Portal 2" })]);
-  env.TAG_CACHE.store.set(v2Key(1), JSON.stringify(goodSpyEntry()));
-  // Thin reviews -> fails FPM_MIN_REVIEWS (50) outright, never becomes
-  // "eligible" — note this candidate would ALSO have failed the old
-  // qualifiesForHof bar, but the point of this test post-7.5 is that it
-  // fails the lane's OWN (much lower) floor, not the retired one.
-  env.TAG_CACHE.store.set(v2Key(200), JSON.stringify(goodSpyEntry({ reviews: { positive: 18, negative: 2 } })));
-
-  let hltbCalls = 0;
-  globalThis.fetch = async (url) => {
-    const u = new URL(url);
-    if (u.hostname === "howlongtobeat.com" && u.pathname === "/api/bleed/init") {
-      return jsonResponse({ token: "tok", hpKey: "hpk", hpVal: "hpv" });
-    }
-    if (u.hostname === "howlongtobeat.com" && u.pathname === "/api/bleed") {
-      hltbCalls++;
-      return jsonResponse({ count: 0, data: [] });
-    }
-    throw new Error(`Unexpected fetch URL in test: ${url}`);
-  };
-
-  const ctx = makeCtx();
-  const res = await worker.fetch(new Request("https://x/api/fpm?owned=0"), env, ctx);
-  await ctx.flush();
+  const res = await worker.fetch(new Request("https://x/api/fpm"), env, ctx);
   const body = await res.json();
 
   assert.equal(body.available, true);
   assert.equal(body.total, 0);
+  assert.equal(body.matched, 0);
+  assert.equal(body.pending, 0);
+  assert.equal(body.ready, true);
   assert.equal(body.fpm.length, 0);
-  assert.equal(hltbCalls, 0, "a non-qualifying candidate must never reach the HLTB search queue");
 });
 
-test("a candidate clearing FPM's own floor (50/0.7/5000) but failing Best-of's 10k/95% floor now qualifies for FPM", async () => {
+// ---------------------------------------------------------------------------
+// GET /api/fpm — happy path + lane math (reading straight from D1, no HLTB
+// traffic anywhere in this path).
+// ---------------------------------------------------------------------------
+
+test("happy path: a matched D1 row is scored/annotated with zero HLTB or eligibility-recompute network calls", async () => {
   const cache = makeMockCache();
   globalThis.caches = { default: cache };
   const env = makeEnv();
 
+  await primeMatchedRow(env, { appid: 200, name: "Portal 2", positive: 96000, negative: 4000, mainHours: 6.5 });
   primeLibrary(cache, env, [ownedGame({ appid: 1 })]);
-  primeFpmPool(cache, [deal({ itadId: "itad-fpm-only", appid: 200, title: "Portal 2" })]);
-  env.TAG_CACHE.store.set(v2Key(1), JSON.stringify(goodSpyEntry()));
-  // 400 total reviews (>= FPM_MIN_REVIEWS, << HOF_MIN_REVIEWS), 80% positive
-  // (wilson comfortably >= FPM_MIN_QUALITY, well under HOF_MIN_RATIO's 95%),
-  // 50000 owners (>= FPM_MIN_OWNERS). Clears FPM, would never clear Best-of.
-  env.TAG_CACHE.store.set(
-    v2Key(200),
-    JSON.stringify(goodSpyEntry({ reviews: { positive: 320, negative: 80 }, owners: 50000 })),
-  );
-  env.TAG_CACHE.store.set(deckKey(200), JSON.stringify({ deck: 0, os: 0, frame: 0 }));
-
-  globalThis.fetch = makeHltbFetch({
-    searchResultsByQuery: { "Portal 2": [rawHltbEntry({ comp_main: 23400 })] }, // 6.5h
-  });
-
-  const ctx = makeCtx();
-  await worker.fetch(new Request("https://x/api/fpm?owned=0"), env, ctx);
-  await ctx.flush();
-  const res = await worker.fetch(new Request("https://x/api/fpm?owned=0"), env, ctx);
-  await ctx.flush();
-  const body = await res.json();
-
-  assert.equal(body.total, 1);
-  assert.equal(body.fpm.length, 1);
-  assert.equal(body.fpm[0].appid, 200);
-});
-
-// ---------------------------------------------------------------------------
-// Happy path + lane math + enrichment.
-// ---------------------------------------------------------------------------
-
-test("happy path: an eligible, matched candidate carries fpm/funPerHour/mainHours/matchMethod/why/deck/tagNames/batteryFriendly", async () => {
-  const cache = makeMockCache();
-  globalThis.caches = { default: cache };
-  const env = makeEnv();
-
-  primeLibrary(cache, env, [ownedGame({ appid: 1 })]);
-  primeFpmPool(cache, [deal({ itadId: "itad-portal2", appid: 200, title: "Portal 2", cut: 80 })]);
-  env.TAG_CACHE.store.set(v2Key(1), JSON.stringify(goodSpyEntry()));
-  // 96% positive, well clear of HOF_MIN_RATIO (0.95) so this candidate is
-  // actually eligible for the lane.
-  env.TAG_CACHE.store.set(
-    v2Key(200),
-    JSON.stringify(goodSpyEntry({ tags: { Puzzle: 50 }, reviews: { positive: 96000, negative: 4000 } })),
-  );
+  primeFpmPool(cache, []); // no deal-side price data for appid 200 in this test
+  env.TAG_CACHE.store.set(v2Key(200), JSON.stringify({ tags: { Puzzle: 50 } }));
   env.TAG_CACHE.store.set(deckKey(200), JSON.stringify({ deck: 3, os: 3, frame: 0 }));
 
-  globalThis.fetch = makeHltbFetch({
-    searchResultsByQuery: { "Portal 2": [rawHltbEntry({ comp_main: 23400 })] }, // exactly 6.5h
-  });
+  globalThis.fetch = async (url) => {
+    const u = new URL(url);
+    if (u.hostname === "howlongtobeat.com") throw new Error("GET /api/fpm must never call HowLongToBeat");
+    if (u.hostname === "api.steampowered.com" && u.pathname.includes("GetOwnedGames")) {
+      throw new Error("GET /api/fpm must reuse the already-cached library, not refetch it");
+    }
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
 
   const ctx = makeCtx();
-  const res = await worker.fetch(new Request("https://x/api/fpm?owned=0"), env, ctx);
-  await ctx.flush();
-
-  // First response may still show the queue pending; poll once more the way
-  // the UI does.
-  const res2 = await worker.fetch(new Request("https://x/api/fpm?owned=0"), env, ctx);
-  await ctx.flush();
-  const body = await res2.json();
+  const res = await worker.fetch(new Request("https://x/api/fpm"), env, ctx);
+  const body = await res.json();
 
   assert.equal(body.available, true);
   assert.equal(body.ready, true);
+  assert.equal(body.total, 1);
+  assert.equal(body.matched, 1);
+  assert.equal(body.pending, 0);
   assert.equal(body.unmatchedCount, 0);
   assert.equal(body.fpm.length, 1);
 
   const entry = body.fpm[0];
-  const expectedQuality = quality(96000, 4000);
   assert.equal(entry.appid, 200);
+  assert.equal(entry.title, "Portal 2");
   assert.equal(entry.mainHours, 6.5);
   assert.equal(entry.matchMethod, "name");
-  assert.equal(entry.quality, expectedQuality);
+  assert.ok(Math.abs(entry.quality - quality(96000, 4000)) < 1e-9);
   assert.equal(entry.funPerHour, Math.round(((entry.quality * 100) / 6.5) * 10) / 10);
-  // Default scoring is sqrt+qexp=2 (Increment 7.5) — quality^2 / sqrt(hours),
-  // not the old plain quality/hours.
-  assert.ok(Math.abs(entry.fpm - (entry.quality ** 2) / Math.sqrt(6.5)) < 1e-9);
-  assert.equal(
-    entry.why,
-    `${Math.round(entry.quality * 100)}% quality ÷ 6.5h main story — ${entry.funPerHour.toFixed(1)} fun/hr · sqrt ranking`,
-  );
+  assert.ok(Math.abs(entry.fpm - entry.quality ** 2 / Math.sqrt(6.5)) < 1e-9);
   assert.deepEqual(entry.deck, { deck: 3, os: 3, frame: 0 });
   assert.deepEqual(entry.tagNames, ["Puzzle"]);
   assert.equal(typeof entry.batteryFriendly, "boolean");
-  assert.equal(entry.cut, 80);
-  assert.equal("tags" in entry, false);
-  assert.equal("reviews" in entry, false);
+  assert.equal(entry.owned, false);
+  assert.equal(entry.price, null);
+  assert.equal(entry.cut, null);
 });
 
 test("a resolved match below FPM_MIN_LENGTH_HOURS is excluded silently — not counted in unmatchedCount", async () => {
@@ -536,649 +342,552 @@ test("a resolved match below FPM_MIN_LENGTH_HOURS is excluded silently — not c
   globalThis.caches = { default: cache };
   const env = makeEnv();
 
-  primeLibrary(cache, env, [ownedGame({ appid: 1 })]);
-  primeFpmPool(cache, [deal({ itadId: "itad-short", appid: 200, title: "Portal 2" })]);
-  env.TAG_CACHE.store.set(v2Key(1), JSON.stringify(goodSpyEntry()));
-  env.TAG_CACHE.store.set(v2Key(200), JSON.stringify(goodSpyEntry()));
-  env.TAG_CACHE.store.set(deckKey(200), JSON.stringify({ deck: 0, os: 0, frame: 0 }));
+  await primeMatchedRow(env, { appid: 200, name: "Short Thing", mainHours: 0.5 });
+  primeLibrary(cache, env, []);
+  primeFpmPool(cache, []);
 
-  globalThis.fetch = makeHltbFetch({
-    // 1800s = 0.5h, under the 1h floor.
-    searchResultsByQuery: { "Portal 2": [rawHltbEntry({ comp_main: 1800 })] },
-  });
+  globalThis.fetch = async (url) => {
+    const u = new URL(url);
+    if (u.pathname === "/deals/v2") return jsonResponse({ list: [], hasMore: false });
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
 
   const ctx = makeCtx();
-  await worker.fetch(new Request("https://x/api/fpm?owned=0"), env, ctx);
-  await ctx.flush();
-  const res = await worker.fetch(new Request("https://x/api/fpm?owned=0"), env, ctx);
-  await ctx.flush();
+  const res = await worker.fetch(new Request("https://x/api/fpm"), env, ctx);
   const body = await res.json();
 
-  assert.equal(body.fpm.length, 0);
+  assert.equal(body.matched, 1, "still counted as matched in the D1-wide stats");
+  assert.equal(body.fpm.length, 0, "but excluded from the displayed lane");
   assert.equal(body.unmatchedCount, 0, "a sub-floor MATCH is not the same as no length data");
 });
 
-test("no HLTB entry clears FPM_MATCH_THRESHOLD -> candidate excluded and counted in unmatchedCount", async () => {
+test("an unmatched (match_method='none') row is counted in unmatchedCount, not shown", async () => {
   const cache = makeMockCache();
   globalThis.caches = { default: cache };
   const env = makeEnv();
 
-  primeLibrary(cache, env, [ownedGame({ appid: 1 })]);
-  primeFpmPool(cache, [deal({ itadId: "itad-nomatch", appid: 200, title: "Some Obscure Indie Game" })]);
-  env.TAG_CACHE.store.set(v2Key(1), JSON.stringify(goodSpyEntry()));
-  env.TAG_CACHE.store.set(v2Key(200), JSON.stringify(goodSpyEntry()));
-  env.TAG_CACHE.store.set(deckKey(200), JSON.stringify({ deck: 0, os: 0, frame: 0 }));
+  await ensureCatalogSchema(env);
+  await upsertCatalogRows(env, [catalogRowFromBulk({ appid: 300, name: "No Match", positive: 100, negative: 10, owners: "10,000 .. 20,000" })], 1000);
+  await recordHltbResult(env, 300, { mainHours: null, matchMethod: "none", checkedAtMs: 2000 });
+  primeLibrary(cache, env, []);
+  primeFpmPool(cache, []);
 
-  globalThis.fetch = makeHltbFetch({
-    // Totally unrelated result set -> similarity well under threshold.
-    searchResultsByQuery: {
-      "Some Obscure Indie Game": [rawHltbEntry({ game_id: 999, game_name: "Portal 2" })],
-    },
-  });
-
-  const ctx = makeCtx();
-  await worker.fetch(new Request("https://x/api/fpm?owned=0"), env, ctx);
-  await ctx.flush();
-  const res = await worker.fetch(new Request("https://x/api/fpm?owned=0"), env, ctx);
-  await ctx.flush();
-  const body = await res.json();
-
-  assert.equal(body.fpm.length, 0);
-  assert.equal(body.unmatchedCount, 1);
-});
-
-test("a search that returns zero results (empty data array) is a clean negative match, not a thrown error", async () => {
-  const cache = makeMockCache();
-  globalThis.caches = { default: cache };
-  const env = makeEnv();
-
-  primeLibrary(cache, env, [ownedGame({ appid: 1 })]);
-  primeFpmPool(cache, [deal({ itadId: "itad-empty", appid: 200, title: "Nonexistent Game Title" })]);
-  env.TAG_CACHE.store.set(v2Key(1), JSON.stringify(goodSpyEntry()));
-  env.TAG_CACHE.store.set(v2Key(200), JSON.stringify(goodSpyEntry()));
-  env.TAG_CACHE.store.set(deckKey(200), JSON.stringify({ deck: 0, os: 0, frame: 0 }));
-
-  globalThis.fetch = makeHltbFetch({ searchResultsByQuery: {} }); // no entry -> [] for every query
+  globalThis.fetch = async (url) => {
+    const u = new URL(url);
+    if (u.pathname === "/deals/v2") return jsonResponse({ list: [], hasMore: false });
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
 
   const ctx = makeCtx();
-  await worker.fetch(new Request("https://x/api/fpm?owned=0"), env, ctx);
-  await ctx.flush();
-  const res = await worker.fetch(new Request("https://x/api/fpm?owned=0"), env, ctx);
-  await ctx.flush();
+  const res = await worker.fetch(new Request("https://x/api/fpm"), env, ctx);
   const body = await res.json();
 
-  assert.equal(body.available, true);
-  assert.equal(body.fpm.length, 0);
-  assert.equal(body.unmatchedCount, 1);
-});
-
-// ---------------------------------------------------------------------------
-// Progressive fill (mirrors /api/best-of's cold-start behaviour).
-// ---------------------------------------------------------------------------
-
-test("cold start (no HLTB cache yet): responds ready:false, empty fpm, still kicks the background queue", async () => {
-  const cache = makeMockCache();
-  globalThis.caches = { default: cache };
-  const env = makeEnv();
-
-  primeLibrary(cache, env, [ownedGame({ appid: 1 })]);
-  primeFpmPool(cache, [deal({ itadId: "itad-cold", appid: 200, title: "Portal 2" })]);
-  env.TAG_CACHE.store.set(v2Key(1), JSON.stringify(goodSpyEntry()));
-  env.TAG_CACHE.store.set(v2Key(200), JSON.stringify(goodSpyEntry()));
-  env.TAG_CACHE.store.set(deckKey(200), JSON.stringify({ deck: 0, os: 0, frame: 0 }));
-
-  let hltbSearchCalls = 0;
-  globalThis.fetch = makeHltbFetch({
-    searchResultsByQuery: { "Portal 2": [rawHltbEntry()] },
-    onCall: (u) => {
-      if (u.hostname === "howlongtobeat.com" && u.pathname === "/api/bleed") hltbSearchCalls++;
-    },
-  });
-
-  const ctx = makeCtx();
-  const res = await worker.fetch(new Request("https://x/api/fpm?owned=0"), env, ctx);
-  const body = await res.json();
-
-  assert.equal(res.status, 200);
-  assert.equal(body.available, true);
-  assert.equal(body.ready, false);
   assert.equal(body.total, 1);
-  assert.equal(body.fetched, 0);
-  assert.equal(body.fpm.length, 0);
-
-  await ctx.flush();
-  assert.equal(hltbSearchCalls, 1, "the background queue should have resolved the one pending candidate");
-
-  const cachedRaw = env.TAG_CACHE.store.get(hltbKey(200));
-  assert.ok(cachedRaw, "a resolved candidate must be cached under its own hltb:<appid> key");
-});
-
-test("HLTB cache round-trip: a primed positive result avoids re-hitting the search endpoint", async () => {
-  const cache = makeMockCache();
-  globalThis.caches = { default: cache };
-  const env = makeEnv();
-
-  primeLibrary(cache, env, [ownedGame({ appid: 1 })]);
-  primeFpmPool(cache, [deal({ itadId: "itad-cached", appid: 200, title: "Portal 2" })]);
-  env.TAG_CACHE.store.set(v2Key(1), JSON.stringify(goodSpyEntry()));
-  env.TAG_CACHE.store.set(v2Key(200), JSON.stringify(goodSpyEntry()));
-  env.TAG_CACHE.store.set(deckKey(200), JSON.stringify({ deck: 0, os: 0, frame: 0 }));
-  env.TAG_CACHE.store.set(
-    hltbKey(200),
-    JSON.stringify({ hltbId: 7231, compMain: 23400, compPlus: 40000, comp100: 50000, matchMethod: "name" }),
-  );
-
-  let searchCalls = 0;
-  globalThis.fetch = makeHltbFetch({ onCall: (u) => {
-    if (u.hostname === "howlongtobeat.com" && u.pathname === "/api/bleed") searchCalls++;
-  } });
-
-  const ctx = makeCtx();
-  const res = await worker.fetch(new Request("https://x/api/fpm?owned=0"), env, ctx);
-  const body = await res.json();
-
-  assert.equal(body.ready, true);
-  assert.equal(body.fpm.length, 1);
-  assert.equal(body.fpm[0].mainHours, 6.5);
-  assert.equal(searchCalls, 0, "a cache hit must never call HLTB search");
-});
-
-test("HLTB negative cache round-trip: a primed null result counts toward unmatchedCount without re-searching", async () => {
-  const cache = makeMockCache();
-  globalThis.caches = { default: cache };
-  const env = makeEnv();
-
-  primeLibrary(cache, env, [ownedGame({ appid: 1 })]);
-  primeFpmPool(cache, [deal({ itadId: "itad-neg", appid: 200, title: "Portal 2" })]);
-  env.TAG_CACHE.store.set(v2Key(1), JSON.stringify(goodSpyEntry()));
-  env.TAG_CACHE.store.set(v2Key(200), JSON.stringify(goodSpyEntry()));
-  env.TAG_CACHE.store.set(hltbKey(200), JSON.stringify(null));
-
-  let searchCalls = 0;
-  globalThis.fetch = makeHltbFetch({ onCall: (u) => {
-    if (u.hostname === "howlongtobeat.com" && u.pathname === "/api/bleed") searchCalls++;
-  } });
-
-  const ctx = makeCtx();
-  const res = await worker.fetch(new Request("https://x/api/fpm?owned=0"), env, ctx);
-  const body = await res.json();
-
-  assert.equal(body.ready, true);
-  assert.equal(body.fpm.length, 0);
+  assert.equal(body.matched, 0);
+  assert.equal(body.pending, 1);
   assert.equal(body.unmatchedCount, 1);
-  assert.equal(searchCalls, 0);
+  assert.equal(body.ready, false);
+  assert.equal(body.fpm.length, 0);
 });
 
-test("?refresh=1 bypasses the HLTB cache even when a positive result is already cached", async () => {
+// ---------------------------------------------------------------------------
+// GET /api/fpm — owned/deal annotation joins at request time, badge
+// precedence, and the ?owned= tri-state filter.
+// ---------------------------------------------------------------------------
+
+test("owned annotation: a matched catalog row that's in the live owned set carries owned:true, price/cut null", async () => {
   const cache = makeMockCache();
   globalThis.caches = { default: cache };
   const env = makeEnv();
 
+  await primeMatchedRow(env, { appid: 1, name: "Owned Game" });
   primeLibrary(cache, env, [ownedGame({ appid: 1 })]);
-  primeFpmPool(cache, [deal({ itadId: "itad-refresh", appid: 200, title: "Portal 2" })]);
-  env.TAG_CACHE.store.set(v2Key(1), JSON.stringify(goodSpyEntry()));
-  env.TAG_CACHE.store.set(v2Key(200), JSON.stringify(goodSpyEntry()));
-  env.TAG_CACHE.store.set(deckKey(200), JSON.stringify({ deck: 0, os: 0, frame: 0 }));
-  env.TAG_CACHE.store.set(
-    hltbKey(200),
-    JSON.stringify({ hltbId: 1, compMain: 3600, compPlus: 3600, comp100: 3600, matchMethod: "name" }),
-  );
+  // Even though this appid ALSO appears in the deal pool (with a real cut),
+  // Owned must win — price/cut stay null.
+  primeFpmPool(cache, [deal({ itadId: "itad-1", appid: 1, title: "Owned Game", cut: 80 })]);
+  globalThis.fetch = stubGetItemsFetch();
 
-  // refresh=1 flows through to loadLibraryForRecs AND loadBestOfPool too
-  // (the same shared helpers handleHof uses) — their cache bypass means
-  // GetOwnedGames and the whole ITAD Best-of sourcing path get re-hit for
-  // real, so this mock has to answer all of that as well as the HLTB
-  // endpoints.
-  let searchCalls = 0;
-  const hltbFetch = makeHltbFetch({
-    searchResultsByQuery: { "Portal 2": [rawHltbEntry({ comp_main: 7200 })] }, // 2h — differs from the stale 3600s cached above
-    onCall: (u) => {
-      if (u.hostname === "howlongtobeat.com" && u.pathname === "/api/bleed") searchCalls++;
-    },
-  });
-  globalThis.fetch = async (url, options = {}) => {
+  const ctx = makeCtx();
+  const res = await worker.fetch(new Request("https://x/api/fpm"), env, ctx);
+  const body = await res.json();
+
+  assert.equal(body.fpm.length, 1);
+  const entry = body.fpm[0];
+  assert.equal(entry.owned, true);
+  assert.equal(entry.price, null);
+  assert.equal(entry.cut, null);
+  assert.equal(entry.atHistoricalLow, false);
+});
+
+test("?refresh=1 bypasses the cached owned status too, not just deal prices (review fix: the 'Refresh prices/owned' button must actually refresh owned)", async () => {
+  const cache = makeMockCache();
+  globalThis.caches = { default: cache };
+  const env = makeEnv();
+
+  await primeMatchedRow(env, { appid: 1, name: "Maybe Owned Game" });
+  // Stale library cache says appid 1 is NOT owned.
+  primeLibrary(cache, env, []);
+  primeFpmPool(cache, []);
+  globalThis.fetch = stubGetItemsFetch();
+
+  const ctx = makeCtx();
+  const beforeRes = await worker.fetch(new Request("https://x/api/fpm"), env, ctx);
+  const beforeBody = await beforeRes.json();
+  assert.equal(beforeBody.fpm[0].owned, false, "stale cache says not owned");
+
+  // The real Steam library (mocked upstream) now says it IS owned.
+  globalThis.fetch = async (url) => {
     const u = new URL(url);
     if (u.hostname === "api.steampowered.com" && u.pathname.includes("GetOwnedGames")) {
       return jsonResponse({ response: { games: [ownedGame({ appid: 1 })] } });
     }
-    if (u.pathname === "/deals/v2") {
-      const offset = Number(u.searchParams.get("offset") || "0");
-      if (offset > 0) return jsonResponse({ list: [], hasMore: false });
-      return jsonResponse({
-        list: [
-          {
-            id: "itad-refresh",
-            title: "Portal 2",
-            deal: { price: { amount: 9.99, amountInt: 999 }, regular: { amount: 19.99 }, cut: 70, expiry: null, flag: null },
-          },
-        ],
-        hasMore: false,
-      });
+    if (u.hostname === "api.steampowered.com" && u.pathname.includes("GetItems")) {
+      return jsonResponse({ response: { store_items: [] } });
     }
-    if (u.pathname === "/lookup/shop/61/id/v1") {
-      const ids = JSON.parse(options.body);
-      const body = {};
-      for (const id of ids) body[id] = id === "itad-refresh" ? ["app/200"] : [];
-      return jsonResponse(body);
-    }
-    if (u.pathname === "/games/historylow/v1") {
-      return jsonResponse([]);
-    }
-    return hltbFetch(url, options);
+    if (u.pathname === "/deals/v2") return jsonResponse({ list: [], hasMore: false });
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
   };
 
-  const ctx = makeCtx();
-  const res = await worker.fetch(new Request("https://x/api/fpm?refresh=1&owned=0"), env, ctx);
-  const body = await res.json();
-  assert.equal(body.ready, false, "refresh must treat the candidate as unresolved again");
-  assert.equal(body.fpm.length, 0);
-
-  await ctx.flush();
-  assert.ok(searchCalls >= 1, "refresh=1 must bypass the HLTB cache and re-hit search");
-
-  const res2 = await worker.fetch(new Request("https://x/api/fpm?owned=0"), env, ctx);
-  const body2 = await res2.json();
-  assert.equal(body2.fpm[0].mainHours, 2, "the cache must now hold the freshly-resolved length");
+  const afterRes = await worker.fetch(new Request("https://x/api/fpm?refresh=1"), env, ctx);
+  const afterBody = await afterRes.json();
+  assert.equal(afterBody.fpm[0].owned, true, "refresh=1 must bypass the stale owned-status cache, not just deal prices");
 });
 
-// ---------------------------------------------------------------------------
-// 403 retry-once behaviour (queue-level, exercised through the route).
-// ---------------------------------------------------------------------------
-
-test("a 403 mid-pump triggers exactly one re-init + retry, and still resolves the match", async () => {
+test("deal annotation: an unowned matched row picks up price/cut/historicalLow from the deal pool", async () => {
   const cache = makeMockCache();
   globalThis.caches = { default: cache };
   const env = makeEnv();
 
-  primeLibrary(cache, env, [ownedGame({ appid: 1 })]);
-  primeFpmPool(cache, [deal({ itadId: "itad-403", appid: 200, title: "Portal 2" })]);
-  env.TAG_CACHE.store.set(v2Key(1), JSON.stringify(goodSpyEntry()));
-  env.TAG_CACHE.store.set(v2Key(200), JSON.stringify(goodSpyEntry()));
-  env.TAG_CACHE.store.set(deckKey(200), JSON.stringify({ deck: 0, os: 0, frame: 0 }));
-
-  let initCalls = 0;
-  globalThis.fetch = makeHltbFetch({
-    searchResultsByQuery: { "Portal 2": [rawHltbEntry({ comp_main: 23400 })] },
-    forbiddenOnceQueries: new Set(["Portal 2"]),
-    onCall: (u) => {
-      if (u.hostname === "howlongtobeat.com" && u.pathname === "/api/bleed/init") initCalls++;
-    },
-  });
+  await primeMatchedRow(env, { appid: 200, name: "Portal 2" });
+  primeLibrary(cache, env, []);
+  primeFpmPool(cache, [
+    deal({ itadId: "itad-200", appid: 200, title: "Portal 2", cut: 75, price: 4.99, atHistoricalLow: true, historicalLow: 4.99 }),
+  ]);
+  globalThis.fetch = stubGetItemsFetch();
 
   const ctx = makeCtx();
-  await worker.fetch(new Request("https://x/api/fpm?owned=0"), env, ctx); // handleFpm's own up-front hltbInit(): call #1
-  await ctx.flush(); // pump hits 403 on the first search -> re-inits (call #2) -> retries -> resolves
-
-  assert.equal(initCalls, 2, "expected exactly one re-init beyond handleFpm's up-front init, before any second request");
-
-  const res = await worker.fetch(new Request("https://x/api/fpm?owned=0"), env, ctx); // its own up-front init: call #3
+  const res = await worker.fetch(new Request("https://x/api/fpm"), env, ctx);
   const body = await res.json();
 
+  const entry = body.fpm[0];
+  assert.equal(entry.owned, false);
+  assert.equal(entry.cut, 75);
+  assert.equal(entry.price, 4.99);
+  assert.equal(entry.atHistoricalLow, true);
+});
+
+test("?owned=hide filters owned rows out; ?owned=only keeps only owned rows; default 'all' keeps both", async () => {
+  const cache = makeMockCache();
+  globalThis.caches = { default: cache };
+  const env = makeEnv();
+
+  await primeMatchedRow(env, { appid: 1, name: "Owned Game" });
+  await primeMatchedRow(env, { appid: 200, name: "Portal 2" });
+  primeLibrary(cache, env, [ownedGame({ appid: 1 })]);
+  primeFpmPool(cache, [deal({ itadId: "itad-200", appid: 200, title: "Portal 2" })]);
+  globalThis.fetch = stubGetItemsFetch();
+
+  const ctx = makeCtx();
+
+  const allRes = await worker.fetch(new Request("https://x/api/fpm"), env, ctx);
+  const allBody = await allRes.json();
+  assert.equal(allBody.fpm.length, 2);
+
+  const hideRes = await worker.fetch(new Request("https://x/api/fpm?owned=hide"), env, ctx);
+  const hideBody = await hideRes.json();
+  assert.deepEqual(hideBody.fpm.map((e) => e.appid), [200]);
+
+  const onlyRes = await worker.fetch(new Request("https://x/api/fpm?owned=only"), env, ctx);
+  const onlyBody = await onlyRes.json();
+  assert.deepEqual(onlyBody.fpm.map((e) => e.appid), [1]);
+});
+
+test("a bad ?owned= value falls back to 'all', never a 500", async () => {
+  const cache = makeMockCache();
+  globalThis.caches = { default: cache };
+  const env = makeEnv();
+  await primeMatchedRow(env, { appid: 1, name: "Owned Game" });
+  primeLibrary(cache, env, [ownedGame({ appid: 1 })]);
+  primeFpmPool(cache, []);
+  globalThis.fetch = stubGetItemsFetch();
+
+  const ctx = makeCtx();
+  const res = await worker.fetch(new Request("https://x/api/fpm?owned=banana"), env, ctx);
+  assert.equal(res.status, 200);
+  const body = await res.json();
   assert.equal(body.fpm.length, 1);
-  assert.equal(body.fpm[0].mainHours, 6.5);
 });
 
 // ---------------------------------------------------------------------------
-// Pool cap: only the top FPM_POOL_CAP (already rank-sorted) pool entries are
-// considered.
+// GET /api/fpm — scoring overrides (Increment 7.5, unchanged behaviour) —
+// re-rank matched D1 rows with zero HLTB traffic (there's no HLTB call left
+// anywhere in this route).
 // ---------------------------------------------------------------------------
-
-test("only the top FPM_POOL_CAP entries of the Best-of pool are considered", async () => {
-  const cache = makeMockCache();
-  globalThis.caches = { default: cache };
-  const env = makeEnv();
-
-  primeLibrary(cache, env, [ownedGame({ appid: 1 })]);
-  env.TAG_CACHE.store.set(v2Key(1), JSON.stringify(goodSpyEntry()));
-
-  const pool = [];
-  for (let i = 0; i < FPM_POOL_CAP + 5; i++) {
-    const appid = 1000 + i;
-    pool.push(deal({ itadId: `itad-${i}`, appid, title: `Pool Game ${i}` }));
-    env.TAG_CACHE.store.set(v2Key(appid), JSON.stringify(goodSpyEntry()));
-  }
-  primeFpmPool(cache, pool);
-
-  globalThis.fetch = makeHltbFetch({ searchResultsByQuery: {} });
-
-  const ctx = makeCtx();
-  const res = await worker.fetch(new Request("https://x/api/fpm?owned=0"), env, ctx);
-  const body = await res.json();
-
-  assert.equal(body.total, FPM_POOL_CAP, "candidates beyond FPM_POOL_CAP must never become eligible");
-
-  // Drain the (unmatched, so fast) background queue before the test ends —
-  // otherwise it keeps running into the next test with a 1000ms/item pace
-  // once afterEach restores the real interval, which looks like a hang.
-  await ctx.flush();
-});
-
-// ---------------------------------------------------------------------------
-// Scoring overrides (Increment 7.5): ?formula=/?qexp=/?breadth= re-rank
-// already-cached candidates only — never trigger new HLTB queue activity,
-// and bad values fall back to config defaults rather than ever 500ing.
-// ---------------------------------------------------------------------------
-
-/** Primes one fully-resolved, eligible candidate (appid 200, "Portal 2",
- * 6.5h main story) so every test below can hit /api/fpm purely from cache —
- * any HLTB search call at all is a bug regardless of which query params are
- * used. */
-function primeWarmFpmCandidate(cache, env) {
-  primeLibrary(cache, env, [ownedGame({ appid: 1 })]);
-  primeFpmPool(cache, [deal({ itadId: "itad-warm", appid: 200, title: "Portal 2", cut: 80 })]);
-  env.TAG_CACHE.store.set(v2Key(1), JSON.stringify(goodSpyEntry()));
-  env.TAG_CACHE.store.set(
-    v2Key(200),
-    JSON.stringify(goodSpyEntry({ tags: { Puzzle: 50 }, reviews: { positive: 96000, negative: 4000 } })),
-  );
-  env.TAG_CACHE.store.set(deckKey(200), JSON.stringify({ deck: 0, os: 0, frame: 0 }));
-  env.TAG_CACHE.store.set(
-    hltbKey(200),
-    JSON.stringify({ hltbId: 7231, compMain: 23400, compPlus: 40000, comp100: 50000, matchMethod: "name" }), // 6.5h
-  );
-}
 
 test("an unrecognized ?formula= falls back to the sqrt default, never a 500", async () => {
   const cache = makeMockCache();
   globalThis.caches = { default: cache };
   const env = makeEnv();
-  primeWarmFpmCandidate(cache, env);
-
-  let searchCalls = 0;
-  globalThis.fetch = makeHltbFetch({
-    onCall: (u) => {
-      if (u.hostname === "howlongtobeat.com" && u.pathname === "/api/bleed") searchCalls++;
-    },
-  });
+  await primeMatchedRow(env, { appid: 200, name: "Portal 2" });
+  primeLibrary(cache, env, []);
+  primeFpmPool(cache, []);
+  globalThis.fetch = stubGetItemsFetch();
 
   const ctx = makeCtx();
-  const bogusRes = await worker.fetch(new Request("https://x/api/fpm?formula=not-a-real-formula&owned=0"), env, ctx);
+  const bogusRes = await worker.fetch(new Request("https://x/api/fpm?formula=not-a-real-formula"), env, ctx);
   assert.equal(bogusRes.status, 200);
   const bogusBody = await bogusRes.json();
-  assert.equal(bogusBody.available, true);
 
-  const sqrtRes = await worker.fetch(new Request("https://x/api/fpm?formula=sqrt&owned=0"), env, ctx);
+  const sqrtRes = await worker.fetch(new Request("https://x/api/fpm?formula=sqrt"), env, ctx);
   const sqrtBody = await sqrtRes.json();
 
-  assert.equal(bogusBody.fpm[0].fpm, sqrtBody.fpm[0].fpm, "an unrecognized formula must score identically to explicit 'sqrt' (the config default)");
+  assert.equal(bogusBody.fpm[0].fpm, sqrtBody.fpm[0].fpm);
   assert.equal(bogusBody.fpm[0].why, sqrtBody.fpm[0].why);
-  assert.equal(searchCalls, 0, "a fully-cached candidate must never trigger an HLTB search, regardless of query params");
 });
 
-test("non-numeric ?qexp=/?breadth= fall back to config defaults, never a 500", async () => {
+test("?formula= flip re-ranks an already-matched row's score/why-line instantly", async () => {
   const cache = makeMockCache();
   globalThis.caches = { default: cache };
   const env = makeEnv();
-  primeWarmFpmCandidate(cache, env);
-  globalThis.fetch = makeHltbFetch({});
+  await primeMatchedRow(env, { appid: 200, name: "Portal 2" });
+  primeLibrary(cache, env, []);
+  primeFpmPool(cache, []);
+  globalThis.fetch = stubGetItemsFetch();
 
   const ctx = makeCtx();
-  const defaultRes = await worker.fetch(new Request("https://x/api/fpm?owned=0"), env, ctx);
-  const defaultBody = await defaultRes.json();
-
-  const garbageRes = await worker.fetch(new Request("https://x/api/fpm?qexp=banana&breadth=nope&owned=0"), env, ctx);
-  assert.equal(garbageRes.status, 200);
-  const garbageBody = await garbageRes.json();
-
-  assert.equal(garbageBody.available, true);
-  assert.equal(garbageBody.fpm[0].fpm, defaultBody.fpm[0].fpm, "non-numeric qexp/breadth must score identically to omitting them entirely");
-});
-
-test("out-of-sane-range ?qexp=/?breadth= fall back to config defaults, never a 500", async () => {
-  const cache = makeMockCache();
-  globalThis.caches = { default: cache };
-  const env = makeEnv();
-  primeWarmFpmCandidate(cache, env);
-  globalThis.fetch = makeHltbFetch({});
-
-  const ctx = makeCtx();
-  const defaultRes = await worker.fetch(new Request("https://x/api/fpm?owned=0"), env, ctx);
-  const defaultBody = await defaultRes.json();
-
-  const outOfRangeRes = await worker.fetch(new Request("https://x/api/fpm?qexp=9999&breadth=-5&owned=0"), env, ctx);
-  assert.equal(outOfRangeRes.status, 200);
-  const outOfRangeBody = await outOfRangeRes.json();
-
-  assert.equal(outOfRangeBody.available, true);
-  assert.equal(outOfRangeBody.fpm[0].fpm, defaultBody.fpm[0].fpm, "out-of-range qexp/breadth must score identically to the config defaults");
-});
-
-test("?formula= flip re-ranks an already-cached candidate's score/why-line instantly with zero new HLTB requests", async () => {
-  const cache = makeMockCache();
-  globalThis.caches = { default: cache };
-  const env = makeEnv();
-  primeWarmFpmCandidate(cache, env);
-
-  let searchCalls = 0;
-  globalThis.fetch = makeHltbFetch({
-    onCall: (u) => {
-      if (u.hostname === "howlongtobeat.com" && u.pathname === "/api/bleed") searchCalls++;
-    },
-  });
-
-  const ctx = makeCtx();
-  const linearRes = await worker.fetch(new Request("https://x/api/fpm?formula=linear&owned=0"), env, ctx);
+  const linearRes = await worker.fetch(new Request("https://x/api/fpm?formula=linear"), env, ctx);
   const linearBody = await linearRes.json();
-  const logRes = await worker.fetch(new Request("https://x/api/fpm?formula=log&owned=0"), env, ctx);
+  const logRes = await worker.fetch(new Request("https://x/api/fpm?formula=log"), env, ctx);
   const logBody = await logRes.json();
 
-  assert.equal(linearBody.fpm[0].why.endsWith("fun/hr"), true, "formula 'linear' keeps the why-line suffix-free");
+  assert.equal(linearBody.fpm[0].why.endsWith("fun/hr"), true);
   assert.equal(logBody.fpm[0].why.endsWith("· log ranking"), true);
-  // funPerHour (the honest raw display number) never changes with formula...
   assert.equal(linearBody.fpm[0].funPerHour, logBody.fpm[0].funPerHour);
-  // ...but the sort score does.
   assert.notEqual(linearBody.fpm[0].fpm, logBody.fpm[0].fpm);
-  assert.equal(searchCalls, 0, "re-ranking a cached candidate must never touch the HLTB queue");
+});
+
+test("non-numeric / out-of-range ?qexp=/?breadth= fall back to config defaults, never a 500", async () => {
+  const cache = makeMockCache();
+  globalThis.caches = { default: cache };
+  const env = makeEnv();
+  await primeMatchedRow(env, { appid: 200, name: "Portal 2" });
+  primeLibrary(cache, env, []);
+  primeFpmPool(cache, []);
+  globalThis.fetch = stubGetItemsFetch();
+
+  const ctx = makeCtx();
+  const defaultRes = await worker.fetch(new Request("https://x/api/fpm"), env, ctx);
+  const defaultBody = await defaultRes.json();
+
+  const garbageRes = await worker.fetch(new Request("https://x/api/fpm?qexp=banana&breadth=nope"), env, ctx);
+  assert.equal(garbageRes.status, 200);
+  const garbageBody = await garbageRes.json();
+  assert.equal(garbageBody.fpm[0].fpm, defaultBody.fpm[0].fpm);
+
+  const outOfRangeRes = await worker.fetch(new Request("https://x/api/fpm?qexp=9999&breadth=-5"), env, ctx);
+  const outOfRangeBody = await outOfRangeRes.json();
+  assert.equal(outOfRangeBody.fpm[0].fpm, defaultBody.fpm[0].fpm);
 });
 
 // ---------------------------------------------------------------------------
-// Increment 7.6 — FPM's own pool, decoupled from Best-of's.
+// GET /api/fpm — enrichment (Deck/tags), incl. the enrich-cap fail-soft
+// "unknown, not excluded" convention.
 // ---------------------------------------------------------------------------
 
-test("FPM's own pool has no min-cut floor: a sub-BESTOF_MIN_CUT (10%) deal is sourced and can qualify", async () => {
+test("a catalog row with no cached SteamSpy tags yet still appears (unknown, not excluded)", async () => {
+  const cache = makeMockCache();
+  globalThis.caches = { default: cache };
+  const env = makeEnv();
+  await primeMatchedRow(env, { appid: 200, name: "Portal 2" });
+  primeLibrary(cache, env, []);
+  primeFpmPool(cache, []);
+  globalThis.fetch = stubGetItemsFetch();
+
+  const ctx = makeCtx();
+  const res = await worker.fetch(new Request("https://x/api/fpm"), env, ctx);
+  await ctx.flush();
+  const body = await res.json();
+
+  assert.equal(body.fpm.length, 1);
+  assert.deepEqual(body.fpm[0].tagNames, []);
+  assert.equal(body.fpm[0].batteryFriendly, false);
+  assert.deepEqual(body.fpm[0].deck, { deck: 0, os: 0, frame: 0 });
+});
+
+test("enrichment cap (mirrors src/worker.js's private FPM_ENRICH_CAP=500, not exported — main-module constraint): rows past the cap never trigger a new SteamSpy/GetItems fetch, but already-cached data still shows and no row is excluded", async () => {
   const cache = makeMockCache();
   globalThis.caches = { default: cache };
   const env = makeEnv();
 
-  env.TAG_CACHE.store.set(v2Key(200), JSON.stringify(goodSpyEntry()));
-  env.TAG_CACHE.store.set(deckKey(200), JSON.stringify({ deck: 0, os: 0, frame: 0 }));
+  const ENRICH_CAP = 500;
+  const totalRows = ENRICH_CAP + 10;
+  const baseAppid = 40000;
 
-  // Cold cache, no primeFpmPool shortcut — this exercises buildFpmPool's
-  // real sourcing (fetchBestOfPages -> merge -> NO filterByMinCut), not a
-  // pre-built fixture that would side-step the thing under test.
-  const hltbFetch = makeHltbFetch({
-    searchResultsByQuery: { "Portal 2": [rawHltbEntry({ comp_main: 23400 })] }, // 6.5h
-  });
-  globalThis.fetch = async (url, options = {}) => {
+  // Seed matched rows with mainHours strictly increasing by index so the
+  // fpm-score sort order is deterministic (all rows share identical
+  // quality via primeMatchedRow's defaults, so fpm is strictly decreasing
+  // as mainHours increases): index 0..499 is exactly the top-ENRICH_CAP
+  // set, index 500..509 is past the cap.
+  for (let i = 0; i < totalRows; i++) {
+    await primeMatchedRow(env, { appid: baseAppid + i, name: `Catalog Game ${i}`, mainHours: 5 + i * 0.001 });
+  }
+  primeLibrary(cache, env, []);
+  primeFpmPool(cache, []);
+
+  // Prime SteamSpy tags for every WITHIN-cap appid so no new spy fetch is
+  // needed there either — isolates this test to the Deck-compat cap, the
+  // branch with actually-differing logic (getCachedSpy is already a free
+  // read for every row regardless of cap; only enqueueSpyFetch's NEW-fetch
+  // triggering is capped).
+  for (let i = 0; i < ENRICH_CAP; i++) {
+    env.TAG_CACHE.store.set(v2Key(baseAppid + i), JSON.stringify({ tags: { Indie: 1 } }));
+  }
+  const pastCapNoTagsAppid = baseAppid + ENRICH_CAP + 2; // index 502 — deliberately never cached
+
+  // One past-cap appid has an already-primed Deck KV entry (proves
+  // "cache-only, still shows real data" — no new fetch needed to surface
+  // it); a different past-cap appid has NO Deck cache at all (proves
+  // "unknown, not excluded" fail-soft).
+  const pastCapPrimedDeckAppid = baseAppid + ENRICH_CAP + 5; // index 505
+  env.TAG_CACHE.store.set(deckKey(pastCapPrimedDeckAppid), JSON.stringify({ deck: 3, os: 2, frame: 0 }));
+  const pastCapUnprimedDeckAppid = baseAppid + ENRICH_CAP + 8; // index 508
+
+  const getItemsCalls = [];
+  let appdetailsCalls = 0;
+  globalThis.fetch = async (url) => {
     const u = new URL(url);
-    if (u.hostname === "api.steampowered.com" && u.pathname.includes("GetOwnedGames")) {
-      // fetchOwnedGames errors out on an empty games array (Steam privacy
-      // guard) — one unrelated owned game keeps loadLibraryForRecs happy
-      // without affecting this test (owned=0, so it's never an FPM candidate).
-      return jsonResponse({ response: { games: [ownedGame({ appid: 1 })] } });
-    }
-    if (u.pathname === "/deals/v2") {
-      const offset = Number(u.searchParams.get("offset") || "0");
-      if (offset > 0) return jsonResponse({ list: [], hasMore: false });
+    if (u.hostname === "api.steampowered.com" && u.pathname.includes("GetItems")) {
+      const inputJson = JSON.parse(u.searchParams.get("input_json"));
+      const appids = inputJson.ids.map((x) => x.appid);
+      getItemsCalls.push(appids);
       return jsonResponse({
-        list: [
-          {
-            id: "itad-lowcut",
-            title: "Portal 2",
-            // 5% off — well under BESTOF_MIN_CUT (10). Best-of's own pool
-            // (buildBestOfPool's filterByMinCut) would drop this entirely;
-            // FPM's pool (buildFpmPool) must not.
-            deal: { price: { amount: 18.99 }, regular: { amount: 19.99 }, cut: 5, expiry: null, flag: null },
-          },
-        ],
-        hasMore: false,
+        response: { store_items: appids.map((appid) => ({ appid, platforms: { steam_deck_compat_category: 2 } })) },
       });
     }
-    if (u.pathname === "/lookup/shop/61/id/v1") {
-      const ids = JSON.parse(options.body);
-      const body = {};
-      for (const id of ids) body[id] = id === "itad-lowcut" ? ["app/200"] : [];
-      return jsonResponse(body);
+    if (u.hostname === "steamspy.com" && u.searchParams.get("request") === "appdetails") {
+      appdetailsCalls++;
+      return jsonResponse({});
     }
-    if (u.pathname === "/games/historylow/v1") {
-      return jsonResponse([]);
-    }
-    return hltbFetch(url, options);
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
   };
 
   const ctx = makeCtx();
-  await worker.fetch(new Request("https://x/api/fpm?owned=0"), env, ctx);
-  await ctx.flush();
-  const res = await worker.fetch(new Request("https://x/api/fpm?owned=0"), env, ctx);
-  await ctx.flush();
-  const body = await res.json();
-
-  assert.equal(body.fpm.length, 1, "a 5% deal must be sourced and qualify — FPM's pool has no min-cut floor");
-  assert.equal(body.fpm[0].appid, 200);
-  assert.equal(body.fpm[0].cut, 5);
-});
-
-// ---------------------------------------------------------------------------
-// Increment 7.6 — owned games in the lane.
-// ---------------------------------------------------------------------------
-
-test("owned games merge into FPM (default owned=1): owned:true, price/cut null, atHistoricalLow false, no dupes with the deal side", async () => {
-  const cache = makeMockCache();
-  globalThis.caches = { default: cache };
-  const env = makeEnv();
-
-  primeLibrary(cache, env, [ownedGame({ appid: 1 }), ownedGame({ appid: 300, name: "Owned Puzzle Game" })]);
-  primeFpmPool(cache, [deal({ itadId: "itad-deal", appid: 200, title: "Portal 2", cut: 70 })]);
-  env.TAG_CACHE.store.set(v2Key(1), JSON.stringify(goodSpyEntry()));
-  env.TAG_CACHE.store.set(v2Key(200), JSON.stringify(goodSpyEntry()));
-  env.TAG_CACHE.store.set(v2Key(300), JSON.stringify(goodSpyEntry({ tags: { Puzzle: 5 } })));
-  env.TAG_CACHE.store.set(deckKey(200), JSON.stringify({ deck: 0, os: 0, frame: 0 }));
-  env.TAG_CACHE.store.set(deckKey(300), JSON.stringify({ deck: 0, os: 0, frame: 0 }));
-
-  globalThis.fetch = makeHltbFetch({
-    searchResultsByQuery: {
-      "Portal 2": [rawHltbEntry({ comp_main: 23400 })], // 6.5h
-      "Owned Puzzle Game": [rawHltbEntry({ game_id: 42, game_name: "Owned Puzzle Game", comp_main: 18000 })], // 5h
-      // "Owned Game" (appid 1) is deliberately left unmocked -> [] -> unmatched,
-      // so it's excluded from `fpm` without affecting this test's counts.
-    },
-  });
-
-  const ctx = makeCtx();
-  await worker.fetch(new Request("https://x/api/fpm"), env, ctx); // owned param omitted -> defaults to 1
-  await ctx.flush();
   const res = await worker.fetch(new Request("https://x/api/fpm"), env, ctx);
+  await ctx.flush();
   const body = await res.json();
+
+  assert.equal(body.fpm.length, totalRows, "every matched row is present regardless of the enrichment cap");
+
+  const requestedAppids = new Set(getItemsCalls.flat());
+  for (const appid of requestedAppids) {
+    assert.ok(appid < baseAppid + ENRICH_CAP, `GetItems must never be called for a past-cap appid (got ${appid})`);
+  }
+  assert.equal(appdetailsCalls, 0, "a past-cap appid with no cached SteamSpy tags must never trigger a new SteamSpy fetch");
 
   const byAppid = new Map(body.fpm.map((e) => [e.appid, e]));
-  assert.equal(body.fpm.length, 2, "one deal row (200) + one owned row (300)");
-  assert.equal(body.fpm.filter((e) => e.appid === 300).length, 1, "the owned appid appears exactly once — no dupes");
 
-  const ownedRow = byAppid.get(300);
-  assert.equal(ownedRow.owned, true);
-  assert.equal(ownedRow.price, null);
-  assert.equal(ownedRow.cut, null);
-  assert.equal(ownedRow.atHistoricalLow, false);
-  assert.equal(ownedRow.title, "Owned Puzzle Game");
-  assert.equal(ownedRow.mainHours, 5);
+  const primedRow = byAppid.get(pastCapPrimedDeckAppid);
+  assert.ok(primedRow, "a past-cap row must still be present, not excluded");
+  assert.deepEqual(primedRow.deck, { deck: 3, os: 2, frame: 0 }, "a past-cap row's ALREADY-CACHED deck data must still surface (cache-only read)");
 
-  const dealRow = byAppid.get(200);
-  assert.equal(dealRow.owned, undefined, "a deal-side row never carries owned:true");
+  const unprimedRow = byAppid.get(pastCapUnprimedDeckAppid);
+  assert.ok(unprimedRow, "a past-cap row with no cached deck data must still be present (fail-soft, not excluded)");
+  assert.deepEqual(unprimedRow.deck, { deck: 0, os: 0, frame: 0 }, "an uncached past-cap row shows the default 'unknown' compat shape");
+
+  const noTagsRow = byAppid.get(pastCapNoTagsAppid);
+  assert.ok(noTagsRow, "a past-cap row with no cached tags is still present");
+  assert.deepEqual(noTagsRow.tagNames, [], "a past-cap row with no cached tags shows empty tagNames, never triggering a new SteamSpy fetch");
 });
 
-test("?owned=0 sources zero owned candidates: no owned rows, and the owned game's title never reaches HLTB search", async () => {
+// ---------------------------------------------------------------------------
+// POST /api/fpm/sync + GET /api/fpm/sync/status.
+// ---------------------------------------------------------------------------
+
+test("POST /api/fpm/sync with no FPM_DB binding -> 200 {started:false}, never a 500", async () => {
+  const env = makeEnv({ FPM_DB: undefined });
+  const ctx = makeCtx();
+  const res = await worker.fetch(new Request("https://x/api/fpm/sync", { method: "POST" }), env, ctx);
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.started, false);
+});
+
+test("GET /api/fpm/sync/status with no FPM_DB binding reports dbReady:false, never a 500", async () => {
+  const env = makeEnv({ FPM_DB: undefined });
+  const ctx = makeCtx();
+  const res = await worker.fetch(new Request("https://x/api/fpm/sync/status"), env, ctx);
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.dbReady, false);
+  assert.equal(body.running, false);
+});
+
+test("a full sync run crawls the catalog, matches HLTB lengths, and status reflects it — then the poll can stop", async () => {
   const cache = makeMockCache();
   globalThis.caches = { default: cache };
   const env = makeEnv();
-
   primeLibrary(cache, env, [ownedGame({ appid: 1 })]);
-  primeFpmPool(cache, [deal({ itadId: "itad-deal", appid: 200, title: "Portal 2", cut: 70 })]);
-  // appid 1 clears the FPM floor -- if it were ever added as a candidate it
-  // would definitely become eligible and reach HLTB search below.
-  env.TAG_CACHE.store.set(v2Key(1), JSON.stringify(goodSpyEntry()));
-  env.TAG_CACHE.store.set(v2Key(200), JSON.stringify(goodSpyEntry()));
-  env.TAG_CACHE.store.set(deckKey(200), JSON.stringify({ deck: 0, os: 0, frame: 0 }));
 
-  const queriesSeen = [];
-  globalThis.fetch = makeHltbFetch({
-    searchResultsByQuery: { "Portal 2": [rawHltbEntry({ comp_main: 23400 })] },
-    onCall: (u, options) => {
-      if (u.hostname === "howlongtobeat.com" && u.pathname === "/api/bleed" && options.body) {
-        queriesSeen.push(JSON.parse(options.body).searchTerms.join(" "));
+  const page0 = { 100: { appid: 100, name: "Game A", positive: 9000, negative: 1000, owners: "1,000,000 .. 2,000,000" } };
+  globalThis.fetch = async (url, options = {}) => {
+    const u = new URL(url);
+    if (u.hostname === "steamspy.com") {
+      return new Response(JSON.stringify(page0), { status: 200 }); // partial page -> end of crawl
+    }
+    if (u.hostname === "api.steampowered.com" && u.pathname.includes("GetOwnedGames")) {
+      return jsonResponse({ response: { games: [ownedGame({ appid: 1 })] } });
+    }
+    if (u.pathname === "/deals/v2") {
+      return jsonResponse({ list: [], hasMore: false });
+    }
+    if (u.pathname === "/api/bleed/init") return jsonResponse({ token: "tok", hpKey: "hpk", hpVal: "hpv" });
+    if (u.pathname === "/api/bleed") {
+      const body = JSON.parse(options.body);
+      if (body.searchTerms.join(" ") === "Game A") {
+        return jsonResponse({ count: 1, data: [{ game_id: 1, game_name: "Game A", comp_main: 23400 }] });
       }
-    },
-  });
+      return jsonResponse({ count: 0, data: [] });
+    }
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
 
   const ctx = makeCtx();
-  await worker.fetch(new Request("https://x/api/fpm?owned=0"), env, ctx);
-  await ctx.flush();
-  const res = await worker.fetch(new Request("https://x/api/fpm?owned=0"), env, ctx);
-  const body = await res.json();
+  const startRes = await worker.fetch(new Request("https://x/api/fpm/sync", { method: "POST" }), env, ctx);
+  const startBody = await startRes.json();
+  assert.equal(startBody.started, true);
 
-  assert.equal(body.fpm.length, 1);
-  assert.ok(body.fpm.every((e) => !e.owned), "no owned row should appear when owned=0");
-  assert.deepEqual(queriesSeen, ["Portal 2"], "the owned game's title must never reach HLTB search when owned=0");
+  // While the background pipeline is still draining (before ctx.flush()),
+  // status should report running:true.
+  const midStatusRes = await worker.fetch(new Request("https://x/api/fpm/sync/status"), env, ctx);
+  const midStatusBody = await midStatusRes.json();
+  assert.equal(midStatusBody.running, true);
+
+  await ctx.flush();
+  assert.equal(isFpmSyncRunning(), false);
+
+  const statusRes = await worker.fetch(new Request("https://x/api/fpm/sync/status"), env, ctx);
+  const statusBody = await statusRes.json();
+  assert.equal(statusBody.running, false, "the poll must be able to stop once idle");
+  assert.equal(statusBody.total, 1);
+  assert.equal(statusBody.matched, 1);
+  assert.equal(statusBody.pending, 0);
+
+  const fpmRes = await worker.fetch(new Request("https://x/api/fpm"), env, ctx);
+  const fpmBody = await fpmRes.json();
+  assert.equal(fpmBody.fpm.length, 1);
+  assert.equal(fpmBody.fpm[0].mainHours, 6.5);
 });
 
-test("bad ?owned= values fall back to the owned=1 default, never a 500", async () => {
+test("a second POST /api/fpm/sync while one is already running reports alreadyRunning", async () => {
   const cache = makeMockCache();
   globalThis.caches = { default: cache };
   const env = makeEnv();
+  primeLibrary(cache, env, []);
 
-  primeLibrary(cache, env, [ownedGame({ appid: 1 })]);
-  primeFpmPool(cache, [deal({ itadId: "itad-deal", appid: 200, title: "Portal 2", cut: 70 })]);
-  env.TAG_CACHE.store.set(v2Key(1), JSON.stringify(goodSpyEntry()));
-  env.TAG_CACHE.store.set(v2Key(200), JSON.stringify(goodSpyEntry()));
-  env.TAG_CACHE.store.set(deckKey(200), JSON.stringify({ deck: 0, os: 0, frame: 0 }));
-
-  globalThis.fetch = makeHltbFetch({
-    searchResultsByQuery: {
-      "Portal 2": [rawHltbEntry({ comp_main: 23400 })],
-      "Owned Game": [rawHltbEntry({ game_id: 55, game_name: "Owned Game", comp_main: 18000 })],
-    },
+  let resolveBlocker;
+  const blocker = new Promise((r) => {
+    resolveBlocker = r;
   });
+  globalThis.fetch = async (url) => {
+    const u = new URL(url);
+    if (u.hostname === "steamspy.com") {
+      await blocker;
+      return new Response(JSON.stringify({}), { status: 200 }); // empty page -> immediate end
+    }
+    if (u.pathname === "/deals/v2") return jsonResponse({ list: [], hasMore: false });
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
 
   const ctx = makeCtx();
-  const bogusRes = await worker.fetch(new Request("https://x/api/fpm?owned=banana"), env, ctx);
-  assert.equal(bogusRes.status, 200);
-  await ctx.flush();
-  const res = await worker.fetch(new Request("https://x/api/fpm?owned=banana"), env, ctx);
-  const body = await res.json();
+  const first = await worker.fetch(new Request("https://x/api/fpm/sync", { method: "POST" }), env, ctx);
+  assert.equal((await first.json()).started, true);
 
-  assert.equal(body.fpm.length, 2, "a bad owned= value must default to owned=1 (both rows present)");
-  assert.ok(body.fpm.some((e) => e.owned === true), "the owned candidate must be present under the default");
+  const second = await worker.fetch(new Request("https://x/api/fpm/sync", { method: "POST" }), env, ctx);
+  const secondBody = await second.json();
+  assert.equal(secondBody.started, false);
+  assert.equal(secondBody.alreadyRunning, true);
+
+  resolveBlocker();
+  await ctx.flush();
 });
 
-test("the SAME FPM floor applies to owned candidates: a below-floor owned game never appears and is never queried against HLTB", async () => {
+test("sync is resumable: re-running after a partial fill only enqueues rows still NULL", async () => {
   const cache = makeMockCache();
   globalThis.caches = { default: cache };
   const env = makeEnv();
+  primeLibrary(cache, env, []);
 
-  primeLibrary(cache, env, [ownedGame({ appid: 1 })]);
-  primeFpmPool(cache, [deal({ itadId: "itad-deal", appid: 200, title: "Portal 2", cut: 70 })]);
-  // Thin reviews -> fails FPM_MIN_REVIEWS (50) outright, same floor a deal
-  // candidate would be held to.
-  env.TAG_CACHE.store.set(v2Key(1), JSON.stringify(goodSpyEntry({ reviews: { positive: 10, negative: 2 } })));
-  env.TAG_CACHE.store.set(v2Key(200), JSON.stringify(goodSpyEntry()));
-  env.TAG_CACHE.store.set(deckKey(200), JSON.stringify({ deck: 0, os: 0, frame: 0 }));
-
+  const page0 = {
+    1: { appid: 1, name: "Game One", positive: 9000, negative: 1000, owners: "1,000,000 .. 2,000,000" },
+    2: { appid: 2, name: "Game Two", positive: 9000, negative: 1000, owners: "1,000,000 .. 2,000,000" },
+  };
   const queriesSeen = [];
-  globalThis.fetch = makeHltbFetch({
-    searchResultsByQuery: { "Portal 2": [rawHltbEntry({ comp_main: 23400 })] },
-    onCall: (u, options) => {
-      if (u.hostname === "howlongtobeat.com" && u.pathname === "/api/bleed" && options.body) {
-        queriesSeen.push(JSON.parse(options.body).searchTerms.join(" "));
-      }
-    },
-  });
+  globalThis.fetch = async (url, options = {}) => {
+    const u = new URL(url);
+    if (u.hostname === "steamspy.com") return new Response(JSON.stringify(page0), { status: 200 });
+    if (u.pathname === "/deals/v2") return jsonResponse({ list: [], hasMore: false });
+    if (u.pathname === "/api/bleed/init") return jsonResponse({ token: "tok", hpKey: "hpk", hpVal: "hpv" });
+    if (u.pathname === "/api/bleed") {
+      const body = JSON.parse(options.body);
+      const query = body.searchTerms.join(" ");
+      queriesSeen.push(query);
+      if (query === "Game One") return jsonResponse({ count: 1, data: [{ game_id: 1, game_name: "Game One", comp_main: 3600 }] });
+      return jsonResponse({ count: 0, data: [] });
+    }
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
 
   const ctx = makeCtx();
-  await worker.fetch(new Request("https://x/api/fpm"), env, ctx); // owned=1 default
+  await worker.fetch(new Request("https://x/api/fpm/sync", { method: "POST" }), env, ctx);
   await ctx.flush();
-  const res = await worker.fetch(new Request("https://x/api/fpm"), env, ctx);
-  const body = await res.json();
+  assert.deepEqual(queriesSeen.sort(), ["Game One", "Game Two"]);
 
-  assert.equal(body.fpm.length, 1);
-  assert.ok(body.fpm.every((e) => !e.owned));
-  assert.deepEqual(queriesSeen, ["Portal 2"], "a below-floor owned candidate must never reach HLTB search");
+  queriesSeen.length = 0;
+  await worker.fetch(new Request("https://x/api/fpm/sync", { method: "POST" }), env, ctx);
+  await ctx.flush();
+  assert.deepEqual(queriesSeen, [], "Game One is matched, Game Two was just checked — neither re-enqueues immediately");
+});
+
+test("sync's deal-pool union actually slices to FPM_POOL_CAP (top 300 of the rank-sorted pool), not the whole pool", async () => {
+  const cache = makeMockCache();
+  globalThis.caches = { default: cache };
+  const env = makeEnv();
+  primeLibrary(cache, env, []);
+
+  // A deal pool bigger than FPM_POOL_CAP, already rank-sorted (as
+  // loadFpmPool's real contract requires) — array order IS priority order.
+  const poolSize = FPM_POOL_CAP + 10;
+  const pool = [];
+  const catalogRows = [];
+  for (let i = 0; i < poolSize; i++) {
+    const appid = 6000 + i;
+    pool.push(deal({ itadId: `itad-${i}`, appid, title: `Deal Game ${i}` }));
+    catalogRows.push(
+      catalogRowFromBulk({ appid, name: `Deal Game ${i}`, positive: 9000, negative: 1000, owners: "1,000,000 .. 2,000,000" }),
+    );
+  }
+  primeFpmPool(cache, pool);
+  await ensureCatalogSchema(env);
+  await upsertCatalogRows(env, catalogRows, 1000);
+
+  globalThis.fetch = async (url) => {
+    const u = new URL(url);
+    if (u.hostname === "steamspy.com") return new Response(JSON.stringify({}), { status: 200 }); // empty page -> immediate end of crawl
+    if (u.hostname === "howlongtobeat.com") throw new Error("HLTB down — irrelevant here, must fail soft and not affect source_deal flagging");
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  const ctx = makeCtx();
+  await worker.fetch(new Request("https://x/api/fpm/sync", { method: "POST" }), env, ctx);
+  await ctx.flush();
+
+  const flaggedResult = await env.FPM_DB.prepare("SELECT appid FROM fpm_catalog WHERE source_deal = 1").all();
+  const flaggedAppids = new Set(flaggedResult.results.map((r) => r.appid));
+  assert.equal(flaggedAppids.size, FPM_POOL_CAP, "only the top FPM_POOL_CAP deal-pool entries get flagged, not the whole pool");
+  for (let i = 0; i < FPM_POOL_CAP; i++) {
+    assert.ok(flaggedAppids.has(6000 + i), `appid ${6000 + i} (within top ${FPM_POOL_CAP}) should be flagged source_deal`);
+  }
+  for (let i = FPM_POOL_CAP; i < poolSize; i++) {
+    assert.ok(!flaggedAppids.has(6000 + i), `appid ${6000 + i} (beyond top ${FPM_POOL_CAP}) should NOT be flagged`);
+  }
 });

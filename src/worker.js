@@ -30,7 +30,7 @@ import {
   parseSteamAppId,
 } from "./deals.js";
 import { TOP_OWNED_GAMES, buildProfile, selectTopOwnedGames, computeIdf, buildTagVector, applyIdf } from "./profile.js";
-import { scoreCandidates, cosineSimilarity, quality } from "./score.js";
+import { scoreCandidates, cosineSimilarity } from "./score.js";
 import { buildWhy } from "./why.js";
 import { getCachedSpy, enqueueSpyFetch } from "./spyQueue.js";
 import { resolveDeckCompat, DEFAULT_DECK_COMPAT } from "./deckCompat.js";
@@ -45,22 +45,22 @@ import {
 } from "./wishlist.js";
 import {
   FPM_POOL_CAP,
-  FPM_OWNED_CAP,
-  FPM_LENGTH_FIELD,
   FPM_FORMULA,
   FPM_QUALITY_EXP,
   FPM_BREADTH_WEIGHT,
-  hltbInit,
-  hltbLengthSeconds,
-  getCachedHltb,
-  enqueueHltbFetch,
   fpmScore,
   funPerHourDisplay,
   qualifiesForFpm,
-  qualifiesForFpmFloor,
   sortFpmLane,
   fpmWhyLine,
 } from "./hltb.js";
+import {
+  ensureCatalogSchema,
+  getCatalogStats,
+  selectMatchedCatalogRows,
+  startFpmSync,
+  isFpmSyncRunning,
+} from "./catalog.js";
 
 const STEAM_API_URL =
   "https://api.steampowered.com/IPlayerService/GetOwnedGames/v1/";
@@ -201,14 +201,22 @@ async function handleLibrary(request, env, ctx) {
  * request — a deals feed with no owned-exclusion is still useful, and a
  * library hiccup shouldn't take it down. (Assumption — spec doesn't say;
  * flagged to the PO/reviewer.)
+ *
+ * `refresh` (default false, added Increment 7.7) mirrors loadLibraryForRecs'
+ * own `refresh` param — passing true bypasses the 24h cache read below, same
+ * as every other cache-respecting loader in this file. Every PRE-EXISTING
+ * call site (buildDealsFeed/buildBestOfPool/buildFpmPool) omits it and keeps
+ * its exact prior behaviour (always cache-first); only handleFpm's
+ * "Refresh prices/owned" button passes it through, since that's the one
+ * place this increment's ?refresh=1 is supposed to reach owned status too.
  */
-async function getOwnedAppIds(env, ctx) {
+async function getOwnedAppIds(env, ctx, refresh = false) {
   if (!env.STEAM_API_KEY || !env.STEAM_ID) return new Set();
 
   const cache = caches.default;
   const cacheKey = libraryCacheKey(env);
 
-  const cached = await cache.match(cacheKey);
+  const cached = refresh ? undefined : await cache.match(cacheKey);
   if (cached) {
     try {
       const body = await cached.clone().json();
@@ -1401,69 +1409,85 @@ async function handleWishlist(request, env, ctx) {
 
 // ---------------------------------------------------------------------------
 // /api/fpm (Increment 7, tuned in 7.5, given its own pool + owned games in
-// 7.6) — "Fun per minute": Wilson quality (raised to a configurable
-// exponent) ÷ a configurable function of HowLongToBeat main-story hours,
-// for players who'd rather have a quick, excellent game than a long good
-// one. Eligibility uses this lane's OWN floor, qualifiesForFpmFloor
-// (Increment 7.5 — deliberately NOT qualifiesForHof; the 10k-review/
-// 95%-positive Best-of bar left only ~9-10 games in the whole pool eligible,
-// too strict for a "quick wins" lane). Best-of itself (handleHof, above) is
-// untouched and still enforces qualifiesForHof over its own pool. Main-story
-// length is resolved per-candidate from HowLongToBeat via src/hltb.js's own
-// throttled background queue, mirroring src/spyQueue.js's progressive-fill
-// pattern. src/hltb.js owns the HLTB handshake/parse/match (its own repair
-// surface, documented there) — this section only owns the fetch/cache/pool
-// wiring, the same split /api/wishlist has with src/wishlist.js.
+// 7.6, re-sourced from a catalog-wide D1 store in 7.7) — "Fun per minute":
+// Wilson quality (raised to a configurable exponent) ÷ a configurable
+// function of HowLongToBeat main-story hours, for players who'd rather have
+// a quick, excellent game than a long good one.
 //
-// INCREMENT 7.6 — FPM independent pool + owned games. Two root causes James's
-// eye test kept hitting: (1) FPM used to source from loadBestOfPool, which
-// applies filterByMinCut(merged, BESTOF_MIN_CUT) server-side — a sub-10%
-// discount could never even enter the pool, so the bar's "Any" discount
-// setting had nothing to surface. (2) the same pool also excludes owned
-// games, so the eye test had no reference points (games James actually
-// knows are all owned). Fix: loadFpmPool below is a dedicated sourcing path
-// (own Cache-API key, own build function) that reuses fetchBestOfPages'
-// sourcing (same rank-ASC axis, same BESTOF_FETCH_CAP) but skips
-// filterByMinCut entirely — loadBestOfPool/BESTOF_MIN_CUT above are
-// untouched, no constant is shared between the two pools. Owned games become
-// their own candidate stream (ownedFpmCandidate, sourced from the
-// libraryGames already fetched for the taste profile — no new Steam API
-// call) merged alongside the deal-side pool before buildCandidatePool, which
-// needs no changes at all: it already treats every deal-shaped candidate
-// identically regardless of where it came from. The SAME qualifiesForFpmFloor
-// applies to owned candidates (the floor guards score data quality, not
-// taste) and the SAME HLTB queue resolves their length by title match.
-// ?owned=0|1 (default 1, bad values -> default) gates whether the owned
-// candidate stream is even constructed — at owned=0 no owned appid is ever
-// added to the pool passed into buildCandidatePool, so zero owned-side spy/
-// HLTB queue work happens, not just a client-side hide.
+// INCREMENT 7.7 — FPM catalog: every floor-passing Steam game, not just
+// deal-pool/owned candidates. James's 7.6 eye test found Celeste missing —
+// root cause (see SPEC.md): every pool in this app used to page ITAD's
+// deals/v2 RANK feed, which is deal-activity popularity; a full-price,
+// unowned, non-promoted evergreen title can never enter any lane at any cap.
+// src/catalog.js now owns a standalone crawl of SteamSpy's bulk `all` feed
+// (floor-qualified straight from the bulk fields, no per-appid SteamSpy call
+// needed) persisted in D1 (env.FPM_DB) — the lane's own database, so the
+// multi-run HowLongToBeat fill survives `wrangler dev` restarts instead of
+// starting over. `POST /api/fpm/sync` (handleFpmSync, manual trigger, no
+// cron) drives the crawl + a priority-ordered HLTB batch each run;
+// `GET /api/fpm/sync/status` (handleFpmSyncStatus) reports D1-wide counts so
+// the frontend can show an honest "ranked X of Y" line and stop polling once
+// idle — this REPLACES the old per-request progressive-fill polling this
+// route used to do itself (7.5/7.6's `ready`/`fetched`/`total` fields tracked
+// ONE request's own toResolve queue; now the catalog's HLTB fill happens
+// only during an explicit sync, and this route is a fast, static read).
 //
-// FAIL-SOFT, SOURCE LEVEL (headline requirement, same as /api/wishlist):
-// missing secrets OR a failed hltbInit() handshake both return the same
-// {available:false} 200 the UI treats as "hide this tab" — a HowLongToBeat
-// outage or unofficial-endpoint drift must never take down the rest of the
-// app. The handshake itself is only attempted when there's fresh work to
-// resolve (toResolve.length > 0) — a fully-cached/warm lane is served
-// straight from KV and never calls hltbInit, so it stays available even if
-// HLTB is down (the UI polls this route every 2s while filling; calling
-// hltbInit unconditionally would fire needless handshakes on every poll and
-// let one transient blip wipe an already-resolved lane). Per-game fail-soft
-// (a search/parse/match failure for one candidate) is handled inside
-// src/hltb.js's queue and simply shows up here as a negative cached result
-// (counted in unmatchedCount).
+// handleFpm below no longer sources or enqueues anything — it reads already-
+// matched, floor-passing rows straight from D1 (selectMatchedCatalogRows)
+// and scores them with the EXACT SAME formula machinery as before
+// (fpmScore/FPM_FORMULA/FPM_QUALITY_EXP/FPM_BREADTH_WEIGHT, the
+// ?formula=/?qexp=/?breadth= overrides) — this increment changes what feeds
+// the formula, never the formula itself. Owned/deal status are ANNOTATIONS
+// joined at request time (getOwnedAppIds + loadFpmPool — the exact same
+// helpers/caches every other lane already uses), not sourcing decisions:
+// loadFpmPool/buildFpmPool/fetchBestOfPages below are KEPT UNCHANGED but
+// demoted from "the candidate source" to "a price/cut/historical-low
+// lookup for whichever catalog appids happen to be in it right now".
+// 7.6's ownedFpmCandidate dual-stream merge and FPM_POOL_CAP-as-candidate-cap
+// are retired entirely — SPEC.md is explicit that there is NO catalog cap,
+// only the quality floor bounds membership.
 //
-// SCORING OVERRIDES (Increment 7.5): ?formula=/?qexp=/?breadth= let the UI's
-// formula picker re-rank ALREADY-CACHED candidates for live A/B comparison,
-// with zero new HLTB queue/network activity — they're parsed once up front
-// and only read at the final per-row score/why-line/sort step, well after
-// the eligibility filter and toResolve/queue logic above have already run.
-// Bad values never throw; they silently fall back to the hltb.js config
-// defaults (parseFpmFormula/parseFpmScoreParam below).
+// `?owned=all|hide|only` (default `all`, bad values -> default, never a
+// 500) replaces the old boolean `?owned=0|1` — it's now a pure post-hoc
+// filter on the live-joined `owned` annotation, not a sourcing toggle (there
+// is no separate owned candidate stream left to gate). Badge precedence:
+// Owned wins over discount (an owned game's sale price is irrelevant).
+//
+// FAIL-SOFT (headline requirement, same as /api/wishlist): missing secrets
+// OR a missing/unconfigured FPM_DB binding both return {available:false} —
+// a HowLongToBeat drift or a not-yet-synced-anything-at-all catalog must
+// never take down the rest of the app. Per-game fail-soft (a search/parse/
+// match failure for one candidate) is handled inside src/catalog.js's
+// resolveHltbBatch (during sync, not during a GET) and simply shows up here
+// as a `match_method: 'none'` row (counted in unmatchedCount).
+//
+// SCORING OVERRIDES (Increment 7.5, unchanged): ?formula=/?qexp=/?breadth=
+// re-rank already-matched D1 rows for live A/B comparison, with zero HLTB
+// traffic (there is no HLTB call left in the GET path AT ALL now — only
+// POST /api/fpm/sync ever talks to HowLongToBeat). Bad values never throw;
+// they fall back to the hltb.js config defaults (parseFpmFormula/
+// parseFpmScoreParam below, unchanged from 7.5).
+//
+// ENRICHMENT CAP (Coder's call, flagged for the gate): Deck-compat/SteamSpy-
+// tag enrichment (for the Deck/battery/tag filter bar to work on catalog
+// rows) is read straight from whatever's already cached for every returned
+// row (cheap KV reads), but NEW fetches (SteamSpy queue enqueues, GetItems
+// batches) are only triggered for the top FPM_ENRICH_CAP rows of the
+// current sorted+filtered response — with an eventual 8-20k+ row catalog,
+// eagerly enriching every row on every request would mean hundreds of
+// GetItems batch calls per poll, and could starve the shared SteamSpy queue
+// the Deals/Recs/Best-of lanes also depend on. Rows beyond the cap that
+// aren't yet cached show as "unknown" (no badge/tags) rather than being
+// excluded — same fail-soft convention every other lane already uses for a
+// cold cache.
 // ---------------------------------------------------------------------------
 
-/** Cache key for FPM's own candidate pool — entirely separate from
- * bestOfPoolCacheKey() above, so building/refreshing this pool never reads
- * or writes the Best-of pool (or vice versa). */
+/** Cache key for FPM's deal-side price/cut lookup pool — entirely separate
+ * from bestOfPoolCacheKey() above, so building/refreshing this pool never
+ * reads or writes the Best-of pool (or vice versa). Increment 7.7: this pool
+ * is no longer a candidate SOURCE (see the section comment above) — it's
+ * consulted only to attach price/cut/historicalLow to whichever catalog
+ * appids happen to appear in it. */
 function fpmPoolCacheKey() {
   return new Request("https://steam-sale-scout.cache/api/fpm/pool");
 }
@@ -1521,38 +1545,13 @@ async function loadFpmPool(env, ctx, refresh) {
   return deals;
 }
 
-/**
- * Build a deal-shaped FPM candidate for one owned library game (Increment
- * 7.6) — same field shape normalizeDeal() produces, so buildCandidatePool
- * needs no changes to accept it, but every price/deal field is null (owned
- * games were never fetched from ITAD) and `owned: true` marks it so the
- * response/UI can render an Owned badge + "—" price cells instead.
- * atHistoricalLow stays false — no price to compare against a historical low.
- * @param {{appid: number, name: string}} game - a trimmed library game.
- */
-function ownedFpmCandidate(game) {
-  return {
-    itadId: null,
-    appid: game.appid,
-    title: game.name,
-    price: null,
-    priceCents: null,
-    regular: null,
-    cut: null,
-    expiry: null,
-    flag: null,
-    atHistoricalLow: false,
-    historicalLow: null,
-    tags: [],
-    owned: true,
-  };
-}
-
-/** `?owned=` override: only the literal string "0" turns the owned candidate
- * stream off; missing, "1", or any other value defaults to on (owned=1) —
- * bad values never 500, mirroring parseFpmFormula/parseFpmScoreParam. */
-function parseOwnedParam(raw) {
-  return raw !== "0";
+/** `?owned=` tri-state (Increment 7.7): "all" (default), "hide", or "only" —
+ * a pure post-hoc filter on the live-joined `owned` annotation (there is no
+ * separate owned candidate stream left to gate, see the section comment
+ * above). Any value other than the two recognized filter modes defaults to
+ * "all" — bad values never 500, mirroring parseFpmFormula/parseFpmScoreParam. */
+function parseOwnedMode(raw) {
+  return raw === "hide" || raw === "only" ? raw : "all";
 }
 
 function fpmUnavailableResponse() {
@@ -1587,160 +1586,232 @@ function parseFpmScoreParam(raw, fallback, min, max) {
   return n;
 }
 
+/** Bound how many catalog rows trigger NEW SteamSpy-queue/GetItems fetches
+ * per /api/fpm request — see the section comment's "ENRICHMENT CAP" note. */
+const FPM_ENRICH_CAP = 500;
+
+/** Read-only cache peek for one appid's Deck compat, using the exact same
+ * `deck:<appid>` KV key src/deckCompat.js's resolveDeckCompat owns — used
+ * (only) for catalog rows beyond FPM_ENRICH_CAP, where we want "already
+ * cached data shows up" without triggering a new GetItems fetch. A small,
+ * deliberate duplication of that key format rather than adding a new
+ * read-only export to deckCompat.js (Coder's call, flagged for the gate). */
+async function peekCachedDeckCompat(env, appid) {
+  const raw = await env.TAG_CACHE.get(`deck:${appid}`);
+  return raw == null ? null : JSON.parse(raw);
+}
+
+/**
+ * Attach tagNames/batteryFriendly/deck to already-scored+sorted FPM rows.
+ * Tags are a free read (getCachedSpy never fetches) for every row; only the
+ * top FPM_ENRICH_CAP rows trigger a NEW SteamSpy-queue enqueue or GetItems
+ * batch fetch for a cold appid — see the section comment above.
+ */
+async function enrichFpmRows(env, ctx, rows) {
+  const appids = rows.map((r) => r.appid);
+  const enrichTargets = appids.slice(0, FPM_ENRICH_CAP);
+
+  const spyByAppid = new Map();
+  await Promise.all(
+    appids.map(async (appid) => {
+      spyByAppid.set(appid, await getCachedSpy(env, appid));
+    }),
+  );
+  const missingSpy = enrichTargets.filter((appid) => !spyByAppid.get(appid).cached);
+  if (missingSpy.length > 0) enqueueSpyFetch(env, ctx, missingSpy);
+
+  const deckByAppid = await resolveDeckCompat(env, enrichTargets);
+  const restAppids = appids.slice(FPM_ENRICH_CAP);
+  await Promise.all(
+    restAppids.map(async (appid) => {
+      const cached = await peekCachedDeckCompat(env, appid);
+      if (cached) deckByAppid.set(appid, cached);
+    }),
+  );
+
+  return rows.map((row) => {
+    const spyEntry = spyByAppid.get(row.appid);
+    const tags = spyEntry?.cached ? spyEntry.data?.tags || {} : {};
+    return {
+      ...row,
+      tagNames: Object.keys(tags),
+      batteryFriendly: batteryFriendly(tags),
+      deck: deckByAppid.get(row.appid) || DEFAULT_DECK_COMPAT,
+    };
+  });
+}
+
 async function handleFpm(request, env, ctx) {
-  if (!env.STEAM_API_KEY || !env.STEAM_ID || !env.ITAD_API_KEY) {
+  if (!env.STEAM_API_KEY || !env.STEAM_ID || !env.ITAD_API_KEY || !env.FPM_DB) {
     return fpmUnavailableResponse();
   }
 
   const url = new URL(request.url);
   const refresh = url.searchParams.get("refresh") === "1";
-  const windowMonthsParam = Number(url.searchParams.get("windowMonths"));
-  const windowMonths = windowMonthsParam > 0 ? windowMonthsParam : 12;
-  const includeOwned = parseOwnedParam(url.searchParams.get("owned"));
+  const ownedMode = parseOwnedMode(url.searchParams.get("owned"));
 
-  // Scoring overrides (Increment 7.5) — parsed up front, but only read at
-  // the final per-row score/why-line/sort step below. Never affects
-  // eligibility, caching, or the HLTB queue.
+  // Scoring overrides (Increment 7.5, unchanged) — parsed up front, only
+  // read at the final per-row score/why-line step below. There is no HLTB
+  // traffic anywhere in this GET path anymore (see the section comment) —
+  // these can never trigger new network activity, only re-rank already-
+  // matched D1 rows.
   const formula = parseFpmFormula(url.searchParams.get("formula"));
   const qualityExp = parseFpmScoreParam(url.searchParams.get("qexp"), FPM_QUALITY_EXP, FPM_QEXP_MIN, FPM_QEXP_MAX);
   const breadthWeight = parseFpmScoreParam(url.searchParams.get("breadth"), FPM_BREADTH_WEIGHT, FPM_BREADTH_MIN, FPM_BREADTH_MAX);
 
-  let libraryGames;
+  let catalogRows;
+  let stats;
   try {
-    libraryGames = await loadLibraryForRecs(env, ctx, refresh);
+    await ensureCatalogSchema(env);
+    stats = await getCatalogStats(env);
+    catalogRows = await selectMatchedCatalogRows(env);
   } catch {
     return fpmUnavailableResponse();
   }
 
-  let dealPool;
-  try {
-    dealPool = await loadFpmPool(env, ctx, refresh);
-  } catch {
-    return fpmUnavailableResponse();
-  }
-
-  // The pool is already rank-sorted (most-popular-first) by loadFpmPool —
-  // cap here, never reorder or otherwise touch it.
-  const capped = dealPool.slice(0, FPM_POOL_CAP);
-
-  // Increment 7.6: owned games are their own candidate stream, sourced from
-  // the SAME libraryGames just fetched for the taste profile (no new Steam
-  // API call). Gated entirely behind includeOwned — at owned=0 no owned
-  // appid is ever added to poolCandidates below, so zero owned-side spy/HLTB
-  // queue work happens, not merely a client-side hide.
-  let ownedCandidates = includeOwned ? libraryGames.map(ownedFpmCandidate) : [];
-  if (FPM_OWNED_CAP > 0) ownedCandidates = ownedCandidates.slice(0, FPM_OWNED_CAP);
-
-  const poolCandidates = [...capped, ...ownedCandidates];
-  const pool = await buildCandidatePool(env, ctx, libraryGames, poolCandidates, windowMonths);
-  // Increment 7.5: this lane's OWN floor (50 reviews / 0.7 Wilson quality /
-  // 5000 owners), not qualifiesForHof — see the section comment above.
-  const eligible = pool.candidates.filter((c) => c.appid != null && qualifiesForFpmFloor(c));
-
-  // ?refresh=1 bypasses the HLTB cache too (per build note) — every eligible
-  // candidate is treated as unresolved and re-queued rather than reading
-  // getCachedHltb at all.
-  const hltbByAppid = new Map();
-  const toResolve = [];
-  for (const candidate of eligible) {
-    if (!refresh) {
-      const { cached, data } = await getCachedHltb(env, candidate.appid);
-      if (cached) {
-        hltbByAppid.set(candidate.appid, data);
-        continue;
-      }
-    }
-    toResolve.push({ appid: candidate.appid, title: candidate.title });
-  }
-  // The HLTB handshake is only performed when there's genuinely fresh work
-  // to resolve — polling a warm/fully-cached lane must never touch HLTB, so
-  // a transient HLTB blip can't wipe already-resolved rows (see build note
-  // above the toResolve loop). A cold cache that can't reach HLTB genuinely
-  // can't build the lane, so that case still fails soft to {available:false}.
-  if (toResolve.length > 0) {
-    let tokens;
-    try {
-      tokens = await hltbInit();
-    } catch {
-      return fpmUnavailableResponse();
-    }
-    enqueueHltbFetch(env, ctx, toResolve, tokens);
-  }
-
-  const total = eligible.length;
-  const hltbPending = toResolve.length;
-  const fetched = total - hltbPending;
-  const ready = pool.ready && hltbPending === 0;
-
-  // unmatchedCount is ONLY resolved-but-negative candidates (matchMethod
-  // 'none') — the "n games had no length data" footer number. A resolved
-  // match that fails the FPM_MIN_LENGTH_HOURS floor is excluded silently
-  // (degenerate short entry, not "no length data").
-  let unmatchedCount = 0;
+  // unmatchedCount mirrors pre-7.7 semantics exactly: checked-but-negative
+  // rows only (match_method='none'), never "not yet checked at all".
   const rows = [];
-  for (const candidate of eligible) {
-    const record = hltbByAppid.get(candidate.appid);
-    if (record === undefined) continue; // still pending resolution
-    if (record === null) {
-      unmatchedCount++;
-      continue;
-    }
+  for (const row of catalogRows) {
+    const mainHours = row.main_hours;
+    // A resolved match below FPM_MIN_LENGTH_HOURS is excluded silently here
+    // (same as before) — it's still "matched" in D1 (see src/catalog.js),
+    // just not shown in this lane.
+    if (!qualifiesForFpm({ compMain: mainHours * 3600, mainHours })) continue;
 
-    const lengthSeconds = hltbLengthSeconds(record, FPM_LENGTH_FIELD);
-    const mainHours = lengthSeconds / 3600;
-    if (!qualifiesForFpm({ compMain: lengthSeconds, mainHours })) continue;
-
-    const wilsonQuality = quality(candidate.reviews?.positive, candidate.reviews?.negative);
-    // funPerHour (the displayed "fun/hr" number) stays the honest raw
-    // quality÷hours figure regardless of formula — only the sort score below
-    // is formula-aware (Increment 7.5).
+    const wilsonQuality = row.wilson;
     const funPerHour = funPerHourDisplay(wilsonQuality, mainHours);
     const qualityPercent = Math.round(wilsonQuality * 100);
-    const reviewCount = (candidate.reviews?.positive || 0) + (candidate.reviews?.negative || 0);
+    const reviewCount = (row.positive || 0) + (row.negative || 0);
+    const reviewPercent = reviewCount > 0 ? Math.round((row.positive / reviewCount) * 100) : null;
 
     rows.push({
-      ...candidate,
+      appid: row.appid,
+      title: row.name,
+      owners: row.owners,
+      reviewCount,
+      reviewPercent,
+      quality: wilsonQuality,
+      mainHours,
+      matchMethod: row.match_method,
       fpm: fpmScore(wilsonQuality, mainHours, { reviewCount, formula, qualityExp, breadthWeight }),
       funPerHour,
-      mainHours,
-      matchMethod: record.matchMethod,
-      quality: wilsonQuality,
       why: fpmWhyLine(qualityPercent, mainHours, funPerHour, formula),
     });
   }
 
-  const sorted = sortFpmLane(rows);
+  // Annotation joins at request time (Increment 7.7) — owned/deal status are
+  // never a sourcing decision here, just a live join against the exact same
+  // helpers/caches every other lane already uses. getOwnedAppIds is already
+  // best-effort (never throws — empty Set on any failure); loadFpmPool is
+  // now consulted purely as a price/cut/historicalLow lookup. `refresh` is
+  // threaded through to BOTH (bug fix, flagged by review): the "Refresh
+  // prices/owned" button's label promises fresh owned status too, not just
+  // fresh deal prices — without this, ?refresh=1 silently left owned status
+  // up to 24h stale despite the button claiming otherwise.
+  const ownedAppIds = await getOwnedAppIds(env, ctx, refresh);
+  let dealPool;
+  try {
+    dealPool = await loadFpmPool(env, ctx, refresh);
+  } catch {
+    dealPool = [];
+  }
+  const dealByAppid = new Map(dealPool.filter((d) => d.appid != null).map((d) => [d.appid, d]));
 
-  // Deck compat only for candidates that actually made it into the lane —
-  // cheaper, matches /api/recs's "candidates only" convention.
-  const fpmAppids = sorted.map((row) => row.appid);
-  const deckByAppid = await resolveDeckCompat(env, fpmAppids);
-
-  const fpm = sorted.map((row) => {
-    const { tags, reviews, owners, ...rest } = row;
-    const totalReviews = (reviews?.positive || 0) + (reviews?.negative || 0);
-    const reviewPercent = totalReviews > 0 ? Math.round((reviews.positive / totalReviews) * 100) : null;
+  let annotated = rows.map((row) => {
+    const owned = ownedAppIds.has(row.appid);
+    // Badge precedence: Owned wins over discount — an owned game's sale
+    // price is irrelevant, so we don't even look it up in that case.
+    const dealEntry = owned ? undefined : dealByAppid.get(row.appid);
     return {
-      ...rest,
-      reviewPercent,
-      reviewCount: totalReviews,
-      owners,
-      tagNames: Object.keys(tags || {}),
-      batteryFriendly: batteryFriendly(tags),
-      deck: deckByAppid.get(rest.appid) || DEFAULT_DECK_COMPAT,
+      ...row,
+      owned,
+      price: dealEntry?.price ?? null,
+      priceCents: dealEntry?.priceCents ?? null,
+      regular: dealEntry?.regular ?? null,
+      cut: dealEntry?.cut ?? null,
+      atHistoricalLow: dealEntry?.atHistoricalLow ?? false,
+      historicalLow: dealEntry?.historicalLow ?? null,
     };
   });
+
+  if (ownedMode === "hide") annotated = annotated.filter((r) => !r.owned);
+  else if (ownedMode === "only") annotated = annotated.filter((r) => r.owned);
+
+  const sorted = sortFpmLane(annotated);
+  const fpm = await enrichFpmRows(env, ctx, sorted);
 
   return new Response(
     JSON.stringify({
       available: true,
-      ready,
-      fetched,
-      total,
-      unmatchedCount,
+      ready: stats.pending === 0,
+      total: stats.total,
+      matched: stats.matched,
+      pending: stats.pending,
+      unmatchedCount: stats.unmatched,
       count: fpm.length,
       fpm,
     }),
+    { status: 200, headers: { "content-type": "application/json" } },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// /api/fpm/sync + /api/fpm/sync/status (Increment 7.7) — the manual trigger
+// that fills the D1 catalog. See src/catalog.js for the actual crawl/D1/
+// HLTB-batch pipeline (runFpmSyncPipeline); this section only wires it up
+// with the two worker.js-private helpers (getOwnedAppIds, loadFpmPool) that
+// can't be imported the other way around (src/worker.js is wrangler's `main`
+// module and exports nothing but `default { fetch }` — see the recurring
+// gotcha this project always flags).
+// ---------------------------------------------------------------------------
+
+/** Both endpoints below fail soft the same way as the rest of this lane: a
+ * missing/unconfigured FPM_DB binding never 500s, it just reports "nothing
+ * to sync yet" — consistent with handleFpm's own {available:false} pattern. */
+function fpmDbUnavailableResponse() {
+  return new Response(JSON.stringify({ started: false, notice: "FPM_DB not configured" }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+async function handleFpmSync(request, env, ctx) {
+  if (!env.FPM_DB) return fpmDbUnavailableResponse();
+
+  const result = startFpmSync(env, ctx, {
+    loadOwnedAppIds: () => getOwnedAppIds(env, ctx),
+    // Top-300 of the rank-sorted deal pool, mirroring the old FPM_POOL_CAP
+    // candidate-cap's value — reused here purely as SPEC.md's "current
+    // deal-pool floor-passers (loadFpmPool top-300)" union bound, not as a
+    // candidate cap (there is no candidate cap anymore).
+    loadDealAppIds: async () => {
+      const pool = await loadFpmPool(env, ctx, false);
+      return pool
+        .filter((d) => d.appid != null)
+        .slice(0, FPM_POOL_CAP)
+        .map((d) => d.appid);
+    },
+  });
+
+  return new Response(JSON.stringify(result), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+async function handleFpmSyncStatus(request, env, ctx) {
+  if (!env.FPM_DB) {
+    return new Response(
+      JSON.stringify({ total: 0, matched: 0, unmatched: 0, pending: 0, running: false, dbReady: false }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+  }
+
+  await ensureCatalogSchema(env);
+  const stats = await getCatalogStats(env);
+  return new Response(
+    JSON.stringify({ ...stats, running: isFpmSyncRunning(), dbReady: true }),
     { status: 200, headers: { "content-type": "application/json" } },
   );
 }
@@ -1765,6 +1836,12 @@ export default {
     }
     if (url.pathname === "/api/fpm") {
       return handleFpm(request, env, ctx);
+    }
+    if (url.pathname === "/api/fpm/sync/status") {
+      return handleFpmSyncStatus(request, env, ctx);
+    }
+    if (url.pathname === "/api/fpm/sync") {
+      return handleFpmSync(request, env, ctx);
     }
     if (url.pathname.startsWith("/api/")) {
       return jsonError("not implemented", 501);

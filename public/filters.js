@@ -127,10 +127,32 @@ export function computeAllTagNames(items) {
 /** Owned rows (FPM only, Increment 7.6 — `item.owned === true`) carry no
  * cut at all, so the discount bar exempts them rather than always failing
  * them at any minDiscount > 0. No other tab's items ever set `owned`, so
- * this is a no-op everywhere except FPM. */
+ * this is a no-op everywhere except FPM.
+ *
+ * Increment 7.7: the FPM catalog also has plain UNOWNED, full-price,
+ * never-on-sale rows (most of the catalog, in fact — evergreen titles like
+ * Celeste that were the whole point of this increment) — `item.cut == null`
+ * (no deal annotation at all) is exempt the same way `owned` rows are, since
+ * every other lane's rows always carry a real numeric cut (they're sourced
+ * from actual ITAD deal entries), this widening is a no-op there. */
 export function passesMinDiscount(item, minDiscount) {
   if (item.owned) return true;
-  return (item.cut ?? 0) >= (minDiscount || 0);
+  if (item.cut == null) return true;
+  return item.cut >= (minDiscount || 0);
+}
+
+/**
+ * "On sale only" filter (FPM-only, Increment 7.7): a row only passes if it
+ * carries a real deal annotation (`cut` non-null) — an owned row (cut always
+ * null) also fails this when the toggle is on, since "owned" isn't "on
+ * sale". When the toggle is off, everything passes (no-op).
+ * @param {{cut?: number|null}} item
+ * @param {boolean} onSaleOnly
+ * @returns {boolean}
+ */
+export function passesOnSaleOnly(item, onSaleOnly) {
+  if (!onSaleOnly) return true;
+  return item.cut != null;
 }
 
 export function passesMaxPrice(item, maxPrice) {
