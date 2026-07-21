@@ -61,7 +61,19 @@ import {
   startFpmSync,
   isFpmSyncRunning,
   getLastSyncStats,
+  startFpmAutoContinue,
+  isFpmAutoContinueActive,
+  requestFpmAutoContinueStop,
 } from "./catalog.js";
+import { ensureSettingsSchema, getAllSettings, putSettings } from "./settings.js";
+import {
+  ensureDismissalsSchema,
+  listDismissals,
+  getDismissedAppIdSet,
+  addDismissal,
+  removeDismissal,
+  excludeDismissed,
+} from "./dismissals.js";
 
 const STEAM_API_URL =
   "https://api.steampowered.com/IPlayerService/GetOwnedGames/v1/";
@@ -238,6 +250,30 @@ async function getOwnedAppIds(env, ctx, refresh = false) {
     });
     ctx.waitUntil(cache.put(cacheKey, response.clone()));
     return buildOwnedAppIdSet(trimmed);
+  } catch {
+    return new Set();
+  }
+}
+
+/**
+ * Dismissed appids (Increment 8) for the server-side, app-wide exclusion
+ * join — Deals/Recs/Best-of/FPM all filter these out before their own
+ * ranking/caps (see each handler's excludeDismissed call site below), so a
+ * dismissal actually frees a slot rather than just being hidden client-side.
+ * Library and Wishlist are deliberately never called with this (PO
+ * decision — see src/dismissals.js's header).
+ *
+ * Fail-soft like getOwnedAppIds above: a missing FPM_DB binding or a D1
+ * hiccup here must never break lane rendering (the headline requirement for
+ * this increment's persistence work) — it just means nothing gets excluded
+ * this request, same as a cold/absent dismissals table.
+ * @returns {Promise<Set<number>>}
+ */
+async function getDismissedAppIds(env) {
+  if (!env.FPM_DB) return new Set();
+  try {
+    await ensureDismissalsSchema(env);
+    return await getDismissedAppIdSet(env);
   } catch {
     return new Set();
   }
@@ -559,7 +595,23 @@ async function handleDeals(request, env, ctx) {
     ctx.waitUntil(cache.put(cacheKey, response.clone()));
   }
 
-  const enriched = await enrichDeals(env, ctx, deals);
+  // Increment 8: dismissal exclusion is a request-time join, never baked
+  // into the 6h dealsCacheKey blob above — a dismissal must take effect in
+  // the same session, not wait out the cache TTL (same reasoning as owned
+  // status being joined at request time elsewhere in this file).
+  //
+  // AWARENESS NOTE (code review, non-blocking): this join runs AFTER
+  // mergeDealPages' DEALS_FETCH_CAP=1000 truncation inside buildDealsFeed
+  // above — a dismissed appid doesn't free a slot in that upstream fetch
+  // cap, only in whatever's downstream of it (nothing, for Deals; there's
+  // no further cap on this response). In practice DEALS_FETCH_CAP is never
+  // reached at real ITAD volumes (minCut=60 typically returns well under
+  // 1000 items), so this is a theoretical gap, not a live one. The exact
+  // same caveat applies to handleRecs/handleHof below — they share this
+  // same buildDealsFeed/buildBestOfPool cap-then-filter shape.
+  const dismissedAppIds = await getDismissedAppIds(env);
+  const undismissed = excludeDismissed(deals, dismissedAppIds);
+  const enriched = await enrichDeals(env, ctx, undismissed);
 
   return new Response(JSON.stringify({ deals: enriched, minCut }), {
     status: 200,
@@ -757,6 +809,18 @@ async function handleRecs(request, env, ctx) {
   } catch (err) {
     return upstreamErrorResponse(err);
   }
+
+  // Increment 8: dismissed appids are excluded before the candidate pool is
+  // even built — same request-time-join reasoning as handleDeals above, and
+  // it means a dismissed game's tag data is never even fetched, not just
+  // hidden from the final list. There's no count-cap anywhere downstream of
+  // this point (scoreCandidates has no top-N slice), so a dismissal here
+  // always promotes the next-best-ranked candidate into recs[0] if the
+  // dismissed one would have outranked it — see handleDeals' AWARENESS NOTE
+  // above for the one upstream cap (DEALS_FETCH_CAP, inside
+  // loadDealsForRecs) this join runs after, same as Deals.
+  const dismissedAppIds = await getDismissedAppIds(env);
+  deals = excludeDismissed(deals, dismissedAppIds);
 
   const pool = await buildCandidatePool(env, ctx, libraryGames, deals, windowMonths);
 
@@ -959,6 +1023,16 @@ async function handleHof(request, env, ctx) {
   } catch (err) {
     return upstreamErrorResponse(err);
   }
+
+  // Increment 8: same dismissal join as handleDeals/handleRecs — excluded
+  // before the candidate pool is built, not just filtered out of the final
+  // list. buildHallOfFame has no count-cap either (a qualification filter,
+  // not a top-N slice), so a dismissal here always promotes the next
+  // qualifying candidate into hof[0] if the dismissed one outranked it —
+  // same upstream-cap caveat (BESTOF_FETCH_CAP, inside loadBestOfPool) as
+  // handleDeals' AWARENESS NOTE above.
+  const dismissedAppIds = await getDismissedAppIds(env);
+  deals = excludeDismissed(deals, dismissedAppIds);
 
   const pool = await buildCandidatePool(env, ctx, libraryGames, deals, windowMonths);
   const hofCandidates = buildHallOfFame(pool.candidates);
@@ -1709,6 +1783,17 @@ async function handleFpm(request, env, ctx) {
     });
   }
 
+  // Increment 8: dismissal exclusion, applied before annotation/sort/the
+  // FPM_ENRICH_CAP enrichment-fetch cap below (enrichFpmRows) — this is the
+  // one lane where "frees a slot" is server-side-verifiable: a dismissed row
+  // that would have ranked inside the top FPM_ENRICH_CAP now lets the
+  // next-best row take its place, triggering a fresh SteamSpy/GetItems fetch
+  // for it that it wouldn't otherwise have gotten this request. (There's no
+  // FPM_DISPLAY_CAP here — that's a client-side-only lazy-render constant in
+  // public/index.html; this route returns every matched, qualifying row.)
+  const dismissedAppIds = await getDismissedAppIds(env);
+  const undismissedRows = excludeDismissed(rows, dismissedAppIds);
+
   // Annotation joins at request time (Increment 7.7) — owned/deal status are
   // never a sourcing decision here, just a live join against the exact same
   // helpers/caches every other lane already uses. getOwnedAppIds is already
@@ -1727,7 +1812,7 @@ async function handleFpm(request, env, ctx) {
   }
   const dealByAppid = new Map(dealPool.filter((d) => d.appid != null).map((d) => [d.appid, d]));
 
-  let annotated = rows.map((row) => {
+  let annotated = undismissedRows.map((row) => {
     const owned = ownedAppIds.has(row.appid);
     // Badge precedence: Owned wins over discount — an owned game's sale
     // price is irrelevant, so we don't even look it up in that case.
@@ -1785,10 +1870,11 @@ function fpmDbUnavailableResponse() {
   });
 }
 
-async function handleFpmSync(request, env, ctx) {
-  if (!env.FPM_DB) return fpmDbUnavailableResponse();
-
-  const result = startFpmSync(env, ctx, {
+/** Both sync-trigger routes below share the same deps builder — extracted so
+ * the `?continue=1` auto-continue path (Increment 8) and the original
+ * single-batch path drive the identical owned/deal loaders. */
+function fpmSyncDeps(env, ctx) {
+  return {
     loadOwnedAppIds: () => getOwnedAppIds(env, ctx),
     // Top-300 of the rank-sorted deal pool, mirroring the old FPM_POOL_CAP
     // candidate-cap's value — reused here purely as SPEC.md's "current
@@ -1801,9 +1887,49 @@ async function handleFpmSync(request, env, ctx) {
         .slice(0, FPM_POOL_CAP)
         .map((d) => d.appid);
     },
-  });
+  };
+}
+
+/**
+ * `?continue=1` (Increment 8, ride-along A): drives startFpmAutoContinue
+ * (repeats the same batch step until both funnels are empty) instead of a
+ * single startFpmSync batch — see src/catalog.js's section comment for why
+ * this needs no new pacing/backoff/give-up logic of its own. Response shape
+ * is the same `{started, alreadyRunning?}` either way; the frontend tells
+ * the two apart via GET /api/fpm/sync/status's `autoContinue` flag, not this
+ * response.
+ */
+async function handleFpmSync(request, env, ctx) {
+  if (!env.FPM_DB) return fpmDbUnavailableResponse();
+
+  const url = new URL(request.url);
+  const continueToCompletion = url.searchParams.get("continue") === "1";
+  const deps = fpmSyncDeps(env, ctx);
+  const result = continueToCompletion ? startFpmAutoContinue(env, ctx, deps) : startFpmSync(env, ctx, deps);
 
   return new Response(JSON.stringify(result), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+/** POST /api/fpm/sync/stop (Increment 8, ride-along A's stop control) — asks
+ * a running auto-continue loop to stop after its current batch step
+ * finishes. A no-op (not an error) if nothing is auto-continuing; same
+ * fpmDbUnavailableResponse fail-soft as the other sync routes. */
+async function handleFpmSyncStop(request, env, ctx) {
+  // Dedicated fail-soft shape (not fpmDbUnavailableResponse's {started:false}
+  // — that's the /api/fpm/sync trigger's own vocabulary, not this route's)
+  // so the response body stays honest about which endpoint you're on even
+  // though the frontend never reads it.
+  if (!env.FPM_DB) {
+    return new Response(JSON.stringify({ stopping: false, notice: "FPM_DB not configured" }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  requestFpmAutoContinueStop();
+  return new Response(JSON.stringify({ stopping: true }), {
     status: 200,
     headers: { "content-type": "application/json" },
   });
@@ -1820,6 +1946,7 @@ async function handleFpmSyncStatus(request, env, ctx) {
         classified: 0,
         nonGame: 0,
         running: false,
+        autoContinue: false,
         dbReady: false,
         lastRun: null,
       }),
@@ -1833,10 +1960,191 @@ async function handleFpmSyncStatus(request, env, ctx) {
     // classified/nonGame (Increment 7.8) come straight through from stats;
     // lastRun surfaces the most recent sync run's HLTB/type-classification
     // funnel counters (cacheHits/resolved/gaveUp, classified/nonGame/
-    // attempted) — null until the first sync run completes.
-    JSON.stringify({ ...stats, running: isFpmSyncRunning(), dbReady: true, lastRun: getLastSyncStats() }),
+    // attempted) — null until the first sync run completes. autoContinue
+    // (Increment 8) lets the frontend show a Stop control and an honest
+    // "auto-continuing" label without any new polling semantics — the
+    // existing `running`-driven poll loop already covers the whole
+    // auto-continue run, since fpmSyncRunning stays true for its entire
+    // duration (see src/catalog.js's startFpmAutoContinue).
+    JSON.stringify({
+      ...stats,
+      running: isFpmSyncRunning(),
+      autoContinue: isFpmAutoContinueActive(),
+      dbReady: true,
+      lastRun: getLastSyncStats(),
+    }),
     { status: 200, headers: { "content-type": "application/json" } },
   );
+}
+
+// ---------------------------------------------------------------------------
+// /api/settings (Increment 8) — persisted UI state (filter-bar values, the
+// recency window, FPM-tab-local controls), replacing the old localStorage
+// story so state survives a browser restart the same way the catalog does
+// (PO's "no split-brain" decision). src/settings.js is a dumb key/value
+// store; this section owns the fail-soft HTTP wiring, same discipline as
+// every other route here — a missing FPM_DB binding or a D1 hiccup never
+// breaks anything, it just means nothing was persisted/restored this time.
+// ---------------------------------------------------------------------------
+
+async function handleGetSettings(request, env, ctx) {
+  if (!env.FPM_DB) {
+    return new Response(JSON.stringify({ settings: {} }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  try {
+    await ensureSettingsSchema(env);
+    const settings = await getAllSettings(env);
+    return new Response(JSON.stringify({ settings }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  } catch {
+    return new Response(JSON.stringify({ settings: {} }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+}
+
+/** Partial-update PUT (Coder's call — see the handoff notes): the body's
+ * top-level keys are upserted as-is (src/settings.js's putSettings), any
+ * keys not present are left untouched. The frontend's debounced auto-save
+ * always sends its whole current state, so in practice this behaves like a
+ * whole-blob PUT without requiring one — a future caller that only wants to
+ * change one key can do that too. A malformed body (not an object) is a
+ * genuine caller error (400), distinct from the fail-soft "D1 hiccup"
+ * case below, which reports {saved:false} rather than breaking the caller's
+ * flow (the frontend's save is already fire-and-forget/best-effort). */
+async function handlePutSettings(request, env, ctx) {
+  if (!env.FPM_DB) {
+    return new Response(JSON.stringify({ saved: false }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    body = null;
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return jsonError("Settings body must be a JSON object.", 400);
+  }
+
+  try {
+    await ensureSettingsSchema(env);
+    await putSettings(env, body);
+    return new Response(JSON.stringify({ saved: true }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  } catch {
+    return new Response(JSON.stringify({ saved: false }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// /api/dismissals (Increment 8) — "Not interested", app-wide across the sale
+// lanes. src/dismissals.js owns the D1 CRUD/pure exclusion helper; this
+// section owns the fail-soft HTTP wiring (GET list / POST dismiss /
+// DELETE :appid restore), mirroring /api/settings' discipline above. The
+// actual server-side exclusion join lives in handleDeals/handleRecs/
+// handleHof/handleFpm (getDismissedAppIds + excludeDismissed), not here —
+// this is just the management surface.
+// ---------------------------------------------------------------------------
+
+async function handleGetDismissals(request, env, ctx) {
+  if (!env.FPM_DB) {
+    return new Response(JSON.stringify({ dismissals: [] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  try {
+    await ensureDismissalsSchema(env);
+    const dismissals = await listDismissals(env);
+    return new Response(JSON.stringify({ dismissals }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  } catch {
+    return new Response(JSON.stringify({ dismissals: [] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+}
+
+async function handlePostDismissal(request, env, ctx) {
+  if (!env.FPM_DB) {
+    return new Response(JSON.stringify({ dismissed: false }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    body = null;
+  }
+  const appid = Number(body?.appid);
+  if (!Number.isFinite(appid)) {
+    return jsonError("appid is required.", 400);
+  }
+  const name = typeof body?.name === "string" ? body.name : null;
+
+  try {
+    await ensureDismissalsSchema(env);
+    await addDismissal(env, appid, name);
+    return new Response(JSON.stringify({ dismissed: true }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  } catch {
+    return new Response(JSON.stringify({ dismissed: false }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+}
+
+/** DELETE /api/dismissals/:appid — the un-dismiss/restore path. `appid` is
+ * parsed off the tail of the URL path (this route is dispatched by prefix,
+ * see the fetch() router below). */
+async function handleDeleteDismissal(request, env, ctx, appid) {
+  if (!env.FPM_DB) {
+    return new Response(JSON.stringify({ restored: false }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  if (!Number.isFinite(appid)) {
+    return jsonError("appid is required.", 400);
+  }
+
+  try {
+    await ensureDismissalsSchema(env);
+    await removeDismissal(env, appid);
+    return new Response(JSON.stringify({ restored: true }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  } catch {
+    return new Response(JSON.stringify({ restored: false }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
 }
 
 export default {
@@ -1863,8 +2171,23 @@ export default {
     if (url.pathname === "/api/fpm/sync/status") {
       return handleFpmSyncStatus(request, env, ctx);
     }
+    if (url.pathname === "/api/fpm/sync/stop") {
+      return handleFpmSyncStop(request, env, ctx);
+    }
     if (url.pathname === "/api/fpm/sync") {
       return handleFpmSync(request, env, ctx);
+    }
+    if (url.pathname === "/api/settings") {
+      if (request.method === "PUT") return handlePutSettings(request, env, ctx);
+      return handleGetSettings(request, env, ctx);
+    }
+    if (url.pathname === "/api/dismissals") {
+      if (request.method === "POST") return handlePostDismissal(request, env, ctx);
+      return handleGetDismissals(request, env, ctx);
+    }
+    if (url.pathname.startsWith("/api/dismissals/")) {
+      const appid = Number(url.pathname.slice("/api/dismissals/".length));
+      return handleDeleteDismissal(request, env, ctx, appid);
     }
     if (url.pathname.startsWith("/api/")) {
       return jsonError("not implemented", 501);

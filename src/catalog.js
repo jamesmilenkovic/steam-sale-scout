@@ -1019,3 +1019,131 @@ export function startFpmSync(env, ctx, deps) {
   );
   return { started: true };
 }
+
+// ---------------------------------------------------------------------------
+// Sync auto-continue (Increment 8, ride-along A) — "one trigger walks
+// classification + HLTB batches until pending = 0". runFpmSyncPipeline above
+// is ONE batch step (crawl the catalog, classify up to FPM_TYPE_BATCH rows,
+// HLTB-resolve up to FPM_SYNC_BATCH rows) — this just calls that SAME,
+// UNMODIFIED step repeatedly, checking D1-wide stats after each run, until
+// both funnels are empty, a stop is requested, or a safety bound is hit. No
+// pacing/backoff/give-up logic changes at all: every throttle/retry/give-up
+// decision still happens exactly where it already did, inside the one batch
+// step this just calls in a loop.
+// ---------------------------------------------------------------------------
+
+/** Safety bound on how many batch-step iterations one auto-continue run will
+ * drive before giving up regardless of remaining pending count — generous
+ * headroom over the worst case at today's catalog size (FPM_SYNC_BATCH=3000/
+ * FPM_TYPE_BATCH=500 per iteration against an ~18k-row catalog is well under
+ * 40 iterations for a real completion); a genuinely stuck run (e.g. HLTB
+ * down for hours) stops here instead of looping forever. */
+export const FPM_AUTO_CONTINUE_MAX_ITERATIONS = 200;
+
+let fpmAutoContinueMaxIterations = FPM_AUTO_CONTINUE_MAX_ITERATIONS;
+
+/** TEST-ONLY seam: shrink the safety-bound iteration count so a "gives up
+ * after the bound" test doesn't have to actually drive 200 real pipeline
+ * runs. Never called from production code. */
+export function __setFpmAutoContinueMaxIterationsForTests(n) {
+  fpmAutoContinueMaxIterations = n;
+}
+
+/** TEST-ONLY seam: restore the production safety bound between tests. */
+export function __resetFpmAutoContinueMaxIterationsForTests() {
+  fpmAutoContinueMaxIterations = FPM_AUTO_CONTINUE_MAX_ITERATIONS;
+}
+
+let fpmAutoContinueActive = false;
+let fpmAutoContinueStopRequested = false;
+
+/** Whether an auto-continue LOOP (as opposed to a single manual sync) is
+ * currently driving — lets the frontend show a Stop control and know the
+ * "sync running" status line represents a multi-batch run, not a one-shot. */
+export function isFpmAutoContinueActive() {
+  return fpmAutoContinueActive;
+}
+
+/** Ask a running auto-continue loop to stop after its current in-flight
+ * batch step finishes — never interrupts mid-batch (that would abandon a
+ * partially-classified/resolved batch outside its own resumable-by-D1-write
+ * discipline). A no-op if no auto-continue is running. */
+export function requestFpmAutoContinueStop() {
+  fpmAutoContinueStopRequested = true;
+}
+
+/** TEST-ONLY seam: reset the module-scoped auto-continue flags between
+ * tests. Never called from production code. */
+export function __resetFpmAutoContinueStateForTests() {
+  fpmAutoContinueActive = false;
+  fpmAutoContinueStopRequested = false;
+}
+
+/**
+ * Repeatedly runs runFpmSyncPipeline (unchanged) until BOTH the type
+ * classification funnel (classified >= total) and the HLTB funnel
+ * (pending === 0) are empty, a stop is requested, or
+ * FPM_AUTO_CONTINUE_MAX_ITERATIONS is reached. Never throws — same
+ * resumable-by-construction discipline as the pipeline itself: whatever
+ * progress got written to D1 this run stands regardless of how the loop
+ * ends.
+ * @param {object} env
+ * @param {object} ctx
+ * @param {object} deps - same shape runFpmSyncPipeline takes.
+ * @returns {Promise<{iterations: number, stoppedEarly: boolean}>}
+ */
+export async function runFpmSyncUntilComplete(env, ctx, deps) {
+  let iterations = 0;
+  let stoppedEarly = false;
+
+  while (iterations < fpmAutoContinueMaxIterations) {
+    if (fpmAutoContinueStopRequested) {
+      stoppedEarly = true;
+      break;
+    }
+
+    await runFpmSyncPipeline(env, ctx, deps);
+    iterations++;
+
+    if (fpmAutoContinueStopRequested) {
+      stoppedEarly = true;
+      break;
+    }
+
+    let stats;
+    try {
+      stats = await getCatalogStats(env);
+    } catch {
+      break; // can't read progress — stop rather than loop blind
+    }
+    const classificationDone = stats.total > 0 && stats.classified >= stats.total;
+    const hltbDone = stats.pending === 0;
+    if (classificationDone && hltbDone) break;
+  }
+
+  return { iterations, stoppedEarly };
+}
+
+/**
+ * Kick an auto-continue loop in the background (ctx.waitUntil) unless a sync
+ * (single-shot OR auto-continue) is already running — reuses fpmSyncRunning
+ * as the single "something is in flight" guard so the two modes can never
+ * run concurrently and double-drive the pipeline. Returns immediately, same
+ * contract as startFpmSync.
+ * @returns {{started: boolean, alreadyRunning?: boolean}}
+ */
+export function startFpmAutoContinue(env, ctx, deps) {
+  if (fpmSyncRunning) return { started: false, alreadyRunning: true };
+  fpmSyncRunning = true;
+  fpmAutoContinueActive = true;
+  fpmAutoContinueStopRequested = false;
+  ctx.waitUntil(
+    runFpmSyncUntilComplete(env, ctx, deps)
+      .catch(() => {})
+      .finally(() => {
+        fpmSyncRunning = false;
+        fpmAutoContinueActive = false;
+      }),
+  );
+  return { started: true };
+}

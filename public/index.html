@@ -138,6 +138,24 @@
     color: #6b5a1f;
   }
   .wishlist-section table { margin-top: 0.5rem; }
+  .settings-panel {
+    margin: 0.75rem 0 0;
+    padding: 0.5rem 0.75rem;
+    background: #f4f4f4;
+    border-radius: 6px;
+  }
+  .settings-panel summary { cursor: pointer; font-weight: 600; color: #444; }
+  .settings-panel .filter-row { margin-top: 0.5rem; }
+  .dismiss-btn {
+    background: none;
+    border: 1px solid #ccc;
+    border-radius: 3px;
+    color: #900;
+    font-size: 0.8rem;
+    line-height: 1;
+    padding: 0.15rem 0.4rem;
+  }
+  .dismiss-btn:hover { background: #fdeaea; border-color: #f0b8b8; }
 </style>
 
 <h1>Steam Sale Scout</h1>
@@ -149,7 +167,28 @@
   <button type="button" class="tab-btn" data-tab="recs" aria-selected="false">Recs</button>
   <button type="button" class="tab-btn" data-tab="hof" aria-selected="false">Best of Steam</button>
   <button type="button" class="tab-btn" data-tab="fpm" aria-selected="false">Fun per minute</button>
+  <button type="button" class="tab-btn" data-tab="dismissed" aria-selected="false">Dismissed <span id="dismissed-count-badge"></span></button>
 </nav>
+
+<!--
+  Settings panel (Increment 8): the one PRD-promised user setting (recency
+  window) gets its own small, always-reachable control here, separate from
+  the per-tab windowMonths inputs on Library/Recs (#window-months/
+  #recs-window-months) which keep working exactly as before — all three stay
+  in sync via the shared `windowMonths` in-memory value below. Everything
+  here now persists to D1 (GET/PUT /api/settings), not localStorage — see
+  the script's `persistedSettings` bootstrap.
+-->
+<details id="settings-panel" class="settings-panel">
+  <summary>Settings</summary>
+  <div class="filter-row">
+    <label>
+      Recency window (months):
+      <input type="number" id="settings-window-months" min="1" step="1" />
+    </label>
+    <span class="filter-hint">How far back "recently played" looks, for Library weighting and Recs scoring.</span>
+  </div>
+</details>
 
 <!--
   Filter bar (Increment 5; min-discount retired from a server param to a
@@ -169,6 +208,7 @@
       Min discount (%):
       <input type="number" id="filter-min-discount" min="0" max="100" step="1" placeholder="any" />
     </label>
+    <span id="filter-min-discount-hint" class="filter-hint"></span>
     <label>
       Max price (AUD):
       <input type="number" id="filter-max-price" min="0" step="1" placeholder="any" />
@@ -280,6 +320,7 @@
         <th>Deck</th>
         <th>Battery</th>
         <th>Store</th>
+        <th></th>
       </tr>
     </thead>
     <tbody id="deals-table-body"></tbody>
@@ -348,6 +389,7 @@
         <th>Battery</th>
         <th>Why</th>
         <th>Store</th>
+        <th></th>
       </tr>
     </thead>
     <tbody id="recs-table-body"></tbody>
@@ -379,6 +421,7 @@
         <th>Deck</th>
         <th>Battery</th>
         <th>Store</th>
+        <th></th>
       </tr>
     </thead>
     <tbody id="hof-table-body"></tbody>
@@ -411,6 +454,8 @@
 
   <div class="controls">
     <button id="fpm-sync-btn" type="button">Sync catalog now</button>
+    <button id="fpm-sync-continue-btn" type="button">Sync to completion</button>
+    <button id="fpm-sync-stop-btn" type="button" hidden>Stop sync</button>
     <button id="fpm-refresh-btn" type="button">Refresh prices/owned</button>
     <label>
       Ranking:
@@ -460,6 +505,7 @@
         <th>Deck</th>
         <th>Battery</th>
         <th>Store</th>
+        <th></th>
       </tr>
     </thead>
     <tbody id="fpm-table-body"></tbody>
@@ -469,21 +515,103 @@
   </div>
 </section>
 
+<!--
+  Dismissed (Increment 8) — "Not interested" management view. Dismissals are
+  app-wide across the sale lanes (Deals/Recs/Best of Steam/Fun per minute —
+  never Library or Wishlist), so this lives as its own tab rather than
+  nested inside any one lane (Coder's call — see the handoff notes).
+-->
+<section id="tab-dismissed" class="tab-panel" hidden>
+  <div id="dismissed-status" class="status">Loading…</div>
+  <div id="dismissed-totals" class="totals"></div>
+  <div id="dismissed-empty" class="status" hidden>Nothing dismissed yet — click the ✕ on any Deals/Recs/Best of Steam/Fun per minute row to hide it everywhere.</div>
+  <table id="dismissed-table" hidden>
+    <thead>
+      <tr>
+        <th>Name</th>
+        <th>Dismissed</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody id="dismissed-table-body"></tbody>
+  </table>
+</section>
+
 <script type="module">
   import { weight } from "./weight.js";
   import {
     DEFAULT_FILTERS,
-    loadFilters,
-    saveFilters,
-    resetFilters,
     computeTopTags,
     computeAllTagNames,
     applyFilters,
     passesOnSaleOnly,
   } from "./filters.js";
 
-  const STORAGE_KEY = "steam-sale-scout.windowMonths";
   const DEFAULT_WINDOW_MONTHS = 12;
+
+  // ---------------------------------------------------------------------
+  // Persisted settings (Increment 8) — filter-bar state, the recency
+  // window, and the FPM-tab-local controls now live in D1 (GET/PUT
+  // /api/settings), not localStorage: "no split-brain, the app's state
+  // lives where its catalog lives" (PO decision). `resetFilters`/
+  // `saveFilters`/`loadFilters` (public/filters.js) were the localStorage-
+  // backed versions of this — no longer called from here, but left in
+  // place/exported/tested since they're still valid pure helpers over any
+  // Storage-shaped backend.
+  //
+  // A top-level `await` here (supported natively by `<script type="module">`)
+  // blocks the rest of THIS module's execution until the persisted blob is
+  // back, so every synchronous "what's the starting value" read further
+  // down (windowInput.value=, filters=, applyFilterInputsToUi(), the FPM
+  // control defaults, etc.) sees the real restored state on the very first
+  // render — no flash of defaults then a jump to the real value. Fail-soft:
+  // any fetch/parse failure just leaves this {} and every reader below
+  // falls back to its own default, same merge-over-defaults discipline
+  // loadFilters() used to apply against localStorage.
+  let persistedSettings = {};
+  try {
+    const settingsRes = await fetch("/api/settings");
+    const settingsBody = await settingsRes.json();
+    if (settingsBody && typeof settingsBody.settings === "object" && settingsBody.settings) {
+      persistedSettings = settingsBody.settings;
+    }
+  } catch {
+    // fail soft — defaults apply everywhere below
+  }
+
+  const SETTINGS_SAVE_DEBOUNCE_MS = 500;
+  let settingsSaveTimer = null;
+
+  /** Debounced auto-save (spec: "auto-saved on change") — always sends the
+   * whole current in-memory settings snapshot, which src/settings.js's
+   * PUT upserts key-by-key. Simpler and always-correct vs. tracking exactly
+   * which key changed; fire-and-forget/best-effort (a save failure just
+   * means this change doesn't survive a reload, same session behaviour
+   * either way). References fpmOwnedModeSelect/fpmOnSaleOnlyCheckbox/
+   * fpmFormulaSelect, which are declared further down this script — safe,
+   * since this function's body only runs when actually called (an event),
+   * long after the whole module has finished its first pass. */
+  function scheduleSettingsSave() {
+    if (settingsSaveTimer) clearTimeout(settingsSaveTimer);
+    settingsSaveTimer = setTimeout(async () => {
+      const body = {
+        filters,
+        windowMonths: persistedSettings.windowMonths,
+        fpmOwnedMode: fpmOwnedModeSelect.value,
+        fpmOnSaleOnly: fpmOnSaleOnlyCheckbox.checked,
+        fpmFormula: fpmFormulaSelect.value,
+      };
+      try {
+        await fetch("/api/settings", {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+      } catch {
+        // best-effort — see the note above
+      }
+    }, SETTINGS_SAVE_DEBOUNCE_MS);
+  }
 
   const statusEl = document.getElementById("status");
   const totalsEl = document.getElementById("totals");
@@ -492,15 +620,35 @@
   const windowInput = document.getElementById("window-months");
   const sortHoursCheckbox = document.getElementById("sort-hours");
   const refreshBtn = document.getElementById("refresh-btn");
+  const settingsWindowInput = document.getElementById("settings-window-months");
 
   let games = [];
 
+  /** In-memory "current recency window" — replaces the old localStorage
+   * read; `persistedSettings.windowMonths` is kept up to date by every
+   * control that changes it (Library tab, Recs tab, and the settings
+   * panel all share this one value). */
+  let windowMonths = persistedSettings.windowMonths > 0 ? persistedSettings.windowMonths : DEFAULT_WINDOW_MONTHS;
+  persistedSettings.windowMonths = windowMonths;
+
   function loadWindowMonths() {
-    const stored = Number(localStorage.getItem(STORAGE_KEY));
-    return stored > 0 ? stored : DEFAULT_WINDOW_MONTHS;
+    return windowMonths;
+  }
+
+  /** Shared by every recency-window control (Library tab, Recs tab, the
+   * settings panel) — updates the in-memory value, persists it, and keeps
+   * the other two inputs' displayed values in sync. */
+  function setWindowMonths(value) {
+    windowMonths = value;
+    persistedSettings.windowMonths = value;
+    windowInput.value = value;
+    recsWindowInput.value = value;
+    settingsWindowInput.value = value;
+    scheduleSettingsSave();
   }
 
   windowInput.value = loadWindowMonths();
+  settingsWindowInput.value = loadWindowMonths();
 
   function iconUrl(game) {
     if (!game.img_icon_url) return "";
@@ -622,9 +770,16 @@
   windowInput.addEventListener("input", () => {
     const raw = Number(windowInput.value);
     const value = raw > 0 ? raw : DEFAULT_WINDOW_MONTHS;
-    windowInput.value = value;
-    localStorage.setItem(STORAGE_KEY, String(value));
+    setWindowMonths(value);
     render();
+  });
+
+  settingsWindowInput.addEventListener("change", () => {
+    const raw = Number(settingsWindowInput.value);
+    const value = raw > 0 ? raw : DEFAULT_WINDOW_MONTHS;
+    setWindowMonths(value);
+    render();
+    if (recsLoaded) loadRecs(); // settings-panel change re-scores Recs too, same as the Recs tab's own input
   });
 
   sortHoursCheckbox.addEventListener("change", render);
@@ -642,12 +797,14 @@
     recs: document.getElementById("tab-recs"),
     hof: document.getElementById("tab-hof"),
     fpm: document.getElementById("tab-fpm"),
+    dismissed: document.getElementById("tab-dismissed"),
   };
   let dealsLoaded = false;
   let recsLoaded = false;
   let hofLoaded = false;
   let wishlistLoaded = false;
   let fpmLoaded = false;
+  let dismissedLoaded = false;
   let activeTab = "library";
 
   tabButtons.forEach((btn) => {
@@ -662,7 +819,9 @@
       // Steam) — Library is owned games with no price/deal/tags in the same
       // shape, so a discount/deck/battery/tag filter has nothing to act on
       // there (flagged in public/filters.js's header + the handoff notes).
-      filterBarEl.hidden = tab === "library";
+      // Dismissed (Increment 8) is a management list, not a filterable
+      // candidate pool, so it's exempt too.
+      filterBarEl.hidden = tab === "library" || tab === "dismissed";
       if (tab === "deals" && !dealsLoaded) {
         dealsLoaded = true;
         loadDeals();
@@ -684,7 +843,12 @@
         loadFpm();
         pollFpmSyncStatus();
       }
+      if (tab === "dismissed" && !dismissedLoaded) {
+        dismissedLoaded = true;
+        loadDismissed();
+      }
       renderTagChips(currentTabRawItems());
+      updateMinDiscountHint();
     });
   });
 
@@ -699,6 +863,7 @@
 
   const filterBarEl = document.getElementById("filter-bar");
   const filterMinDiscountInput = document.getElementById("filter-min-discount");
+  const filterMinDiscountHintEl = document.getElementById("filter-min-discount-hint");
   const filterMaxPriceInput = document.getElementById("filter-max-price");
   const filterMinSimilarityInput = document.getElementById("filter-min-similarity");
   const filterDeckModeSelect = document.getElementById("filter-deck-mode");
@@ -713,10 +878,10 @@
   const filterTagSearchModeSelect = document.getElementById("filter-tag-search-mode");
   const filterTagSearchAddBtn = document.getElementById("filter-tag-search-add");
 
-  let filters = loadFilters(localStorage);
+  let filters = { ...DEFAULT_FILTERS, ...(persistedSettings.filters && typeof persistedSettings.filters === "object" ? persistedSettings.filters : {}) };
 
   function persistFilters() {
-    saveFilters(filters, localStorage);
+    scheduleSettingsSave();
   }
 
   function applyFilterInputsToUi() {
@@ -794,11 +959,40 @@
     });
   }
 
+  /**
+   * Ride-along B (Increment 8) — root cause investigated and confirmed: the
+   * min-discount bar control is shared across every sale tab, but Deals/Recs
+   * always SOURCE at a fixed server floor (DEALS_SOURCING_MIN_CUT=60, below)
+   * while Best-of sources from a much lower floor (BESTOF_SOURCING_MIN_CUT,
+   * mirroring src/deals.js's BESTOF_MIN_CUT). A bar value below the ACTIVE
+   * tab's sourcing floor is a genuine no-op there — nothing below that floor
+   * was ever fetched, so there's nothing to filter. This is a UI-honesty fix
+   * only (an informational hint), not an engine/sourcing change: it makes
+   * that no-op visible per-tab instead of silently doing nothing.
+   */
+  function updateMinDiscountHint() {
+    let floor = null;
+    if (activeTab === "deals" || activeTab === "recs") floor = DEALS_SOURCING_MIN_CUT;
+    else if (activeTab === "hof") floor = BESTOF_SOURCING_MIN_CUT;
+
+    if (floor == null) {
+      filterMinDiscountHintEl.textContent = "";
+      return;
+    }
+    const current = filters.minDiscount || 0;
+    if (current > 0 && current < floor) {
+      filterMinDiscountHintEl.textContent = `⚠ this tab only sources games ≥${floor}% off — values below ${floor} have no effect here`;
+    } else {
+      filterMinDiscountHintEl.textContent = `(this tab sources ≥${floor}% off)`;
+    }
+  }
+
   filterMinDiscountInput.addEventListener("change", () => {
     const raw = filterMinDiscountInput.value;
     const value = Number(raw);
     filters.minDiscount = raw === "" || !(value >= 0) ? 0 : value;
     persistFilters();
+    updateMinDiscountHint();
     rerenderActiveTab();
   });
 
@@ -855,9 +1049,11 @@
   });
 
   filterResetBtn.addEventListener("click", () => {
-    filters = resetFilters(localStorage);
+    filters = { ...DEFAULT_FILTERS };
+    persistFilters();
     applyFilterInputsToUi();
     renderTagChips(currentTabRawItems());
+    updateMinDiscountHint();
     rerenderActiveTab();
   });
 
@@ -904,6 +1100,52 @@
     td.appendChild(span);
   }
 
+  /**
+   * "Not interested" (Increment 8) — dismisses a game app-wide, server-side,
+   * across every sale lane (Deals/Recs/Best of Steam/Fun per minute) —
+   * Library and Wishlist rows never call this (PO's exemption). Optimistic:
+   * removes the row from every already-loaded lane's in-memory data
+   * immediately, so it's gone from this tab right now and from every other
+   * lane the next time it renders, then fires the POST best-effort (a
+   * failed request just means it reappears on the next reload, same as
+   * this app's settings auto-save). References lastRecsBody/lastHofBody/
+   * lastFpmBody/deals/dismissedLoaded/loadDismissed, all declared further
+   * down this script — safe, this only runs on a click, well after the
+   * whole module has finished its first pass.
+   */
+  async function dismissGame(item) {
+    if (item.appid == null) return;
+    deals = deals.filter((d) => d.appid !== item.appid);
+    if (lastRecsBody) lastRecsBody.recs = (lastRecsBody.recs || []).filter((r) => r.appid !== item.appid);
+    if (lastHofBody) lastHofBody.hof = (lastHofBody.hof || []).filter((h) => h.appid !== item.appid);
+    if (lastFpmBody) lastFpmBody.fpm = (lastFpmBody.fpm || []).filter((f) => f.appid !== item.appid);
+    rerenderActiveTab();
+    try {
+      await fetch("/api/dismissals", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ appid: item.appid, name: item.title || null }),
+      });
+    } catch {
+      // best-effort — see the note above
+    }
+    if (dismissedLoaded) loadDismissed();
+  }
+
+  /** Appends the ✕ "Not interested" column every sale-lane row carries —
+   * shared across renderDeals/renderRecs/renderHof/renderFpm. */
+  function appendDismissTd(tr, item) {
+    const td = document.createElement("td");
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "dismiss-btn";
+    btn.title = "Not interested — hide this game everywhere";
+    btn.textContent = "✕";
+    btn.addEventListener("click", () => dismissGame(item));
+    td.appendChild(btn);
+    tr.appendChild(td);
+  }
+
   // --- Deals (Increment 2, filters/deck/battery added Increment 5) --------
 
   // Increment 5.5: min-discount is now a client-side bar filter (see the
@@ -912,6 +1154,14 @@
   // so this constant keeps /api/deals?minCut=60 byte-identical to inc-5's
   // default rather than exposing it as a user control.
   const DEALS_SOURCING_MIN_CUT = 60;
+
+  // Increment 8 (ride-along B): mirrors src/deals.js's BESTOF_MIN_CUT —
+  // Best-of sources from a much lower floor than Deals/Recs (deliberately,
+  // since 5.5, so shallow-cut Hall-of-Fame qualifiers aren't excluded). Used
+  // only by updateMinDiscountHint() above to tell James per-tab why a
+  // min-discount value might be a no-op — never sent as a query param
+  // (Best-of's floor is a server-side config, not client-controlled).
+  const BESTOF_SOURCING_MIN_CUT = 10;
 
   const dealsStatusEl = document.getElementById("deals-status");
   const dealsTotalsEl = document.getElementById("deals-totals");
@@ -990,6 +1240,8 @@
         storeTd.appendChild(a);
       }
       tr.appendChild(storeTd);
+
+      appendDismissTd(tr, deal);
 
       dealsTableBodyEl.appendChild(tr);
     });
@@ -1264,6 +1516,8 @@
       }
       tr.appendChild(storeTd);
 
+      appendDismissTd(tr, rec);
+
       recsTableBodyEl.appendChild(tr);
     });
 
@@ -1321,8 +1575,7 @@
   recsWindowInput.addEventListener("change", () => {
     const raw = Number(recsWindowInput.value);
     const value = raw > 0 ? raw : DEFAULT_WINDOW_MONTHS;
-    recsWindowInput.value = value;
-    localStorage.setItem(STORAGE_KEY, String(value));
+    setWindowMonths(value);
     loadRecs();
   });
 
@@ -1422,6 +1675,8 @@
       }
       tr.appendChild(storeTd);
 
+      appendDismissTd(tr, entry);
+
       hofTableBodyEl.appendChild(tr);
     });
 
@@ -1517,6 +1772,8 @@
   const fpmTableEl = document.getElementById("fpm-table");
   const fpmTableBodyEl = document.getElementById("fpm-table-body");
   const fpmSyncBtn = document.getElementById("fpm-sync-btn");
+  const fpmSyncContinueBtn = document.getElementById("fpm-sync-continue-btn");
+  const fpmSyncStopBtn = document.getElementById("fpm-sync-stop-btn");
   const fpmRefreshBtn = document.getElementById("fpm-refresh-btn");
   const fpmFormulaSelect = document.getElementById("fpm-formula");
   const fpmQexpInput = document.getElementById("fpm-qexp");
@@ -1525,6 +1782,21 @@
   const fpmOnSaleOnlyCheckbox = document.getElementById("fpm-on-sale-only");
   const fpmShowMoreWrapEl = document.getElementById("fpm-show-more-wrap");
   const fpmShowMoreBtn = document.getElementById("fpm-show-more-btn");
+
+  // Increment 8: restore the FPM-tab-local controls from persisted settings
+  // (see the top-level-await bootstrap) — these are NOT part of the shared
+  // `filters` object, so they're restored here individually. A restored
+  // formula-picker choice is a lens the user is looking through, not a
+  // change to the default — FPM_FORMULA stays 'sqrt' in src/hltb.js.
+  if (["hide", "only"].includes(persistedSettings.fpmOwnedMode)) {
+    fpmOwnedModeSelect.value = persistedSettings.fpmOwnedMode;
+  }
+  if (typeof persistedSettings.fpmOnSaleOnly === "boolean") {
+    fpmOnSaleOnlyCheckbox.checked = persistedSettings.fpmOnSaleOnly;
+  }
+  if (["linear", "sqrt", "log"].includes(persistedSettings.fpmFormula)) {
+    fpmFormulaSelect.value = persistedSettings.fpmFormula;
+  }
 
   let fpmSyncPollTimer = null;
   let lastFpmBody = null;
@@ -1633,6 +1905,8 @@
       }
       tr.appendChild(storeTd);
 
+      appendDismissTd(tr, entry);
+
       fpmTableBodyEl.appendChild(tr);
     });
 
@@ -1657,6 +1931,11 @@
    * awaiting classification whenever that fill isn't complete, so the
    * status line stays honest about BOTH backfills, not just the HLTB one. */
   function renderFpmSyncStatus(status) {
+    // Increment 8: the Stop control only makes sense while an auto-continue
+    // LOOP is driving (a single "Sync catalog now" batch isn't stoppable
+    // mid-batch, same as before) — status.autoContinue distinguishes the two.
+    fpmSyncStopBtn.hidden = !status?.autoContinue;
+
     if (!status) {
       fpmSyncStatusEl.textContent = "";
       return;
@@ -1670,7 +1949,7 @@
     const pendingNote = status.pending > 0 ? ` (${status.pending} pending)` : "";
     const unclassified = Math.max((status.total ?? 0) - (status.classified ?? 0), 0);
     const classificationNote = unclassified > 0 ? ` · ${unclassified} awaiting classification` : "";
-    const runningNote = status.running ? " — sync running…" : "";
+    const runningNote = status.autoContinue ? " — syncing to completion…" : status.running ? " — sync running…" : "";
     fpmSyncStatusEl.textContent = `Ranked ${status.matched} of ${status.total} qualifying games${pendingNote}${classificationNote}${runningNote}`;
   }
 
@@ -1765,16 +2044,141 @@
     pollFpmSyncStatus();
   });
 
+  /** "Sync to completion" (Increment 8, ride-along A) — POST
+   * /api/fpm/sync?continue=1 starts the auto-continue loop; GET
+   * /api/fpm/sync/status's existing `running` flag stays true for the
+   * WHOLE loop's duration (not just one batch), so the existing
+   * pollFpmSyncStatus() below already keeps polling throughout — no new
+   * polling semantics needed, per the build note. */
+  fpmSyncContinueBtn.addEventListener("click", async () => {
+    fpmSyncContinueBtn.disabled = true;
+    fpmSyncStatusEl.textContent = "Starting sync to completion…";
+    try {
+      await fetch("/api/fpm/sync?continue=1", { method: "POST" });
+    } catch (err) {
+      fpmSyncStatusEl.textContent = `Sync failed to start: ${err.message}`;
+    } finally {
+      fpmSyncContinueBtn.disabled = false;
+    }
+    pollFpmSyncStatus();
+  });
+
+  fpmSyncStopBtn.addEventListener("click", async () => {
+    fpmSyncStopBtn.disabled = true;
+    try {
+      await fetch("/api/fpm/sync/stop", { method: "POST" });
+    } catch {
+      // best-effort — the next status poll will reflect reality either way
+    } finally {
+      fpmSyncStopBtn.disabled = false;
+    }
+  });
+
   fpmRefreshBtn.addEventListener("click", () => loadFpm(true));
-  fpmFormulaSelect.addEventListener("change", () => loadFpm(false));
+  fpmFormulaSelect.addEventListener("change", () => {
+    scheduleSettingsSave();
+    loadFpm(false);
+  });
   fpmQexpInput.addEventListener("change", () => loadFpm(false));
   fpmBreadthInput.addEventListener("change", () => loadFpm(false));
-  fpmOwnedModeSelect.addEventListener("change", () => loadFpm(false));
+  fpmOwnedModeSelect.addEventListener("change", () => {
+    scheduleSettingsSave();
+    loadFpm(false);
+  });
   fpmOnSaleOnlyCheckbox.addEventListener("change", () => {
+    scheduleSettingsSave();
     if (lastFpmBody) renderFpm(lastFpmBody); // client-side only, no refetch
   });
   fpmShowMoreBtn.addEventListener("click", () => {
     fpmDisplayLimit += FPM_DISPLAY_CAP;
     if (lastFpmBody) renderFpm(lastFpmBody);
   });
+
+  // --- Dismissed (Increment 8) ---------------------------------------------
+  // "Not interested" management view — app-wide across the sale lanes (see
+  // dismissGame()/appendDismissTd() above). No filter bar here (this is a
+  // management list, not a filterable candidate pool — see the tab-click
+  // handler's filterBarEl.hidden logic).
+
+  const dismissedStatusEl = document.getElementById("dismissed-status");
+  const dismissedTotalsEl = document.getElementById("dismissed-totals");
+  const dismissedEmptyEl = document.getElementById("dismissed-empty");
+  const dismissedTableEl = document.getElementById("dismissed-table");
+  const dismissedTableBodyEl = document.getElementById("dismissed-table-body");
+  const dismissedCountBadgeEl = document.getElementById("dismissed-count-badge");
+
+  function formatDismissedAt(ms) {
+    if (!ms) return "—";
+    return new Date(ms).toLocaleDateString();
+  }
+
+  function renderDismissed(list) {
+    dismissedCountBadgeEl.textContent = list.length ? `(${list.length})` : "";
+
+    dismissedTableBodyEl.innerHTML = "";
+    list.forEach((item) => {
+      const tr = document.createElement("tr");
+
+      const nameTd = document.createElement("td");
+      nameTd.textContent = item.name || `App ${item.appid}`;
+      tr.appendChild(nameTd);
+
+      const dateTd = document.createElement("td");
+      dateTd.textContent = formatDismissedAt(item.dismissed_at);
+      tr.appendChild(dateTd);
+
+      const actionTd = document.createElement("td");
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.textContent = "Restore";
+      btn.addEventListener("click", () => restoreGame(item.appid));
+      actionTd.appendChild(btn);
+      tr.appendChild(actionTd);
+
+      dismissedTableBodyEl.appendChild(tr);
+    });
+
+    dismissedTotalsEl.textContent = `${list.length} dismissed`;
+    dismissedEmptyEl.hidden = list.length !== 0;
+    dismissedTableEl.hidden = list.length === 0;
+  }
+
+  async function loadDismissed() {
+    dismissedStatusEl.textContent = "Loading…";
+    dismissedStatusEl.hidden = false;
+    dismissedStatusEl.className = "status";
+    dismissedTableEl.hidden = true;
+
+    try {
+      const res = await fetch("/api/dismissals");
+      const body = await res.json();
+      dismissedStatusEl.hidden = true;
+      renderDismissed(body.dismissals || []);
+    } catch (err) {
+      dismissedStatusEl.textContent = err.message;
+      dismissedStatusEl.className = "status error";
+    }
+  }
+
+  /** Un-dismiss: DELETE the D1 row, refresh the Dismissed list, and refetch
+   * whichever sale lanes are already loaded so the restored game reappears
+   * there too — a plain refetch (no ?refresh=1) is enough since dismissal
+   * exclusion is a request-time join, never baked into the deals/pool
+   * caches (see src/worker.js's handleDeals/handleRecs/handleHof/handleFpm). */
+  async function restoreGame(appid) {
+    try {
+      await fetch(`/api/dismissals/${appid}`, { method: "DELETE" });
+    } catch {
+      // best-effort — see loadDismissed's own fail-soft handling below
+    }
+    await loadDismissed();
+    if (dealsLoaded) loadDeals();
+    if (recsLoaded) loadRecs();
+    if (hofLoaded) loadHof();
+    if (fpmLoaded) loadFpm();
+  }
+
+  // --- Initial state: apply everything restored from persistedSettings ----
+
+  updateMinDiscountHint();
 </script>

@@ -11,6 +11,8 @@ import assert from "node:assert/strict";
 import worker from "../src/worker.js";
 import { __setSpyMinIntervalMsForTests, __resetSpyQueueForTests } from "../src/spyQueue.js";
 import { BESTOF_FETCH_CAP, BESTOF_MIN_CUT, BESTOF_PAGE_LIMIT, BESTOF_SORT } from "../src/deals.js";
+import { makeMockD1 } from "./helpers/mockD1.mjs";
+import { ensureDismissalsSchema, addDismissal } from "../src/dismissals.js";
 
 const originalFetch = globalThis.fetch;
 const originalCaches = globalThis.caches;
@@ -293,6 +295,80 @@ test("only candidates clearing HOF_MIN_REVIEWS/HOF_MIN_RATIO appear, ordered by 
   assert.equal(body.hof[0].appid, 201);
   assert.equal(body.hof[1].appid, 200);
   assert.ok(!body.hof.some((h) => h.appid === 202), "non-qualifying candidate must be excluded");
+});
+
+test("a dismissed appid is excluded from /api/best-of even though it clears every Hall-of-Fame bar", async () => {
+  const cache = makeMockCache();
+  globalThis.caches = { default: cache };
+  const env = makeEnv();
+
+  primeLibrary(cache, env, [ownedGame({ appid: 1, playtime_forever: 600 })]);
+  const keptAppid = 200;
+  const dismissedAppid = 201;
+  primeBestOfPool(cache, [
+    deal({ itadId: "itad-keep", appid: keptAppid, cut: 90, title: "Keep This All-timer" }),
+    deal({ itadId: "itad-dismissed", appid: dismissedAppid, cut: 90, title: "Dismissed All-timer" }),
+  ]);
+
+  env.TAG_CACHE.store.set(v2Key(1), JSON.stringify(goodSpyEntry({ tags: { Roguelike: 10 } })));
+  const hofQualifyingReviews = { reviews: { positive: 95000, negative: 5000 } };
+  env.TAG_CACHE.store.set(v2Key(keptAppid), JSON.stringify(goodSpyEntry({ tags: { Roguelike: 10 }, ...hofQualifyingReviews })));
+  env.TAG_CACHE.store.set(v2Key(dismissedAppid), JSON.stringify(goodSpyEntry({ tags: { Roguelike: 10 }, ...hofQualifyingReviews })));
+
+  const fpmDb = makeMockD1();
+  await ensureDismissalsSchema({ FPM_DB: fpmDb });
+  await addDismissal({ FPM_DB: fpmDb }, dismissedAppid, "Dismissed All-timer");
+  env.FPM_DB = fpmDb;
+
+  const ctx = makeCtx();
+  const res = await worker.fetch(new Request("https://x/api/best-of"), env, ctx);
+  const body = await res.json();
+
+  assert.equal(body.hof.length, 1);
+  assert.equal(body.hof[0].appid, keptAppid);
+});
+
+test("dismissal slot-freeing (rank promotion): dismissing the top-ranked Hall-of-Fame pick promotes the runner-up into hof[0]", async () => {
+  // buildHallOfFame has no top-N slice — same "prove rank promotion, not
+  // just exclusion" reasoning as the Recs sibling test.
+  const cache = makeMockCache();
+  globalThis.caches = { default: cache };
+  const env = makeEnv();
+
+  primeLibrary(cache, env, [ownedGame({ appid: 1, playtime_forever: 600 })]);
+  const topAppid = 210;
+  const runnerUpAppid = 211;
+  // Identical qualifying reviews (identical Wilson quality) — the only
+  // thing separating hofScore (discountDepth x qualityValue) is the
+  // discount depth, deterministically making the deeper cut rank #1.
+  const hofQualifyingReviews = { reviews: { positive: 95000, negative: 5000 } };
+  primeBestOfPool(cache, [
+    deal({ itadId: "itad-top", appid: topAppid, cut: 95, title: "Deepest Cut All-timer" }),
+    deal({ itadId: "itad-runner-up", appid: runnerUpAppid, cut: 90, title: "Shallower Cut All-timer" }),
+  ]);
+
+  env.TAG_CACHE.store.set(v2Key(1), JSON.stringify(goodSpyEntry({ tags: { Roguelike: 10 } })));
+  env.TAG_CACHE.store.set(v2Key(topAppid), JSON.stringify(goodSpyEntry({ tags: { Roguelike: 10 }, ...hofQualifyingReviews })));
+  env.TAG_CACHE.store.set(v2Key(runnerUpAppid), JSON.stringify(goodSpyEntry({ tags: { Roguelike: 10 }, ...hofQualifyingReviews })));
+
+  const fpmDb = makeMockD1();
+  await ensureDismissalsSchema({ FPM_DB: fpmDb });
+  env.FPM_DB = fpmDb;
+
+  const ctx = makeCtx();
+
+  const before = await worker.fetch(new Request("https://x/api/best-of"), env, ctx);
+  const beforeBody = await before.json();
+  assert.equal(beforeBody.hof.length, 2);
+  assert.equal(beforeBody.hof[0].appid, topAppid, "baseline: the deeper-cut pick ranks #1");
+  assert.equal(beforeBody.hof[1].appid, runnerUpAppid);
+
+  await addDismissal({ FPM_DB: fpmDb }, topAppid, "Deepest Cut All-timer");
+
+  const after = await worker.fetch(new Request("https://x/api/best-of"), env, ctx);
+  const afterBody = await after.json();
+  assert.equal(afterBody.hof.length, 1, "the dismissed row is gone, not just re-ranked");
+  assert.equal(afterBody.hof[0].appid, runnerUpAppid, "promoted: the runner-up now occupies hof[0]");
 });
 
 test("similarity is attached as a secondary field but never used to exclude a qualifying candidate", async () => {

@@ -16,6 +16,8 @@ import assert from "node:assert/strict";
 import worker from "../src/worker.js";
 import { __setSpyMinIntervalMsForTests, __resetSpyQueueForTests } from "../src/spyQueue.js";
 import { BESTOF_FETCH_CAP, BESTOF_SORT, DEALS_FETCH_CAP } from "../src/deals.js";
+import { makeMockD1 } from "./helpers/mockD1.mjs";
+import { ensureDismissalsSchema, addDismissal } from "../src/dismissals.js";
 
 const originalFetch = globalThis.fetch;
 const originalCaches = globalThis.caches;
@@ -272,6 +274,60 @@ test("a deal with no resolvable Steam appid is kept in the response with appid=n
   const body = await res.json();
   assert.equal(body.deals.length, 1);
   assert.equal(body.deals[0].appid, null);
+});
+
+// ---------------------------------------------------------------------------
+// Dismissal exclusion (Increment 8) — a request-time join, so it must never
+// be baked into the cached deals blob and must never touch the response
+// shape when nothing is dismissed (the 7.8-regression "byte-identical"
+// requirement).
+// ---------------------------------------------------------------------------
+
+test("a dismissed appid is excluded from /api/deals, even though it clears minCut and isn't owned", async () => {
+  const dealKeep = rawDeal("itad-keep", "Keep This Game", 75, 9.99);
+  const dealDismissed = rawDeal("itad-dismissed", "Dismissed Game", 80, 4.99);
+
+  globalThis.fetch = makeItadFetch({
+    dealsPagesByOffset: { 0: { list: [dealKeep, dealDismissed], hasMore: false } },
+    appIdsById: { "itad-keep": ["app/100"], "itad-dismissed": ["app/200"] },
+    lowsById: {},
+  });
+  globalThis.caches = { default: makeMockCache() };
+
+  const fpmDb = makeMockD1();
+  await ensureDismissalsSchema({ FPM_DB: fpmDb });
+  await addDismissal({ FPM_DB: fpmDb }, 200, "Dismissed Game");
+
+  const env = makeEnv({ FPM_DB: fpmDb });
+  const ctx = makeCtx();
+  const res = await worker.fetch(new Request("https://x/api/deals"), env, ctx);
+  await ctx.flush();
+
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  const titles = body.deals.map((d) => d.title);
+  assert.deepEqual(titles, ["Keep This Game"]);
+});
+
+test("with zero dismissals (no FPM_DB bound, matching every existing test's env), /api/deals is unaffected — the 7.8 regression baseline", async () => {
+  const dealA = rawDeal("itad-a", "Game A", 75, 9.99);
+
+  globalThis.fetch = makeItadFetch({
+    dealsPagesByOffset: { 0: { list: [dealA], hasMore: false } },
+    appIdsById: { "itad-a": ["app/100"] },
+    lowsById: {},
+  });
+  globalThis.caches = { default: makeMockCache() };
+
+  const env = makeEnv(); // no FPM_DB — dismissal join must fail soft to "nothing excluded"
+  const ctx = makeCtx();
+  const res = await worker.fetch(new Request("https://x/api/deals"), env, ctx);
+  await ctx.flush();
+
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.deals.length, 1);
+  assert.equal(body.deals[0].title, "Game A");
 });
 
 // ---------------------------------------------------------------------------

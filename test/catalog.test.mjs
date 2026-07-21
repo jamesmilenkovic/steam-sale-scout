@@ -40,6 +40,10 @@ import {
   startFpmSync,
   isFpmSyncRunning,
   getLastSyncStats,
+  runFpmSyncUntilComplete,
+  startFpmAutoContinue,
+  isFpmAutoContinueActive,
+  requestFpmAutoContinueStop,
   __setCatalogPacingMsForTests,
   __setCatalogBackoffMsForTests,
   __resetCatalogPacingForTests,
@@ -52,6 +56,9 @@ import {
   __resetHltbItemTimeoutForTests,
   __resetFpmSyncStateForTests,
   __resetLastSyncStatsForTests,
+  __setFpmAutoContinueMaxIterationsForTests,
+  __resetFpmAutoContinueMaxIterationsForTests,
+  __resetFpmAutoContinueStateForTests,
 } from "../src/catalog.js";
 
 const originalFetch = globalThis.fetch;
@@ -128,6 +135,7 @@ test.beforeEach(() => {
   __setHltbPollingForTests(0, 50);
   __resetFpmSyncStateForTests();
   __resetLastSyncStatsForTests();
+  __resetFpmAutoContinueStateForTests();
 });
 
 test.afterEach(() => {
@@ -137,6 +145,7 @@ test.afterEach(() => {
   __resetTypePacingForTests();
   __resetHltbPollingForTests();
   __resetHltbItemTimeoutForTests();
+  __resetFpmAutoContinueMaxIterationsForTests();
 });
 
 /** Mark a batch of appids classified 'game' directly (bypassing the real
@@ -1203,4 +1212,198 @@ test("runFpmSyncPipeline is resumable: a second run only enqueues rows the first
   queriesSeen.length = 0;
   await runFpmSyncPipeline(env, ctx, deps);
   assert.deepEqual(queriesSeen, [], "Game One is matched (never re-enqueued); Game Two was just checked (not yet stale)");
+});
+
+// ---------------------------------------------------------------------------
+// Sync auto-continue (Increment 8, ride-along A) — runFpmSyncUntilComplete
+// keeps calling the SAME unmodified runFpmSyncPipeline until both funnels
+// (classification, HLTB) are empty. No pacing/backoff changes here at all —
+// these tests only exercise the "keep calling it" loop logic itself.
+// ---------------------------------------------------------------------------
+
+test("runFpmSyncUntilComplete: a catalog that fully resolves in one batch stops after exactly one iteration", async () => {
+  const env = makeEnv();
+  await ensureCatalogSchema(env);
+  await upsertCatalogRows(
+    env,
+    [catalogRowFromBulk(bulkRow({ appid: 1, name: "Game One" })), catalogRowFromBulk(bulkRow({ appid: 2, name: "Game Two" }))],
+    1000,
+  );
+
+  globalThis.fetch = async (url, options = {}) => {
+    const u = new URL(url);
+    if (u.hostname === "steamspy.com") return jsonResponse({}); // empty page -> immediate end of crawl
+    const appdetailsRes = appdetailsBranch(url);
+    if (appdetailsRes) return appdetailsRes; // classification always succeeds
+    if (u.pathname === "/api/bleed/init") return jsonResponse({ token: "tok", hpKey: "hpk", hpVal: "hpv" });
+    if (u.pathname === "/api/bleed") {
+      const body = JSON.parse(options.body);
+      const name = body.searchTerms.join(" ");
+      return jsonResponse({ count: 1, data: [rawHltbEntry({ game_name: name, comp_main: 3600 })] });
+    }
+    throw new Error(`unexpected: ${url}`);
+  };
+
+  const ctx = makeCtx();
+  const result = await runFpmSyncUntilComplete(env, ctx, { loadOwnedAppIds: async () => new Set(), loadDealAppIds: async () => [] });
+
+  assert.equal(result.iterations, 1);
+  assert.equal(result.stoppedEarly, false);
+  const stats = await getCatalogStats(env);
+  assert.equal(stats.pending, 0);
+  assert.equal(stats.classified, stats.total);
+});
+
+test("runFpmSyncUntilComplete: keeps calling the batch step across an HLTB outage until both funnels are empty (throttle-pause self-recovery)", async () => {
+  const env = makeEnv();
+  await ensureCatalogSchema(env);
+  await upsertCatalogRows(
+    env,
+    [catalogRowFromBulk(bulkRow({ appid: 1, name: "Game One" })), catalogRowFromBulk(bulkRow({ appid: 2, name: "Game Two" }))],
+    1000,
+  );
+
+  let hltbInitCalls = 0;
+  globalThis.fetch = async (url, options = {}) => {
+    const u = new URL(url);
+    if (u.hostname === "steamspy.com") return jsonResponse({}); // empty page -> immediate end of crawl, every run
+    const appdetailsRes = appdetailsBranch(url);
+    if (appdetailsRes) return appdetailsRes; // classification always succeeds, both rows, run 1
+    if (u.pathname === "/api/bleed/init") {
+      hltbInitCalls++;
+      if (hltbInitCalls === 1) return new Response("down", { status: 503 }); // HLTB unreachable on pass 1
+      return jsonResponse({ token: "tok", hpKey: "hpk", hpVal: "hpv" }); // recovered by pass 2
+    }
+    if (u.pathname === "/api/bleed") {
+      const body = JSON.parse(options.body);
+      const name = body.searchTerms.join(" ");
+      return jsonResponse({ count: 1, data: [rawHltbEntry({ game_name: name, comp_main: 3600 })] });
+    }
+    throw new Error(`unexpected: ${url}`);
+  };
+
+  const ctx = makeCtx();
+  const result = await runFpmSyncUntilComplete(env, ctx, { loadOwnedAppIds: async () => new Set(), loadDealAppIds: async () => [] });
+
+  assert.equal(result.stoppedEarly, false);
+  assert.equal(result.iterations, 2, "pass 1: classification succeeds but HLTB is down (0 progress); pass 2: HLTB recovers and finishes both rows");
+
+  const stats = await getCatalogStats(env);
+  assert.equal(stats.pending, 0);
+  assert.equal(stats.classified, stats.total);
+});
+
+test("runFpmSyncUntilComplete: a stop request takes effect after the current batch step, not mid-batch", async () => {
+  const env = makeEnv();
+  await ensureCatalogSchema(env);
+  await upsertCatalogRows(
+    env,
+    [catalogRowFromBulk(bulkRow({ appid: 1, name: "Game One" })), catalogRowFromBulk(bulkRow({ appid: 2, name: "Game Two" }))],
+    1000,
+  );
+
+  // HLTB never resolves (no match, ever) — classification succeeds, so
+  // classified reaches total on pass 1 but pending never reaches 0, meaning
+  // the loop would otherwise keep going. Requesting a stop after pass 1
+  // should end the loop early rather than running forever.
+  globalThis.fetch = async (url, options = {}) => {
+    const u = new URL(url);
+    if (u.hostname === "steamspy.com") return jsonResponse({});
+    const appdetailsRes = appdetailsBranch(url);
+    if (appdetailsRes) return appdetailsRes;
+    if (u.pathname === "/api/bleed/init") return jsonResponse({ token: "tok", hpKey: "hpk", hpVal: "hpv" });
+    if (u.pathname === "/api/bleed") return jsonResponse({ count: 0, data: [] }); // never matches
+    throw new Error(`unexpected: ${url}`);
+  };
+
+  const ctx = makeCtx();
+  const promise = runFpmSyncUntilComplete(env, ctx, { loadOwnedAppIds: async () => new Set(), loadDealAppIds: async () => [] });
+  // A poll-timeout give-up (HLTB_ITEM_TIMEOUT_MS_DEFAULT) writes
+  // hltb_checked_at, so a NEVER-matching search still finishes pass 1 rather
+  // than hanging — request the stop immediately so pass 2 never starts.
+  requestFpmAutoContinueStop();
+  const result = await promise;
+
+  assert.equal(result.stoppedEarly, true);
+  assert.ok(result.iterations >= 1);
+});
+
+test("runFpmSyncUntilComplete: gives up after the safety-bound iteration count rather than looping forever", async () => {
+  __setFpmAutoContinueMaxIterationsForTests(2);
+  __setHltbItemTimeoutMsForTests(0); // give up on every HLTB item instantly
+
+  const env = makeEnv();
+  await ensureCatalogSchema(env);
+  await upsertCatalogRows(env, [catalogRowFromBulk(bulkRow({ appid: 1, name: "Game One" }))], 1000);
+
+  // Classification always succeeds; HLTB init always fails, so pending
+  // NEVER reaches 0 — this run can only stop via the safety bound.
+  globalThis.fetch = async (url) => {
+    const u = new URL(url);
+    if (u.hostname === "steamspy.com") return jsonResponse({});
+    const appdetailsRes = appdetailsBranch(url);
+    if (appdetailsRes) return appdetailsRes;
+    if (u.pathname === "/api/bleed/init") return new Response("down", { status: 503 });
+    throw new Error(`unexpected: ${url}`);
+  };
+
+  const ctx = makeCtx();
+  const result = await runFpmSyncUntilComplete(env, ctx, { loadOwnedAppIds: async () => new Set(), loadDealAppIds: async () => [] });
+
+  assert.equal(result.iterations, 2);
+  assert.equal(result.stoppedEarly, false);
+  const stats = await getCatalogStats(env);
+  assert.ok(stats.pending > 0, "still stuck — the safety bound, not completion, ended the loop");
+});
+
+test("startFpmAutoContinue: isFpmAutoContinueActive is true only while the loop is driving, and reports via isFpmSyncRunning too", async () => {
+  const env = makeEnv();
+  await ensureCatalogSchema(env);
+  let resolveFirstFetch;
+  const blocker = new Promise((r) => {
+    resolveFirstFetch = r;
+  });
+  globalThis.fetch = async () => {
+    await blocker;
+    return jsonResponse({}); // empty page -> immediate end of crawl
+  };
+
+  const ctx = makeCtx();
+  assert.equal(isFpmAutoContinueActive(), false);
+
+  const result = startFpmAutoContinue(env, ctx, { loadOwnedAppIds: async () => new Set(), loadDealAppIds: async () => [] });
+  assert.deepEqual(result, { started: true });
+  assert.equal(isFpmAutoContinueActive(), true);
+  assert.equal(isFpmSyncRunning(), true, "the existing running flag covers auto-continue too — no new polling semantics needed");
+
+  resolveFirstFetch();
+  await ctx.flush();
+  assert.equal(isFpmAutoContinueActive(), false);
+  assert.equal(isFpmSyncRunning(), false);
+});
+
+test("startFpmAutoContinue: refuses to start a second run (auto-continue or manual) while one is already active", async () => {
+  const env = makeEnv();
+  await ensureCatalogSchema(env);
+  let resolveFirstFetch;
+  const blocker = new Promise((r) => {
+    resolveFirstFetch = r;
+  });
+  globalThis.fetch = async () => {
+    await blocker;
+    return jsonResponse({});
+  };
+
+  const ctx = makeCtx();
+  const first = startFpmAutoContinue(env, ctx, { loadOwnedAppIds: async () => new Set(), loadDealAppIds: async () => [] });
+  assert.deepEqual(first, { started: true });
+
+  const second = startFpmAutoContinue(env, ctx, { loadOwnedAppIds: async () => new Set(), loadDealAppIds: async () => [] });
+  assert.deepEqual(second, { started: false, alreadyRunning: true });
+
+  const manualWhileAutoContinuing = startFpmSync(env, ctx, { loadOwnedAppIds: async () => new Set(), loadDealAppIds: async () => [] });
+  assert.deepEqual(manualWhileAutoContinuing, { started: false, alreadyRunning: true });
+
+  resolveFirstFetch();
+  await ctx.flush();
 });

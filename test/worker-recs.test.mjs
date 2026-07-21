@@ -27,6 +27,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import worker from "../src/worker.js";
+import { makeMockD1 } from "./helpers/mockD1.mjs";
+import { ensureDismissalsSchema, addDismissal } from "../src/dismissals.js";
 import {
   TAG_CACHE_TTL_SECONDS,
   TAG_CACHE_FAIL_TTL_SECONDS,
@@ -359,6 +361,193 @@ test("warm run (everything already cached): ready:true, fetched===total, recs po
   assert.equal(typeof body.recs[0].batteryFriendly, "boolean");
   assert.deepEqual(body.recs[0].deck, { deck: 3, os: 3, frame: 0 });
   assert.equal(steamSpyCalls, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Dismissal exclusion (Increment 8) — excluded before the candidate pool is
+// even built, so a dismissed appid's tags are never fetched at all (not just
+// hidden from the final `recs` array).
+// ---------------------------------------------------------------------------
+
+test("a dismissed candidate is excluded from /api/recs and never triggers a SteamSpy fetch for its tags", async () => {
+  let steamSpyCallsForDismissed = 0;
+  globalThis.fetch = async (url) => {
+    const u = new URL(url);
+    if (u.pathname === "/api.php" && u.searchParams.get("appid") === "999") {
+      steamSpyCallsForDismissed++;
+    }
+    return jsonResponse(goodSpyRaw());
+  };
+  const cache = makeMockCache();
+  globalThis.caches = { default: cache };
+
+  const env = makeEnv();
+  const ownedAppid = 1;
+  const keptAppid = 100;
+  const dismissedAppid = 999;
+  primeLibrary(cache, env, [
+    ownedGame({ appid: ownedAppid, name: "Slay the Spire", playtime_forever: 10800 }),
+    ownedGame({ appid: 2, name: "Barely Played", playtime_forever: 1 }),
+  ]);
+  primeDeals(cache, 60, [
+    deal({ itadId: "itad-keep", appid: keptAppid, title: "Kept Deal" }),
+    deal({ itadId: "itad-dismissed", appid: dismissedAppid, title: "Dismissed Deal" }),
+  ]);
+
+  env.TAG_CACHE.store.set(v2Key(ownedAppid), JSON.stringify(goodSpyEntry({ tags: { Roguelike: 100 } })));
+  env.TAG_CACHE.store.set(v2Key(2), JSON.stringify(goodSpyEntry({ tags: { Simulation: 50 } })));
+  env.TAG_CACHE.store.set(v2Key(keptAppid), JSON.stringify(goodSpyEntry({ tags: { Roguelike: 80 } })));
+  env.TAG_CACHE.store.set(`deck:${keptAppid}`, JSON.stringify({ deck: 3, os: 3, frame: 0 }));
+
+  const fpmDb = makeMockD1();
+  await ensureDismissalsSchema({ FPM_DB: fpmDb });
+  await addDismissal({ FPM_DB: fpmDb }, dismissedAppid, "Dismissed Deal");
+  env.FPM_DB = fpmDb;
+
+  const ctx = makeCtx();
+  const res = await worker.fetch(new Request("https://x/api/recs"), env, ctx);
+  await ctx.flush();
+  const body = await res.json();
+
+  assert.equal(body.recs.length, 1);
+  assert.equal(body.recs[0].appid, keptAppid);
+  // total counts the appids actually needed for the pool — the dismissed
+  // appid was excluded before that set was built, so it's not counted here
+  // and never got a SteamSpy fetch.
+  assert.equal(body.total, 3); // 2 owned + 1 (not 2) deal candidate
+  assert.equal(steamSpyCallsForDismissed, 0);
+});
+
+test("dismissal slot-freeing (rank promotion): dismissing the top-ranked rec promotes the runner-up into recs[0]", async () => {
+  // src/score.js has no top-N slice on `recs` — every qualifying candidate
+  // is returned, so the strongest server-side proof of "a dismissed row
+  // doesn't count toward caps" available here is RANK promotion: with the
+  // #1 pick dismissed, the #2 pick must move into position 0, not just
+  // "the list is one shorter." A future regression that filtered dismissals
+  // out of the final array AFTER scoring (rather than before pool-building)
+  // would still pass a bare "is X excluded" test but would still leak X's
+  // influence into IDF weighting — this test's sibling above already
+  // catches that via steamSpyCallsForDismissed===0; this one catches a
+  // reordering/promotion regression specifically.
+  const cache = makeMockCache();
+  globalThis.caches = { default: cache };
+  const env = makeEnv();
+
+  primeLibrary(cache, env, [ownedGame({ appid: 1, name: "Owned", playtime_forever: 6000 })]);
+
+  const topAppid = 300;
+  const runnerUpAppid = 301;
+  // Identical tags (so identical similarity) and identical reviews (so
+  // identical quality) — the ONLY thing separating their rankScore
+  // (src/score.js: similarity x quality x historicalLowBonus) is the
+  // historical-low bonus, deterministically making topAppid rank #1.
+  primeDeals(cache, 60, [
+    deal({ itadId: "itad-top", appid: topAppid, title: "Top Pick", atHistoricalLow: true }),
+    deal({ itadId: "itad-runner-up", appid: runnerUpAppid, title: "Runner Up", atHistoricalLow: false }),
+  ]);
+
+  env.TAG_CACHE.store.set(v2Key(1), JSON.stringify(goodSpyEntry({ tags: { Roguelike: 100 } })));
+  env.TAG_CACHE.store.set(v2Key(topAppid), JSON.stringify(goodSpyEntry({ tags: { Roguelike: 100 } })));
+  env.TAG_CACHE.store.set(v2Key(runnerUpAppid), JSON.stringify(goodSpyEntry({ tags: { Roguelike: 100 } })));
+
+  globalThis.fetch = async () => {
+    throw new Error("everything above is pre-cached — no network call expected");
+  };
+
+  const fpmDb = makeMockD1();
+  await ensureDismissalsSchema({ FPM_DB: fpmDb });
+  env.FPM_DB = fpmDb;
+
+  const ctx = makeCtx();
+
+  const before = await worker.fetch(new Request("https://x/api/recs"), env, ctx);
+  const beforeBody = await before.json();
+  assert.equal(beforeBody.recs.length, 2);
+  assert.equal(beforeBody.recs[0].appid, topAppid, "baseline: the historical-low pick ranks #1");
+  assert.equal(beforeBody.recs[1].appid, runnerUpAppid);
+
+  await addDismissal({ FPM_DB: fpmDb }, topAppid, "Top Pick");
+
+  const after = await worker.fetch(new Request("https://x/api/recs"), env, ctx);
+  const afterBody = await after.json();
+  assert.equal(afterBody.recs.length, 1, "the dismissed row is gone, not just re-ranked");
+  assert.equal(afterBody.recs[0].appid, runnerUpAppid, "promoted: the runner-up now occupies recs[0]");
+});
+
+// ---------------------------------------------------------------------------
+// Recency window (Increment 8) — the PRD-promised user setting, now
+// surfaced in the settings panel and persisted server-side. This is the
+// spec's falsifiable claim: changing ?windowMonths= must actually re-score
+// Recs, not silently serve a stale profile. The underlying mechanism (a
+// fresh buildProfile() computed per request, keyed on the query param) isn't
+// new to this increment, but nothing previously proved it end to end — this
+// closes that gap.
+// ---------------------------------------------------------------------------
+
+test("windowMonths changes the taste profile and provably re-scores Recs (same fixture, two windows, different top rec)", async () => {
+  const cache = makeMockCache();
+  globalThis.caches = { default: cache };
+  const env = makeEnv();
+
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const monthsAgoSeconds = (months) => nowSeconds - Math.round(months * 30.44 * 24 * 60 * 60);
+
+  // Owned game A: 50h, played 24 months ago, tagged Roguelike. Its recency
+  // multiplier (public/weight.js's recencyMultiplier) depends on the
+  // window: windowMonths=6 -> 24mo is beyond 2x the window -> the floor
+  // multiplier (0.5); windowMonths=16 -> 24mo falls within 2x the window ->
+  // multiplier 1. That's a real, verified (see build note) 2x swing in A's
+  // weight between the two windows.
+  //
+  // Owned game B: 200h, NEVER played (recencyMultiplier is always its own
+  // floor, 0.5, regardless of window) tagged Simulation — a weight that's
+  // constant across both windows, deliberately set (via higher hours) to
+  // sit BETWEEN A's two possible weights: above A's floor-multiplier
+  // weight, below A's mult-1 weight. Verified with public/weight.js's real
+  // weight() directly: window=6 -> weightA≈2.84 < weightB≈3.83 (B wins);
+  // window=16 -> weightA≈5.67 > weightB≈3.83 (A wins) — a genuine flip.
+  const ownedA = ownedGame({ appid: 10, name: "Roguelike Owned", playtime_forever: 50 * 60, rtime_last_played: monthsAgoSeconds(24) });
+  const ownedB = ownedGame({ appid: 11, name: "Simulation Owned", playtime_forever: 200 * 60, rtime_last_played: 0 });
+
+  primeLibrary(cache, env, [ownedA, ownedB]);
+
+  const rogueDeal = deal({ itadId: "itad-rogue", appid: 200, title: "Roguelike Deal" });
+  const simDeal = deal({ itadId: "itad-sim", appid: 201, title: "Simulation Deal" });
+  primeDeals(cache, 60, [rogueDeal, simDeal]);
+
+  // median: 0 on the two OWNED entries forces src/profile.js's playtimeNorm
+  // into its log2(1+hours) fallback branch (no SteamSpy median available) —
+  // the same formula public/weight.js's weight() uses, which is what the
+  // build note's numbers above were computed against. (median is irrelevant
+  // for the two candidate/deal entries below — it only feeds owned-game
+  // weighting, not cosine similarity.)
+  env.TAG_CACHE.store.set(v2Key(10), JSON.stringify(goodSpyEntry({ tags: { Roguelike: 100 }, median: 0 })));
+  env.TAG_CACHE.store.set(v2Key(11), JSON.stringify(goodSpyEntry({ tags: { Simulation: 100 }, median: 0 })));
+  env.TAG_CACHE.store.set(v2Key(200), JSON.stringify(goodSpyEntry({ tags: { Roguelike: 100 } })));
+  env.TAG_CACHE.store.set(v2Key(201), JSON.stringify(goodSpyEntry({ tags: { Simulation: 100 } })));
+
+  globalThis.fetch = async () => {
+    throw new Error("everything above is pre-cached — no network call expected");
+  };
+
+  const ctx = makeCtx();
+
+  const shortWindowRes = await worker.fetch(new Request("https://x/api/recs?windowMonths=6"), env, ctx);
+  const shortWindowBody = await shortWindowRes.json();
+
+  const longWindowRes = await worker.fetch(new Request("https://x/api/recs?windowMonths=16"), env, ctx);
+  const longWindowBody = await longWindowRes.json();
+
+  assert.equal(shortWindowBody.recs.length, 2);
+  assert.equal(longWindowBody.recs.length, 2);
+
+  // Short window: A is recency-demoted to its floor multiplier, B (never
+  // played, hours-heavier) dominates the profile -> Simulation deal wins.
+  // Long window: A's multiplier recovers and now outweighs B -> the profile
+  // flips toward Roguelike -> the Roguelike deal takes #1 instead. A
+  // provably different top rec across the two windows, same input data.
+  assert.equal(shortWindowBody.recs[0].appid, 201, "short window: profile tilts toward the hours-heavy, never-demoted (Simulation) owned game");
+  assert.equal(longWindowBody.recs[0].appid, 200, "long window: A's recency multiplier recovers and the profile flips toward Roguelike");
 });
 
 test("partial cache (~40% of tags cached): recs computed from what's cached, response doesn't crash, pendingCount/excludedCount split correctly", async () => {

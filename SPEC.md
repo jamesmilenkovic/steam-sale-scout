@@ -1,140 +1,130 @@
-# Increment 7.8 — FPM catalog hygiene: app-type classification + sync resilience
+# Increment 8 — Settings + dismissals (+ sync auto-continue)
 
-**Project:** Steam Sale Scout · **Phase 2, slice 3.8** (the contamination finding, James 2026-07-18)
+**Project:** Steam Sale Scout · **Phase 2, final slice — the "daily-drivable" gate**
 **PRD:** `PRDs/2-in-progress/2026-07-04-steam-sale-recommender.md`
-**Base:** `main` @ inc-7.7 (`b3e6c4e`) · **Status:** Build-ready (scoped 2026-07-18)
+**Base:** `main` @ inc-7.8 (`7f993ee`) · **Status:** Build-ready (scoped 2026-07-21)
 
 ## Why
 
-James, watching the 7.7 catalog fill live: free promotional demos/prologues
-and DLC rank in the FPM lane as if they were real games, skewing the
-leaderboard ("we are including DLCs and free games… they are skewing the
-data"). Confirmed real (7.7 result §7): `Stoneshard: Prologue`,
-`The Riftbreaker: Prologue`, `Contraband Police: Prologue` and more — short
-(1–4h), decently reviewed by small enthusiast audiences, indistinguishable
-from real short games by anything the catalog tracks (reviews / Wilson /
-owners). Exactly the shape a fun-per-hour formula over-rewards.
+Slipped twice (for 7.7 and 7.8) and deliberately so: this increment persists
+the lane's *final* shape, which didn't exist until the catalog was complete,
+clean, and the formula locked (`sqrt`, 2026-07-21). Today every session
+starts from scratch — filters reset on reload, there's no way to say "never
+show me this game again," and the multi-run catalog fill needs manual
+babysitting (friction felt twice in 7.8: QA mistook idle-because-nobody-
+retriggered for a stall, and the operator hand-drove ~10 batches). Phase 2's
+end gate is "daily-drivable"; this is the slice that makes it daily.
 
-No in-pipeline source classifies app type (§7's live investigation):
-SteamSpy bulk has no type field; `GetItems` returns `type: 0` for a
-confirmed demo and ELDEN RING alike, and its `unlisted` flag is
-inconsistent; title heuristics false-positive on real games
-(`Half-Life: Opposing Force`, `The Binding of Isaac: Rebirth`). The one
-reliable classifier is storefront `appdetails`
-(`type: "game"|"dlc"|"demo"|"advertising"|…`, PRD data source #5) —
-per-appid only, ~200 req/5min → a ~7.5h one-time backfill for ~18.3k rows.
-Same problem shape as HLTB matching: slow, per-item, rate-limited, cached
-forever, never redone. 7.7 just built the pattern (D1-persisted resumable
-batches); 7.8 applies it a second time.
+**Scoping decisions (PO, 2026-07-21):**
 
-Also in scope: the sync-resilience QA advisories from the 7.7 result —
-sequential `resolveHltbBatch` means one stuck lookup (up to 300s give-up,
-never recorded) can silently zero an entire 3,000-row sync run, and the
-queue's cache-hit/give-up counters aren't surfaced anywhere. With the fill
-only ~26% done, the remaining runs deserve both fixes.
-
-**Scoping decisions (PO, 2026-07-18):**
-
-1. **Exclude-until-classified.** Unclassified rows do NOT appear in the
-   lane. Include-by-default is the exact bug being fixed — a deliberate
-   exception to the app's fail-soft "unknown ≠ excluded" convention, which
-   stands everywhere else (Deck/battery/tags).
-2. **Classify matched rows first.** Priority = already-HLTB-matched rows
-   (the only displayable ones — restores the visible leaderboard in ~2h at
-   ~200 req/5min for the current ~4,700), then rows in the existing HLTB
-   queue priority order (owned + on-sale, then owners desc), so
-   classification stays ahead of matching from then on.
-3. **Non-games never reach HLTB.** `type != "game"` rows are excluded from
-   the lane AND from the HLTB queue — demos/DLC currently burn HLTB budget
-   for nothing. New HLTB enqueues gate on classified `type = "game"`; a
-   queued row that classifies non-game leaves the queue.
-4. **Formula lock moves here (4th carry, deliberate).** An eye test against
-   a contaminated leaderboard would lock against skewed data. 7.8
-   acceptance = the first attempt with a reference set that is both
-   complete and clean.
+1. **D1 is the single persistence story** — `settings` (KV table) +
+   `dismissals` table, both in the existing `FPM_DB` database. No
+   localStorage split-brain; the app's state lives where its catalog lives.
+   Thin endpoints (`GET/PUT /api/settings`, `POST/DELETE` dismissals) —
+   single-user, local-only, no auth.
+2. **Dismissals are app-wide across sale lanes** — Deals, Recs, Best-of,
+   FPM — applied **server-side** (excluded before caps/filters, so a
+   dismissal actually frees a slot). **Library and Wishlist exempt**: one
+   is a factual record, the other is James's own curated list.
+3. **Un-dismiss exists from day one** — a "Dismissed (N)" view with per-row
+   restore. No permanent deletes; data is data.
+4. **Persisted settings** = per-tab filter-bar state (every control, incl.
+   FPM owned tri-state / on-sale-only / formula-picker choice), auto-saved
+   on change, restored on load — plus the **recency window** (the
+   PRD-promised user setting, default 12 months) surfaced in a small
+   settings panel and actually re-scoring Recs on change. A restored
+   formula-picker choice is a lens, not the default — `FPM_FORMULA` stays
+   `sqrt` in code.
+5. **Ride-along A — sync auto-continue:** one trigger walks classification
+   + HLTB batches until pending = 0 (bounded loop, stoppable, existing
+   pacing/backoff/give-up machinery untouched). NOT cron — still manually
+   started, still local-only; it just doesn't need re-poking every ~9
+   minutes.
+6. **Ride-along B — Recs min-discount:** James hit "filter appears not to
+   work" live during the 7.8 eye test. Investigate root cause FIRST; the
+   likely candidate is 5.5's fixed sourcing floor 60 (the bar can only
+   tighten above it — sub-60 values are no-ops *by design*). If that's it,
+   the fix is UI honesty (annotate/disable sub-floor values), not engine
+   changes. If it's a real regression, fix it. Root cause goes in the
+   save-down either way.
 
 ## Build
 
-### 1. Probe first (house rule)
+### 1. D1 schema + endpoints
 
-`appdetails` live shape before writing the adapter: confirm the `type`
-value set; whether `filters=` can slim the payload while keeping `type`;
-whether `cc=au` changes anything relevant here; per-appid-only (assumed);
-and the real rate-limit behavior (~200 req/5min per the PRD's existing
-note — verify how throttling actually presents). 7.7's SteamSpy lesson
-applies: throttles may arrive as HTTP 200 with a non-JSON body — detect by
-body shape, not status code. Raw samples to `scratchpad/`.
+- `settings` (`key` TEXT PK, `value` TEXT/JSON, `updated_at`) and
+  `dismissals` (`appid` INTEGER PK, `name` TEXT snapshot, `dismissed_at`)
+  via the existing `CREATE TABLE IF NOT EXISTS` init path.
+- `GET /api/settings` / `PUT /api/settings` (whole-blob vs per-key —
+  Coder's call); `POST /api/dismissals` / `DELETE /api/dismissals/:appid` /
+  `GET /api/dismissals`. Fail-soft: settings endpoints erroring must never
+  break lane rendering (defaults apply, 7.5 discipline — never a 500 from a
+  bad value).
 
-### 2. D1 schema + classification job
+### 2. Dismissals in the lanes
 
-- `fpm_catalog` gains `app_type` (TEXT, NULL until classified) +
-  `type_checked_at`.
-- Classification runs as a step of `/api/fpm/sync` (or a sibling step —
-  Coder's call): pick unclassified rows in the priority order above,
-  classify via `appdetails`, batched per run (`FPM_TYPE_BATCH`, config;
-  suggest ~500/run ≈ 12–13 min at pace — set from the probe's real
-  numbers), gentle pacing, resumable by construction: classified rows never
-  re-fetch (a type never changes — no TTL refetch, ever). Failed/missing
-  responses → retry after `FPM_TYPE_TTL_DAYS = 30` (same convention as
-  unmatched HLTB rows).
-- `GET /api/fpm/sync/status` extends with classified / non-game counts; the
-  FPM tab status line becomes honest about both fills (e.g. "ranked X of Y
-  qualifying games · Z awaiting classification" — exact wording Coder's
-  call; both numbers visible whenever either fill is incomplete).
+- Server-side exclusion in the Deals/Recs/Best-of/FPM handlers — join once,
+  before caps, so dismissed rows free slots. Library/Wishlist untouched.
+- Row UI: an unobtrusive ✕ ("Not interested") on every sale-lane row;
+  optimistic client removal + POST.
+- "Dismissed (N)" management view (collapsible list or tab — Coder's call)
+  with per-row restore.
 
-### 3. Lane + queue gating
+### 3. Settings persistence
 
-- `handleFpm` serves only `app_type = 'game'` rows (matched +
-  floor-passing, as now). Already-matched non-game rows stay in D1 (data is
-  data) but never render.
-- HLTB enqueue gates on `app_type = 'game'`: unclassified and non-game rows
-  are skipped, freeing HLTB budget for real games.
+- Per-tab filter-bar state auto-saved (debounced) + restored on load.
+- Settings panel: recency window (months, default 12) wired into the
+  existing recency decay. Changing it must actually take effect — probe
+  what the profile/scoring cache keys on and invalidate accordingly; a
+  window change that silently serves stale scores is a fail.
 
-### 4. Sync resilience (7.7 QA advisories 2 + 3)
+### 4. Sync auto-continue (ride-along A)
 
-- **Per-item skip-ahead in `resolveHltbBatch`:** one stuck lookup must not
-  block the rest of its batch — per-item timeout, and the give-up is
-  recorded (`hltb_checked_at` set, existing `match_method` convention) so
-  it retries on the normal `FPM_HLTB_TTL_DAYS` cycle instead of silently
-  re-blocking every future run.
-- **Surface the queue counters:** `cacheHits` / `resolved` / `gaveUp` per
-  batch — dev-log line and/or sync-status fields (Coder's call) — so a
-  stalled vs healthy run is visible without spelunking scratchpad logs.
+- `POST /api/fpm/sync?continue=1` (or equivalent): loop batches until
+  classification AND HLTB pending both reach 0, honoring all existing
+  pacing/backoff; hard safety bound on loop count; a stop control
+  (endpoint flag or running-state toggle). Frontend: "Sync to completion"
+  button + stop. Status endpoint already shows progress — no new polling
+  semantics (the 7.6 lesson stands: polls stop at idle).
+
+### 5. Recs min-discount (ride-along B)
+
+- Investigate → root cause in the save-down → fix per finding (UI honesty
+  vs real bug). No engine/sourcing changes without flagging at the diff
+  gate.
 
 ## Out of scope
 
-Server-side pagination / slim sync-tick payload for `/api/fpm` (QA advisory
-1 — loopback-cheap today; backlog, revisit only if latency bites once the
-catalog is mostly matched); settings + dismissals (inc 8 — next after
-this); formula/scoring math (the lock is a config default choice, not a
-code change); the catalog as a source for any other lane; HLTB adapter
-internals beyond the batch-loop skip; scheduled/cron sync; deploy
-(local-only stands).
+FPM price coverage beyond the top-300 price pool (2,918 unowned rows show
+no price — James's call pending, likely a dedicated ITAD batch-price
+slice); similarity sort on Recs; cron/scheduled sync; curated exclusion for
+`game`-typed prologues (accepted 7.8 gap); the `/api/fpm` pagination
+advisory; formula/scoring math (locked); deploy (local-only stands).
 
 ## Testing
 
-- Unit: lane excludes non-game AND unclassified rows; already-matched
-  non-game rows persist in D1 but never render; HLTB enqueue gating
-  (unclassified/non-game skipped; a queued row that classifies non-game
-  leaves the queue); classification batch bounds + priority order
-  (matched-first, then HLTB queue order) + resumability (classified rows
-  never re-fetch; failures retry after TTL); per-item HLTB skip (a stuck
-  item times out, successors in the same batch still process, the give-up
-  is recorded and TTL-retried); status-endpoint count fields.
-- Regression: full suite green (418 baseline).
-  Best-of/Recs/Wishlist/Library byte-identical (house method).
-- **Live proof:** (a) the named contaminants (`Stoneshard: Prologue`,
-  `The Riftbreaker: Prologue`, `Contraband Police: Prologue`) classify
-  non-game and are gone from the lane; (b) false-positive guard:
-  `Half-Life: Opposing Force` and `The Binding of Isaac: Rebirth` (plus any
-  other colon-titled real game already matched) classify `game` and remain
-  ranked; (c) classification funnel recorded: total rows → classified per
-  run → non-game count → wall time per batch → observed throttle behavior;
-  (d) restart mid-classification → resumes with zero re-classification
-  (same D1 property 7.7 proved for HLTB); (e) zero HLTB enqueues for
-  non-game/unclassified rows across a sync run; (f) a full sync run
-  completes with the per-item skip in place — no zero-progress stall — and
-  the new counters are visible; (g) deal lanes byte-identical.
-- Manual (James, localhost): **the eye test on a clean AND complete
-  leaderboard — lock `FPM_FORMULA`'s shipped default.** Pick + why go in
-  the save-down. `sqrt` remains the interim default until then.
+- Unit: settings round-trip + fail-soft defaults; dismissal exclusion per
+  lane incl. Library/Wishlist exemption AND slot-freeing (a dismissed row
+  doesn't count toward caps); restore path; per-tab filter save/restore;
+  recency-window change provably re-scores (falsifiable: same fixture, two
+  windows, different decay); auto-continue loop semantics (multi-batch
+  fixture runs to zero, stop flag halts mid-loop, safety bound trips);
+  min-discount regression test matching the found root cause.
+- Regression: full suite green (440 baseline). **With zero dismissals and
+  default settings, every lane response byte-identical to 7.8** — the house
+  isolation method; persistence must be invisible until used.
+- **Live proof:** (a) dismiss a game in FPM → gone from Deals/Recs/Best-of
+  in the same session, still gone after dev-server AND browser restart;
+  (b) un-dismiss restores it everywhere; (c) per-tab filter state survives
+  reload + restart; (d) recency-window change visibly re-scores Recs
+  (record one example movement); (e) "Sync to completion" sustains
+  unattended progress across ≥3 consecutive batches including at least one
+  throttle-pause self-recovery — running the remaining ~13.6k to zero can
+  finish outside the QA session, wall-clock recorded when it does;
+  (f) Recs min-discount root cause demonstrated live + fix verified;
+  (g) with nothing dismissed and no settings changed, lanes byte-identical
+  to 7.8.
+- Manual (James, localhost): daily-drive it — dismiss junk, set filters
+  once, come back tomorrow and it's all still there. **Accepting this
+  increment = passing the end-of-Phase-2 "daily-drivable" gate**; Phase 3
+  (LLM re-rank, digest/schedule, the deploy question) unlocks behind it.

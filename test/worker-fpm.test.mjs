@@ -41,6 +41,7 @@ import {
   __resetLastSyncStatsForTests,
   isFpmSyncRunning,
 } from "../src/catalog.js";
+import { ensureDismissalsSchema, addDismissal } from "../src/dismissals.js";
 
 const originalFetch = globalThis.fetch;
 const originalCaches = globalThis.caches;
@@ -360,6 +361,48 @@ test("happy path: a matched D1 row is scored/annotated with zero HLTB or eligibi
   assert.equal(entry.owned, false);
   assert.equal(entry.price, null);
   assert.equal(entry.cut, null);
+});
+
+test("a dismissed appid is excluded from /api/fpm even though it's a fully matched, qualifying row", async () => {
+  const cache = makeMockCache();
+  globalThis.caches = { default: cache };
+  const env = makeEnv();
+
+  await primeMatchedRow(env, { appid: 200, name: "Keep This Game", mainHours: 6.5 });
+  await primeMatchedRow(env, { appid: 201, name: "Dismissed Game", mainHours: 4.0 });
+  primeLibrary(cache, env, []);
+  primeFpmPool(cache, []);
+
+  await ensureDismissalsSchema(env);
+  await addDismissal(env, 201, "Dismissed Game");
+
+  const ctx = makeCtx();
+  const res = await worker.fetch(new Request("https://x/api/fpm"), env, ctx);
+  const body = await res.json();
+
+  assert.equal(body.matched, 2, "still counted as matched in the D1-wide stats — dismissal doesn't touch D1's own record");
+  assert.equal(body.fpm.length, 1);
+  assert.equal(body.fpm[0].appid, 200);
+});
+
+test("with no dismissals table yet (fresh D1), /api/fpm is unaffected — dismissal join fails soft to 'nothing excluded'", async () => {
+  const cache = makeMockCache();
+  globalThis.caches = { default: cache };
+  const env = makeEnv();
+
+  await primeMatchedRow(env, { appid: 200, name: "Portal 2", mainHours: 6.5 });
+  primeLibrary(cache, env, []);
+  primeFpmPool(cache, []);
+  // Deliberately never call ensureDismissalsSchema — the dismissals table
+  // doesn't exist yet, mirroring a brand-new D1 that's never had anything
+  // dismissed.
+
+  const ctx = makeCtx();
+  const res = await worker.fetch(new Request("https://x/api/fpm"), env, ctx);
+  const body = await res.json();
+
+  assert.equal(body.fpm.length, 1);
+  assert.equal(body.fpm[0].appid, 200);
 });
 
 test("a resolved match below FPM_MIN_LENGTH_HOURS is excluded silently — not counted in unmatchedCount", async () => {
@@ -791,6 +834,72 @@ test("enrichment cap (mirrors src/worker.js's private FPM_ENRICH_CAP=500, not ex
   assert.deepEqual(noTagsRow.tagNames, [], "a past-cap row with no cached tags shows empty tagNames, never triggering a new SteamSpy fetch");
 });
 
+test("dismissal slot-freeing against the real FPM_ENRICH_CAP: a row just past the cap gets promoted into the enrichment budget once the top row is dismissed", async () => {
+  const cache = makeMockCache();
+  globalThis.caches = { default: cache };
+  const env = makeEnv();
+
+  const ENRICH_CAP = 500;
+  const baseAppid = 50000;
+
+  // 501 matched rows, mainHours strictly increasing by index (identical
+  // quality via primeMatchedRow's defaults) so the fpm-score sort is
+  // deterministic: index 0 is rank 1 (best), index 500 is rank 501 — the
+  // FIRST row that falls just past FPM_ENRICH_CAP=500 and so, on a cold
+  // cache, would NOT get a new SteamSpy fetch triggered for it.
+  for (let i = 0; i <= ENRICH_CAP; i++) {
+    await primeMatchedRow(env, { appid: baseAppid + i, name: `Slot Game ${i}`, mainHours: 5 + i * 0.001 });
+  }
+  primeLibrary(cache, env, []);
+  primeFpmPool(cache, []);
+  // Cold TAG_CACHE across the board — every fetch below is a genuinely NEW
+  // one, so "did appid X get fetched this call" is unambiguous.
+
+  const fetchedAppids = new Set();
+  globalThis.fetch = async (url) => {
+    const u = new URL(url);
+    if (u.hostname === "steamspy.com" && u.searchParams.get("request") === "appdetails") {
+      const appid = Number(u.searchParams.get("appid"));
+      fetchedAppids.add(appid);
+      return jsonResponse({}); // no usable tags — irrelevant to this test, we only care WHETHER a fetch happened
+    }
+    if (u.hostname === "api.steampowered.com" && u.pathname.includes("GetItems")) {
+      const inputJson = JSON.parse(u.searchParams.get("input_json"));
+      return jsonResponse({
+        response: { store_items: inputJson.ids.map(({ appid }) => ({ appid, platforms: { steam_deck_compat_category: 0 } })) },
+      });
+    }
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  const rank501Appid = baseAppid + ENRICH_CAP; // index 500 — one past the cap at baseline
+  const ctx = makeCtx();
+
+  // Baseline: rank501Appid is past the cap, so it must NOT get a new fetch.
+  const before = await worker.fetch(new Request("https://x/api/fpm"), env, ctx);
+  await ctx.flush();
+  await before.json();
+  assert.equal(fetchedAppids.has(rank501Appid), false, "baseline: the 501st-ranked row is past FPM_ENRICH_CAP, no fetch triggered for it");
+
+  // Dismiss the #1-ranked row (appid+0) — every other row's rank shifts up
+  // by one, so what was rank 501 (rank501Appid) is now rank 500: INSIDE the
+  // enrichment cap.
+  await ensureDismissalsSchema(env);
+  await addDismissal(env, baseAppid, "Slot Game 0");
+  fetchedAppids.clear();
+
+  const after = await worker.fetch(new Request("https://x/api/fpm"), env, ctx);
+  await ctx.flush();
+  const afterBody = await after.json();
+
+  assert.equal(afterBody.fpm.length, ENRICH_CAP, "the dismissed row is gone; 500 rows remain");
+  assert.equal(
+    fetchedAppids.has(rank501Appid),
+    true,
+    "promoted: now ranked 500th (inside the cap), the same row DOES trigger a new SteamSpy fetch this time",
+  );
+});
+
 // ---------------------------------------------------------------------------
 // POST /api/fpm/sync + GET /api/fpm/sync/status.
 // ---------------------------------------------------------------------------
@@ -934,6 +1043,99 @@ test("a second POST /api/fpm/sync while one is already running reports alreadyRu
 
   resolveBlocker();
   await ctx.flush();
+});
+
+// ---------------------------------------------------------------------------
+// Sync auto-continue (Increment 8, ride-along A) — POST /api/fpm/sync?continue=1
+// and POST /api/fpm/sync/stop, exercised end to end through the route. The
+// loop mechanics themselves (multi-iteration completion, safety bound,
+// mid-loop stop) are covered in test/catalog.test.mjs; this just confirms
+// the HTTP wiring — query-param dispatch, fail-soft with no FPM_DB, and the
+// GET /api/fpm/sync/status `autoContinue` flag.
+// ---------------------------------------------------------------------------
+
+test("POST /api/fpm/sync?continue=1 starts an auto-continue run, and status reports autoContinue:true while it's in flight", async () => {
+  const cache = makeMockCache();
+  globalThis.caches = { default: cache };
+  const env = makeEnv();
+  primeLibrary(cache, env, []);
+
+  let resolveBlocker;
+  const blocker = new Promise((r) => {
+    resolveBlocker = r;
+  });
+  globalThis.fetch = async (url) => {
+    const u = new URL(url);
+    if (u.hostname === "steamspy.com") {
+      await blocker;
+      return new Response(JSON.stringify({}), { status: 200 }); // empty page -> immediate end of crawl
+    }
+    if (u.pathname === "/deals/v2") return jsonResponse({ list: [], hasMore: false });
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  const ctx = makeCtx();
+  const startRes = await worker.fetch(new Request("https://x/api/fpm/sync?continue=1", { method: "POST" }), env, ctx);
+  assert.deepEqual(await startRes.json(), { started: true });
+
+  const statusRes = await worker.fetch(new Request("https://x/api/fpm/sync/status"), env, ctx);
+  const statusBody = await statusRes.json();
+  assert.equal(statusBody.running, true);
+  assert.equal(statusBody.autoContinue, true);
+
+  resolveBlocker();
+  await ctx.flush();
+
+  const finalStatusRes = await worker.fetch(new Request("https://x/api/fpm/sync/status"), env, ctx);
+  const finalStatusBody = await finalStatusRes.json();
+  assert.equal(finalStatusBody.running, false);
+  assert.equal(finalStatusBody.autoContinue, false);
+});
+
+test("a plain POST /api/fpm/sync (no ?continue=1) is a single batch — status reports autoContinue:false while it runs", async () => {
+  const cache = makeMockCache();
+  globalThis.caches = { default: cache };
+  const env = makeEnv();
+  primeLibrary(cache, env, []);
+
+  let resolveBlocker;
+  const blocker = new Promise((r) => {
+    resolveBlocker = r;
+  });
+  globalThis.fetch = async (url) => {
+    const u = new URL(url);
+    if (u.hostname === "steamspy.com") {
+      await blocker;
+      return new Response(JSON.stringify({}), { status: 200 });
+    }
+    if (u.pathname === "/deals/v2") return jsonResponse({ list: [], hasMore: false });
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  const ctx = makeCtx();
+  await worker.fetch(new Request("https://x/api/fpm/sync", { method: "POST" }), env, ctx);
+  const statusRes = await worker.fetch(new Request("https://x/api/fpm/sync/status"), env, ctx);
+  const statusBody = await statusRes.json();
+  assert.equal(statusBody.running, true);
+  assert.equal(statusBody.autoContinue, false);
+
+  resolveBlocker();
+  await ctx.flush();
+});
+
+test("POST /api/fpm/sync/stop with no FPM_DB binding -> 200 {stopping:false, notice:...}, never a 500", async () => {
+  const env = makeEnv({ FPM_DB: undefined });
+  const res = await worker.fetch(new Request("https://x/api/fpm/sync/stop", { method: "POST" }), env, makeCtx());
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.stopping, false);
+});
+
+test("POST /api/fpm/sync/stop with FPM_DB configured but nothing running -> 200 {stopping:true}, not an error", async () => {
+  const env = makeEnv();
+  const res = await worker.fetch(new Request("https://x/api/fpm/sync/stop", { method: "POST" }), env, makeCtx());
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), { stopping: true });
 });
 
 test("sync is resumable: re-running after a partial fill only enqueues rows still NULL", async () => {
