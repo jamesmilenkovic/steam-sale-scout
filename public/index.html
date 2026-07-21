@@ -194,15 +194,15 @@
     </label>
     <label>
       Min reviews <span class="filter-hint">(Recs + Best-of only)</span>:
-      <input type="number" id="filter-min-reviews" min="0" step="1" placeholder="default" />
+      <input type="number" id="filter-min-reviews" min="0" step="1" placeholder="default: 50" />
     </label>
     <label>
       Min quality (%) <span class="filter-hint">(Recs + Best-of only)</span>:
-      <input type="number" id="filter-min-quality" min="0" max="100" step="1" placeholder="default" />
+      <input type="number" id="filter-min-quality" min="0" max="100" step="1" placeholder="default: 70" />
     </label>
     <label>
       Min owners <span class="filter-hint">(Recs + Best-of only)</span>:
-      <input type="number" id="filter-min-owners" min="0" step="1" placeholder="default" />
+      <input type="number" id="filter-min-owners" min="0" step="1" placeholder="default: 5000" />
     </label>
   </div>
   <div class="filter-row">
@@ -1649,7 +1649,13 @@
 
   /** Honest "ranked X of Y qualifying games" line (SPEC.md §3) — driven by
    * GET /api/fpm/sync/status's D1-wide counts, independent of whatever
-   * filters happen to be narrowing the visible table right now. */
+   * filters happen to be narrowing the visible table right now.
+   *
+   * Increment 7.8: app-type classification is a second, separate fill
+   * (matched rows can be fully HLTB-resolved yet still be hidden from the
+   * lane if unclassified) — the line now also names how many rows are still
+   * awaiting classification whenever that fill isn't complete, so the
+   * status line stays honest about BOTH backfills, not just the HLTB one. */
   function renderFpmSyncStatus(status) {
     if (!status) {
       fpmSyncStatusEl.textContent = "";
@@ -1662,8 +1668,10 @@
       return;
     }
     const pendingNote = status.pending > 0 ? ` (${status.pending} pending)` : "";
+    const unclassified = Math.max((status.total ?? 0) - (status.classified ?? 0), 0);
+    const classificationNote = unclassified > 0 ? ` · ${unclassified} awaiting classification` : "";
     const runningNote = status.running ? " — sync running…" : "";
-    fpmSyncStatusEl.textContent = `Ranked ${status.matched} of ${status.total} qualifying games${pendingNote}${runningNote}`;
+    fpmSyncStatusEl.textContent = `Ranked ${status.matched} of ${status.total} qualifying games${pendingNote}${classificationNote}${runningNote}`;
   }
 
   function stopFpmSyncPoll() {

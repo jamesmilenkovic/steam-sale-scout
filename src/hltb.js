@@ -428,6 +428,12 @@ export function matchHltbEntry(candidateTitle, parsedEntries, threshold = FPM_MA
  * the default) and `'log'` (q^k / log2(h + 1)) both taper off how hard
  * length punishes a long, excellent game, per James's Increment 7.5 review
  * (pure linear made ultra-short games dominate on brevity alone).
+ *
+ * LOCKED (Increment 7.8, 2026-07-21): James's eye test on the first clean
+ * AND complete leaderboard (post app-type classification) confirmed 'sqrt' —
+ * carried as the interim default since 7.5, now the shipped choice, not
+ * provisional. `?formula=` overrides remain for live A/B, but this is the
+ * value the app ships with.
  * @type {'linear'|'sqrt'|'log'}
  */
 export const FPM_FORMULA = "sqrt";

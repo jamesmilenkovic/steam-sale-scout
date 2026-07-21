@@ -60,6 +60,7 @@ import {
   selectMatchedCatalogRows,
   startFpmSync,
   isFpmSyncRunning,
+  getLastSyncStats,
 } from "./catalog.js";
 
 const STEAM_API_URL =
@@ -1480,6 +1481,14 @@ async function handleWishlist(request, env, ctx) {
 // aren't yet cached show as "unknown" (no badge/tags) rather than being
 // excluded — same fail-soft convention every other lane already uses for a
 // cold cache.
+//
+// APP-TYPE GATING (Increment 7.8, deliberate exception to the cold-cache
+// fail-soft convention above): src/catalog.js's selectMatchedCatalogRows now
+// gates on app_type = 'game' — an unclassified or non-game row is EXCLUDED
+// from this lane, not shown as "unknown". This is the fix for demos/DLC
+// (e.g. free promotional prologues) skewing the leaderboard; PO's explicit
+// "exclude-until-classified" scoping decision (probe-findings-7.8.md). The
+// row still exists in D1 either way — nothing is ever deleted, only hidden.
 // ---------------------------------------------------------------------------
 
 /** Cache key for FPM's deal-side price/cut lookup pool — entirely separate
@@ -1803,7 +1812,17 @@ async function handleFpmSync(request, env, ctx) {
 async function handleFpmSyncStatus(request, env, ctx) {
   if (!env.FPM_DB) {
     return new Response(
-      JSON.stringify({ total: 0, matched: 0, unmatched: 0, pending: 0, running: false, dbReady: false }),
+      JSON.stringify({
+        total: 0,
+        matched: 0,
+        unmatched: 0,
+        pending: 0,
+        classified: 0,
+        nonGame: 0,
+        running: false,
+        dbReady: false,
+        lastRun: null,
+      }),
       { status: 200, headers: { "content-type": "application/json" } },
     );
   }
@@ -1811,7 +1830,11 @@ async function handleFpmSyncStatus(request, env, ctx) {
   await ensureCatalogSchema(env);
   const stats = await getCatalogStats(env);
   return new Response(
-    JSON.stringify({ ...stats, running: isFpmSyncRunning(), dbReady: true }),
+    // classified/nonGame (Increment 7.8) come straight through from stats;
+    // lastRun surfaces the most recent sync run's HLTB/type-classification
+    // funnel counters (cacheHits/resolved/gaveUp, classified/nonGame/
+    // attempted) — null until the first sync run completes.
+    JSON.stringify({ ...stats, running: isFpmSyncRunning(), dbReady: true, lastRun: getLastSyncStats() }),
     { status: 200, headers: { "content-type": "application/json" } },
   );
 }

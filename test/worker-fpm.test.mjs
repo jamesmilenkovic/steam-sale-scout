@@ -25,15 +25,20 @@ import {
   ensureCatalogSchema,
   upsertCatalogRows,
   recordHltbResult,
+  recordAppType,
   markOwned,
   markDeal,
   catalogRowFromBulk,
   __setCatalogPacingMsForTests,
   __setCatalogBackoffMsForTests,
   __resetCatalogPacingForTests,
+  __setTypePacingMsForTests,
+  __setTypeBackoffMsForTests,
+  __resetTypePacingForTests,
   __setHltbPollingForTests,
   __resetHltbPollingForTests,
   __resetFpmSyncStateForTests,
+  __resetLastSyncStatsForTests,
   isFpmSyncRunning,
 } from "../src/catalog.js";
 
@@ -177,13 +182,30 @@ function deal(overrides = {}) {
 
 /** Prime a matched (main_hours set), floor-passing catalog row directly via
  * src/catalog.js's own CRUD — the fast path for GET /api/fpm tests, which
- * shouldn't need to exercise the whole sync pipeline. */
-async function primeMatchedRow(env, { appid, name, positive = 96000, negative = 4000, owners = 750000, mainHours = 6.5, matchMethod = "name" }) {
+ * shouldn't need to exercise the whole sync pipeline. Increment 7.8:
+ * defaults appType to 'game' so every existing test that primes a row and
+ * expects it to render in the lane keeps working unchanged — pass
+ * appType: null / 'demo' / etc explicitly to exercise the gating itself. */
+async function primeMatchedRow(env, { appid, name, positive = 96000, negative = 4000, owners = 750000, mainHours = 6.5, matchMethod = "name", appType = "game" }) {
   await ensureCatalogSchema(env);
   await upsertCatalogRows(env, [{ appid, name, owners, positive, negative, wilson: undefined }].map((r) => ({
     ...catalogRowFromBulk({ appid: r.appid, name: r.name, positive: r.positive, negative: r.negative, owners: `${r.owners} .. ${r.owners}` }),
   })), 1000);
   await recordHltbResult(env, appid, { mainHours, matchMethod, checkedAtMs: 2000 });
+  if (appType !== undefined) {
+    await recordAppType(env, appid, { appType, checkedAtMs: 3000 });
+  }
+}
+
+/** Fetch-mock branch for storefront appdetails — Increment 7.8's
+ * classification step now runs as part of every sync pipeline run, so any
+ * test driving POST /api/fpm/sync end to end needs to answer this endpoint
+ * too (unless every row involved is already pre-classified). */
+function appdetailsBranch(url, type = "game") {
+  const u = new URL(url);
+  if (u.hostname !== "store.steampowered.com" || u.pathname !== "/api/appdetails") return null;
+  const appid = u.searchParams.get("appids");
+  return jsonResponse({ [appid]: { success: true, data: { type, name: "x" } } });
 }
 
 test.beforeEach(() => {
@@ -193,8 +215,11 @@ test.beforeEach(() => {
   __resetHltbQueueForTests();
   __setCatalogPacingMsForTests(0);
   __setCatalogBackoffMsForTests(0, 0);
+  __setTypePacingMsForTests(0);
+  __setTypeBackoffMsForTests(0, 0);
   __setHltbPollingForTests(0, 50);
   __resetFpmSyncStateForTests();
+  __resetLastSyncStatsForTests();
 });
 
 test.afterEach(() => {
@@ -202,6 +227,7 @@ test.afterEach(() => {
   __setSpyMinIntervalMsForTests(1000);
   __setHltbMinIntervalMsForTests(1000);
   __resetCatalogPacingForTests();
+  __resetTypePacingForTests();
   __resetHltbPollingForTests();
 });
 
@@ -388,6 +414,72 @@ test("an unmatched (match_method='none') row is counted in unmatchedCount, not s
   assert.equal(body.unmatchedCount, 1);
   assert.equal(body.ready, false);
   assert.equal(body.fpm.length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/fpm — app-type gating (Increment 7.8): unclassified and non-game
+// rows are excluded from the lane even though HLTB-matched; they stay in D1
+// (never deleted), just never render.
+// ---------------------------------------------------------------------------
+
+test("an unclassified (app_type NULL) matched row is excluded from the lane — 'unknown' means excluded here, not shown", async () => {
+  const cache = makeMockCache();
+  globalThis.caches = { default: cache };
+  const env = makeEnv();
+
+  await primeMatchedRow(env, { appid: 200, name: "Never Classified", appType: null });
+  primeLibrary(cache, env, []);
+  primeFpmPool(cache, []);
+  globalThis.fetch = stubGetItemsFetch();
+
+  const ctx = makeCtx();
+  const res = await worker.fetch(new Request("https://x/api/fpm"), env, ctx);
+  const body = await res.json();
+
+  assert.equal(body.matched, 1, "still counted as HLTB-matched in the D1-wide stats");
+  assert.equal(body.fpm.length, 0, "but never shown while unclassified");
+
+  const row = await env.FPM_DB.prepare("SELECT appid FROM fpm_catalog WHERE appid = 200").first();
+  assert.ok(row, "the row must still exist in D1 — nothing is ever deleted");
+});
+
+test("a matched row classified 'demo' is excluded from the lane and stays in D1", async () => {
+  const cache = makeMockCache();
+  globalThis.caches = { default: cache };
+  const env = makeEnv();
+
+  await primeMatchedRow(env, { appid: 1396240, name: "Contraband Police: Prologue", appType: "demo" });
+  primeLibrary(cache, env, []);
+  primeFpmPool(cache, []);
+  globalThis.fetch = stubGetItemsFetch();
+
+  const ctx = makeCtx();
+  const res = await worker.fetch(new Request("https://x/api/fpm"), env, ctx);
+  const body = await res.json();
+
+  assert.equal(body.fpm.length, 0, "a classified non-game row must never render, even though it's HLTB-matched");
+
+  const row = await env.FPM_DB.prepare("SELECT app_type FROM fpm_catalog WHERE appid = 1396240").first();
+  assert.equal(row.app_type, "demo", "the classification persists in D1 — data is data, only rendering is gated");
+});
+
+test("a matched row classified 'dlc' is excluded from the lane; a 'game'-classified row alongside it still renders (mixed catalog)", async () => {
+  const cache = makeMockCache();
+  globalThis.caches = { default: cache };
+  const env = makeEnv();
+
+  await primeMatchedRow(env, { appid: 211720, name: "Skyrim - Dawnguard", appType: "dlc" });
+  await primeMatchedRow(env, { appid: 1245620, name: "ELDEN RING", appType: "game" });
+  primeLibrary(cache, env, []);
+  primeFpmPool(cache, []);
+  globalThis.fetch = stubGetItemsFetch();
+
+  const ctx = makeCtx();
+  const res = await worker.fetch(new Request("https://x/api/fpm"), env, ctx);
+  const body = await res.json();
+
+  assert.equal(body.matched, 2, "both rows counted D1-wide");
+  assert.deepEqual(body.fpm.map((e) => e.appid), [1245620], "only the game-classified row renders");
 });
 
 // ---------------------------------------------------------------------------
@@ -720,6 +812,31 @@ test("GET /api/fpm/sync/status with no FPM_DB binding reports dbReady:false, nev
   const body = await res.json();
   assert.equal(body.dbReady, false);
   assert.equal(body.running, false);
+  assert.equal(body.classified, 0);
+  assert.equal(body.nonGame, 0);
+  assert.equal(body.lastRun, null);
+});
+
+test("GET /api/fpm/sync/status surfaces classified/nonGame counts straight from D1, before any sync run has completed (lastRun stays null)", async () => {
+  const env = makeEnv({ FPM_DB: makeMockD1() });
+  await ensureCatalogSchema(env);
+  await upsertCatalogRows(
+    env,
+    [1, 2, 3].map((appid) => catalogRowFromBulk({ appid, name: `Game ${appid}`, positive: 100, negative: 0, owners: "10,000 .. 20,000" })),
+    1000,
+  );
+  await recordAppType(env, 1, { appType: "game", checkedAtMs: 2000 });
+  await recordAppType(env, 2, { appType: "demo", checkedAtMs: 2000 });
+  // appid 3: never classified
+
+  const ctx = makeCtx();
+  const res = await worker.fetch(new Request("https://x/api/fpm/sync/status"), env, ctx);
+  const body = await res.json();
+
+  assert.equal(body.total, 3);
+  assert.equal(body.classified, 2);
+  assert.equal(body.nonGame, 1);
+  assert.equal(body.lastRun, null, "no sync run has happened in this test — the counters must not be fabricated");
 });
 
 test("a full sync run crawls the catalog, matches HLTB lengths, and status reflects it — then the poll can stop", async () => {
@@ -734,6 +851,8 @@ test("a full sync run crawls the catalog, matches HLTB lengths, and status refle
     if (u.hostname === "steamspy.com") {
       return new Response(JSON.stringify(page0), { status: 200 }); // partial page -> end of crawl
     }
+    const appdetailsRes = appdetailsBranch(url); // Increment 7.8: classification runs before HLTB selection
+    if (appdetailsRes) return appdetailsRes;
     if (u.hostname === "api.steampowered.com" && u.pathname.includes("GetOwnedGames")) {
       return jsonResponse({ response: { games: [ownedGame({ appid: 1 })] } });
     }
@@ -771,6 +890,12 @@ test("a full sync run crawls the catalog, matches HLTB lengths, and status refle
   assert.equal(statusBody.total, 1);
   assert.equal(statusBody.matched, 1);
   assert.equal(statusBody.pending, 0);
+  assert.equal(statusBody.classified, 1, "Increment 7.8: classified count surfaced on the status endpoint");
+  assert.equal(statusBody.nonGame, 0);
+  assert.ok(statusBody.lastRun, "the last-run HLTB/type funnel counters must be surfaced");
+  assert.equal(statusBody.lastRun.typeClassified, 1);
+  assert.equal(statusBody.lastRun.typeNonGame, 0);
+  assert.equal(statusBody.lastRun.resolved, 1);
 
   const fpmRes = await worker.fetch(new Request("https://x/api/fpm"), env, ctx);
   const fpmBody = await fpmRes.json();
@@ -825,6 +950,8 @@ test("sync is resumable: re-running after a partial fill only enqueues rows stil
   globalThis.fetch = async (url, options = {}) => {
     const u = new URL(url);
     if (u.hostname === "steamspy.com") return new Response(JSON.stringify(page0), { status: 200 });
+    const appdetailsRes = appdetailsBranch(url); // Increment 7.8: classification runs before HLTB selection
+    if (appdetailsRes) return appdetailsRes;
     if (u.pathname === "/deals/v2") return jsonResponse({ list: [], hasMore: false });
     if (u.pathname === "/api/bleed/init") return jsonResponse({ token: "tok", hpKey: "hpk", hpVal: "hpv" });
     if (u.pathname === "/api/bleed") {

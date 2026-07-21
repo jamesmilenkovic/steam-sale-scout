@@ -15,6 +15,8 @@ import { __setHltbMinIntervalMsForTests, __resetHltbQueueForTests } from "../src
 import {
   CATALOG_PAGE_SIZE,
   FPM_SYNC_BATCH,
+  FPM_TYPE_BATCH,
+  FPM_TYPE_TTL_DAYS,
   catalogRowFromBulk,
   floorPassesCatalogRow,
   isThrottledBody,
@@ -30,15 +32,26 @@ import {
   selectMatchedCatalogRows,
   crawlAndUpsertCatalog,
   resolveHltbBatch,
+  fetchAppType,
+  selectTypeClassificationBatch,
+  recordAppType,
+  classifyCatalogTypes,
   runFpmSyncPipeline,
   startFpmSync,
   isFpmSyncRunning,
+  getLastSyncStats,
   __setCatalogPacingMsForTests,
   __setCatalogBackoffMsForTests,
   __resetCatalogPacingForTests,
+  __setTypePacingMsForTests,
+  __setTypeBackoffMsForTests,
+  __resetTypePacingForTests,
   __setHltbPollingForTests,
   __resetHltbPollingForTests,
+  __setHltbItemTimeoutMsForTests,
+  __resetHltbItemTimeoutForTests,
   __resetFpmSyncStateForTests,
+  __resetLastSyncStatsForTests,
 } from "../src/catalog.js";
 
 const originalFetch = globalThis.fetch;
@@ -110,16 +123,41 @@ test.beforeEach(() => {
   __resetHltbQueueForTests();
   __setCatalogPacingMsForTests(0);
   __setCatalogBackoffMsForTests(0, 0);
+  __setTypePacingMsForTests(0);
+  __setTypeBackoffMsForTests(0, 0);
   __setHltbPollingForTests(0, 50);
   __resetFpmSyncStateForTests();
+  __resetLastSyncStatsForTests();
 });
 
 test.afterEach(() => {
   restoreGlobals();
   __setHltbMinIntervalMsForTests(1000);
   __resetCatalogPacingForTests();
+  __resetTypePacingForTests();
   __resetHltbPollingForTests();
+  __resetHltbItemTimeoutForTests();
 });
+
+/** Mark a batch of appids classified 'game' directly (bypassing the real
+ * appdetails network call) — the fast path for tests that only care about
+ * downstream HLTB-batch/lane behaviour, not classification itself. */
+async function markAllGame(env, appids, checkedAtMs = 1000) {
+  for (const appid of appids) {
+    await recordAppType(env, appid, { appType: "game", checkedAtMs });
+  }
+}
+
+/** Fetch-mock branch for storefront appdetails — Increment 7.8's
+ * classification step now runs as part of every runFpmSyncPipeline call, so
+ * any test driving the full pipeline (rather than pre-classifying via
+ * markAllGame) needs to answer this endpoint too. */
+function appdetailsBranch(url, type = "game") {
+  const u = new URL(url);
+  if (u.hostname !== "store.steampowered.com" || u.pathname !== "/api/appdetails") return null;
+  const appid = u.searchParams.get("appids");
+  return new Response(JSON.stringify({ [appid]: { success: true, data: { type, name: "x" } } }), { status: 200 });
+}
 
 // ---------------------------------------------------------------------------
 // Pure: bulk-row shaping + floor qualification + throttle detection.
@@ -226,7 +264,45 @@ test("ensureCatalogSchema is idempotent (safe to call repeatedly)", async () => 
   await ensureCatalogSchema(env);
   await ensureCatalogSchema(env);
   const stats = await getCatalogStats(env);
-  assert.deepEqual(stats, { total: 0, matched: 0, unmatched: 0, pending: 0 });
+  assert.deepEqual(stats, { total: 0, matched: 0, unmatched: 0, pending: 0, classified: 0, nonGame: 0 });
+});
+
+test("ensureCatalogSchema on a pre-7.8 install (table exists without app_type/type_checked_at) adds the columns without losing existing data", async () => {
+  const env = makeEnv();
+  // Simulate a pre-7.8 database: the OLD CREATE TABLE, no app_type/
+  // type_checked_at columns at all, with a real row already in it.
+  await env.FPM_DB.exec(`CREATE TABLE fpm_catalog (
+    appid INTEGER PRIMARY KEY,
+    name TEXT,
+    owners INTEGER NOT NULL DEFAULT 0,
+    positive INTEGER NOT NULL DEFAULT 0,
+    negative INTEGER NOT NULL DEFAULT 0,
+    wilson REAL NOT NULL DEFAULT 0,
+    main_hours REAL,
+    match_method TEXT,
+    source_catalog INTEGER NOT NULL DEFAULT 0,
+    source_owned INTEGER NOT NULL DEFAULT 0,
+    source_deal INTEGER NOT NULL DEFAULT 0,
+    spy_synced_at INTEGER,
+    hltb_checked_at INTEGER
+  )`);
+  await env.FPM_DB.prepare(
+    "INSERT INTO fpm_catalog (appid, name, owners, positive, negative, wilson, main_hours, match_method) VALUES (500, 'Pre-existing Game', 100000, 9000, 1000, 0.9, 6.5, 'name')",
+  ).run();
+
+  await ensureCatalogSchema(env); // must not throw, must not touch the existing row
+
+  const row = await env.FPM_DB.prepare("SELECT * FROM fpm_catalog WHERE appid = 500").first();
+  assert.equal(row.name, "Pre-existing Game", "pre-existing data must survive the ALTER TABLE");
+  assert.equal(row.main_hours, 6.5);
+  assert.equal(row.app_type, null, "new column exists and defaults to NULL, not dropped/errored data");
+
+  // A second call must also be safe (column-already-exists is expected and
+  // swallowed every time after the first).
+  await ensureCatalogSchema(env);
+  const stats = await getCatalogStats(env);
+  assert.equal(stats.total, 1);
+  assert.equal(stats.classified, 0);
 });
 
 test("upsertCatalogRows: a brand-new appid inserts with main_hours/match_method NULL and source_catalog=1", async () => {
@@ -246,6 +322,7 @@ test("upsertCatalogRows idempotence: re-upserting an already-matched appid never
   const env = makeEnv();
   await ensureCatalogSchema(env);
   await upsertCatalogRows(env, [catalogRowFromBulk(bulkRow({ appid: 100 }))], 1000);
+  await markAllGame(env, [100]);
   await recordHltbResult(env, 100, { mainHours: 6.5, matchMethod: "name", checkedAtMs: 2000 });
 
   // A later sync re-crawls and re-upserts the same appid (fresh stats) —
@@ -308,6 +385,7 @@ test("selectHltbBatch priority order: owned-or-deal first, then owners desc, the
     1000,
   );
   await markOwned(env, [3]);
+  await markAllGame(env, [1, 2, 3]);
 
   const batch = await selectHltbBatch(env, { limit: 10, staleCutoffMs: 2000 });
   assert.deepEqual(
@@ -321,6 +399,7 @@ test("selectHltbBatch: a matched row (main_hours set) is never selected, regardl
   const env = makeEnv();
   await ensureCatalogSchema(env);
   await upsertCatalogRows(env, [catalogRowFromBulk(bulkRow({ appid: 1 }))], 1000);
+  await markAllGame(env, [1]);
   await recordHltbResult(env, 1, { mainHours: 6.5, matchMethod: "name", checkedAtMs: 1000 });
 
   const farFutureCutoff = 1000 + 1000 * 24 * 60 * 60 * 1000; // absurdly generous "staleness" window
@@ -332,6 +411,7 @@ test("selectHltbBatch: an unmatched row is retried once hltb_checked_at is older
   const env = makeEnv();
   await ensureCatalogSchema(env);
   await upsertCatalogRows(env, [catalogRowFromBulk(bulkRow({ appid: 1 }))], 1000);
+  await markAllGame(env, [1]);
   await recordHltbResult(env, 1, { mainHours: null, matchMethod: "none", checkedAtMs: 5000 });
 
   const notYetStale = await selectHltbBatch(env, { limit: 10, staleCutoffMs: 4000 }); // cutoff before the check -> not stale yet
@@ -349,8 +429,50 @@ test("selectHltbBatch respects limit", async () => {
     [1, 2, 3].map((appid) => catalogRowFromBulk(bulkRow({ appid }))),
     1000,
   );
+  await markAllGame(env, [1, 2, 3]);
   const batch = await selectHltbBatch(env, { limit: 2, staleCutoffMs: 2000 });
   assert.equal(batch.length, 2);
+});
+
+// ---------------------------------------------------------------------------
+// selectHltbBatch — app_type gating (Increment 7.8).
+// ---------------------------------------------------------------------------
+
+test("selectHltbBatch: an unclassified (app_type NULL) row is never selected — HLTB budget is not spent on it", async () => {
+  const env = makeEnv();
+  await ensureCatalogSchema(env);
+  await upsertCatalogRows(env, [catalogRowFromBulk(bulkRow({ appid: 1 }))], 1000);
+  // Deliberately never classified.
+
+  const batch = await selectHltbBatch(env, { limit: 10, staleCutoffMs: 2000 });
+  assert.deepEqual(batch, [], "an unclassified row must not be enqueued for HLTB");
+});
+
+test("selectHltbBatch: a row classified non-game is never selected, even though main_hours is NULL", async () => {
+  const env = makeEnv();
+  await ensureCatalogSchema(env);
+  await upsertCatalogRows(env, [catalogRowFromBulk(bulkRow({ appid: 1 }))], 1000);
+  await recordAppType(env, 1, { appType: "demo", checkedAtMs: 1000 });
+
+  const batch = await selectHltbBatch(env, { limit: 10, staleCutoffMs: 2000 });
+  assert.deepEqual(batch, [], "a classified non-game row must never reach the HLTB queue");
+});
+
+test("selectHltbBatch: a row already selected once, then reclassified non-game, drops out of the next selection (no separate removal step)", async () => {
+  const env = makeEnv();
+  await ensureCatalogSchema(env);
+  await upsertCatalogRows(env, [catalogRowFromBulk(bulkRow({ appid: 1 }))], 1000);
+  await markAllGame(env, [1]);
+
+  const before = await selectHltbBatch(env, { limit: 10, staleCutoffMs: 2000 });
+  assert.deepEqual(before.map((r) => r.appid), [1], "eligible while classified 'game'");
+
+  // app_type is set-once in real usage (never re-classified once set), but
+  // this proves the WHERE clause itself is what enforces the gate — no
+  // separate "dequeue non-game rows" step exists or is needed.
+  await env.FPM_DB.prepare("UPDATE fpm_catalog SET app_type = 'dlc' WHERE appid = 1").run();
+  const after = await selectHltbBatch(env, { limit: 10, staleCutoffMs: 2000 });
+  assert.deepEqual(after, [], "no longer selected once app_type stops being 'game'");
 });
 
 test("FPM_SYNC_BATCH (3000) bounds per-run HLTB enqueues; a second run picks up exactly the remainder", async () => {
@@ -371,6 +493,14 @@ test("FPM_SYNC_BATCH (3000) bounds per-run HLTB enqueues; a second run picks up 
     );
   }
   await upsertCatalogRows(env, rows, 1000);
+  // Pre-classify every row 'game' directly (Increment 7.8's classification
+  // step is bounded by the much smaller FPM_TYPE_BATCH — this test is about
+  // FPM_SYNC_BATCH's HLTB-side bound specifically, so classification is
+  // taken out of the loop rather than tested here).
+  await markAllGame(
+    env,
+    rows.map((r) => r.appid),
+  );
 
   // Pre-warm KV for exactly the expected first-3000 batch — resolveHltbBatch
   // resolves these instantly from cache with zero HLTB network traffic,
@@ -389,6 +519,7 @@ test("FPM_SYNC_BATCH (3000) bounds per-run HLTB enqueues; a second run picks up 
   globalThis.fetch = async (url, options = {}) => {
     const u = new URL(url);
     if (u.hostname === "steamspy.com") return new Response(JSON.stringify({}), { status: 200 }); // empty page -> immediate end of crawl, no new rows
+    if (u.hostname === "store.steampowered.com") throw new Error("every row is pre-classified — appdetails must not be called");
     if (u.pathname === "/api/bleed/init") return jsonResponse({ token: "tok", hpKey: "hpk", hpVal: "hpv" });
     if (u.pathname === "/api/bleed") {
       searchCalls++;
@@ -435,13 +566,32 @@ test("getCatalogStats: total/matched/unmatched/pending are computed correctly ac
   // appid 3, 4: never checked
 
   const stats = await getCatalogStats(env);
-  assert.deepEqual(stats, { total: 4, matched: 1, unmatched: 1, pending: 3 });
+  assert.deepEqual(stats, { total: 4, matched: 1, unmatched: 1, pending: 3, classified: 0, nonGame: 0 });
+});
+
+test("getCatalogStats: classified/nonGame count app_type rows independently of the HLTB matched/unmatched/pending fields", async () => {
+  const env = makeEnv();
+  await ensureCatalogSchema(env);
+  await upsertCatalogRows(
+    env,
+    [1, 2, 3].map((appid) => catalogRowFromBulk(bulkRow({ appid }))),
+    1000,
+  );
+  await recordAppType(env, 1, { appType: "game", checkedAtMs: 2000 });
+  await recordAppType(env, 2, { appType: "demo", checkedAtMs: 2000 });
+  // appid 3: never classified
+
+  const stats = await getCatalogStats(env);
+  assert.equal(stats.total, 3);
+  assert.equal(stats.classified, 2);
+  assert.equal(stats.nonGame, 1);
 });
 
 test("selectMatchedCatalogRows returns only main_hours-NOT-NULL rows, carrying stored wilson/owners", async () => {
   const env = makeEnv();
   await ensureCatalogSchema(env);
   await upsertCatalogRows(env, [catalogRowFromBulk(bulkRow({ appid: 1, positive: 9000, negative: 1000 }))], 1000);
+  await markAllGame(env, [1]);
   await recordHltbResult(env, 1, { mainHours: 6.5, matchMethod: "name", checkedAtMs: 2000 });
 
   const rows = await selectMatchedCatalogRows(env);
@@ -599,6 +749,7 @@ test("resolveHltbBatch: a pre-warmed KV cache hit resolves instantly with zero H
   const env = makeEnv();
   await ensureCatalogSchema(env);
   await upsertCatalogRows(env, [catalogRowFromBulk(bulkRow({ appid: 200, name: "Portal 2" }))], 1000);
+  await markAllGame(env, [200]);
   env.TAG_CACHE.store.set(
     "hltb:200",
     JSON.stringify({ hltbId: 1, compMain: 23400, compPlus: 40000, comp100: 50000, matchMethod: "name" }),
@@ -624,6 +775,7 @@ test("resolveHltbBatch: a cold item is enqueued, resolved via the real HLTB queu
   const env = makeEnv();
   await ensureCatalogSchema(env);
   await upsertCatalogRows(env, [catalogRowFromBulk(bulkRow({ appid: 200, name: "Portal 2" }))], 1000);
+  await markAllGame(env, [200]);
 
   globalThis.fetch = makeHltbFetch({ searchResultsByQuery: { "Portal 2": [rawHltbEntry()] } });
 
@@ -673,6 +825,269 @@ test("resolveHltbBatch: hltbInit() failure leaves every item pending (fail-soft,
 });
 
 // ---------------------------------------------------------------------------
+// resolveHltbBatch — per-item timeout / skip-ahead (Increment 7.8, 7.7 QA
+// advisory 2). A genuinely stuck item (its search fetch never resolves)
+// must not block the rest of its batch for the full ~5 min safety valve —
+// each item is bounded by the much shorter hltbItemTimeoutMs deadline
+// instead.
+// ---------------------------------------------------------------------------
+
+test("resolveHltbBatch: a stuck item times out well before the ~5 min safety valve, its successor in the same batch still gets processed, and both give-ups are TTL-retryable", async () => {
+  const env = makeEnv();
+  await ensureCatalogSchema(env);
+  await upsertCatalogRows(
+    env,
+    [
+      catalogRowFromBulk(bulkRow({ appid: 200, name: "Stuck Game" })),
+      catalogRowFromBulk(bulkRow({ appid: 201, name: "Successor Game" })),
+    ],
+    1000,
+  );
+  await markAllGame(env, [200, 201]);
+
+  // A short per-item deadline (test seam) and a HIGH hltbPollMaxAttempts
+  // safety valve, so the deadline — not the attempt count — is what cuts
+  // the loop short. hltbPollIntervalMs is set small but non-zero so the
+  // deadline actually has room to elapse across a few polling iterations.
+  __setHltbItemTimeoutMsForTests(30);
+  __setHltbPollingForTests(5, 1000);
+
+  // Every search hangs forever (simulates a genuinely stuck queue/fetch) —
+  // this promise is intentionally never resolved. resolveHltbBatch must
+  // still return in bounded time rather than waiting on it.
+  globalThis.fetch = async (url) => {
+    const u = new URL(url);
+    if (u.pathname === "/api/bleed/init") return jsonResponse({ token: "tok", hpKey: "hpk", hpVal: "hpv" });
+    if (u.pathname === "/api/bleed") return new Promise(() => {}); // never resolves
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+
+  const ctx = makeCtx();
+  const start = Date.now();
+  const result = await resolveHltbBatch(env, ctx, [
+    { appid: 200, name: "Stuck Game" },
+    { appid: 201, name: "Successor Game" },
+  ]);
+  const elapsedMs = Date.now() - start;
+
+  assert.equal(result.resolved, 0);
+  assert.equal(result.gaveUp, 2, "the loop must reach BOTH items, not stall forever on the first");
+  assert.ok(elapsedMs < 5000, `must not wait anywhere near the 5 min safety valve (took ${elapsedMs}ms)`);
+
+  const stuckRow = await env.FPM_DB.prepare("SELECT hltb_checked_at, match_method FROM fpm_catalog WHERE appid = 200").first();
+  assert.equal(stuckRow.match_method, "none");
+  assert.ok(stuckRow.hltb_checked_at != null, "a poll-timeout give-up must record hltb_checked_at so it retries on the normal TTL cycle");
+
+  const successorRow = await env.FPM_DB.prepare("SELECT hltb_checked_at, match_method FROM fpm_catalog WHERE appid = 201").first();
+  assert.equal(successorRow.match_method, "none");
+  assert.ok(successorRow.hltb_checked_at != null, "the successor must also be reached and recorded, not skipped entirely");
+});
+
+// ---------------------------------------------------------------------------
+// App-type classification (Increment 7.8) — fetchAppType, selection
+// priority/resumability, batch bounds, throttle backoff.
+// ---------------------------------------------------------------------------
+
+test("fetchAppType: a real classified response returns status 'ok' with the type string", async () => {
+  globalThis.fetch = async (url) => {
+    const u = new URL(url);
+    assert.equal(u.searchParams.get("appids"), "1245620");
+    assert.equal(u.searchParams.get("filters"), "basic");
+    return jsonResponse({ 1245620: { success: true, data: { type: "game", name: "ELDEN RING" } } });
+  };
+  const result = await fetchAppType(1245620);
+  assert.deepEqual(result, { status: "ok", type: "game" });
+});
+
+test("fetchAppType: success:false (e.g. a delisted appid) resolves to 'ok' with type:null — a real answer, not a failure", async () => {
+  globalThis.fetch = async () => jsonResponse({ 999999999: { success: false } });
+  const result = await fetchAppType(999999999);
+  assert.deepEqual(result, { status: "ok", type: null });
+});
+
+test("fetchAppType: a real HTTP 429 resolves to 'throttled'", async () => {
+  globalThis.fetch = async () => new Response(JSON.stringify(null), { status: 429 });
+  const result = await fetchAppType(1245620);
+  assert.equal(result.status, "throttled");
+});
+
+test("fetchAppType: an unexpected/non-keyed JSON body (defensive backstop) resolves to 'error', not a crash", async () => {
+  globalThis.fetch = async () => new Response(JSON.stringify(null), { status: 200 });
+  const result = await fetchAppType(1245620);
+  assert.equal(result.status, "error");
+});
+
+test("fetchAppType: a network error resolves to 'error' rather than throwing", async () => {
+  globalThis.fetch = async () => {
+    throw new Error("network down");
+  };
+  const result = await fetchAppType(1245620);
+  assert.equal(result.status, "error");
+});
+
+test("selectTypeClassificationBatch priority: HLTB-matched rows first, then owned/deal-first + owners desc (mirrors selectHltbBatch)", async () => {
+  const env = makeEnv();
+  await ensureCatalogSchema(env);
+  await upsertCatalogRows(
+    env,
+    [
+      catalogRowFromBulk(bulkRow({ appid: 1, owners: "1,000,000 .. 2,000,000", positive: 100, negative: 0 })), // high owners, NOT matched
+      catalogRowFromBulk(bulkRow({ appid: 2, owners: "5,000 .. 20,000", positive: 100, negative: 0 })), // low owners, but MATCHED
+      catalogRowFromBulk(bulkRow({ appid: 3, owners: "5,000 .. 20,000", positive: 100, negative: 0 })), // low owners, not matched, but OWNED
+    ],
+    1000,
+  );
+  await recordHltbResult(env, 2, { mainHours: 6.5, matchMethod: "name", checkedAtMs: 1000 });
+  await markOwned(env, [3]);
+
+  const batch = await selectTypeClassificationBatch(env, { limit: 10, staleCutoffMs: 2000 });
+  assert.deepEqual(
+    batch.map((r) => r.appid),
+    [2, 3, 1],
+    "matched appid 2 first (restores the leaderboard fastest), then owned appid 3, then appid 1",
+  );
+});
+
+test("selectTypeClassificationBatch: a classified row is never reselected, regardless of age", async () => {
+  const env = makeEnv();
+  await ensureCatalogSchema(env);
+  await upsertCatalogRows(env, [catalogRowFromBulk(bulkRow({ appid: 1 }))], 1000);
+  await recordAppType(env, 1, { appType: "game", checkedAtMs: 1000 });
+
+  const farFutureCutoff = 1000 + 1000 * 24 * 60 * 60 * 1000;
+  const batch = await selectTypeClassificationBatch(env, { limit: 10, staleCutoffMs: farFutureCutoff });
+  assert.deepEqual(batch, [], "a classified row must never be reselected, no matter the staleness cutoff");
+});
+
+test("selectTypeClassificationBatch: an unclassified-attempt row is retried once type_checked_at is older than the cutoff, not before", async () => {
+  const env = makeEnv();
+  await ensureCatalogSchema(env);
+  await upsertCatalogRows(env, [catalogRowFromBulk(bulkRow({ appid: 1 }))], 1000);
+  await recordAppType(env, 1, { appType: null, checkedAtMs: 5000 });
+
+  const notYetStale = await selectTypeClassificationBatch(env, { limit: 10, staleCutoffMs: 4000 });
+  assert.deepEqual(notYetStale, []);
+
+  const nowStale = await selectTypeClassificationBatch(env, { limit: 10, staleCutoffMs: 6000 });
+  assert.deepEqual(nowStale.map((r) => r.appid), [1]);
+});
+
+test("classifyCatalogTypes: classifies rows, counts non-game separately, writes through per row, and never re-fetches an already-classified row (resumable)", async () => {
+  const env = makeEnv();
+  await ensureCatalogSchema(env);
+  await upsertCatalogRows(
+    env,
+    [
+      catalogRowFromBulk(bulkRow({ appid: 1245620, name: "ELDEN RING" })),
+      catalogRowFromBulk(bulkRow({ appid: 1396240, name: "Contraband Police: Prologue" })),
+    ],
+    1000,
+  );
+
+  const typesByAppid = { 1245620: "game", 1396240: "demo" };
+  let calls = 0;
+  globalThis.fetch = async (url) => {
+    calls++;
+    const u = new URL(url);
+    const appid = u.searchParams.get("appids");
+    return jsonResponse({ [appid]: { success: true, data: { type: typesByAppid[appid] } } });
+  };
+
+  const result = await classifyCatalogTypes(env, { limit: 10 });
+  assert.equal(result.attempted, 2);
+  assert.equal(result.classified, 2);
+  assert.equal(result.nonGame, 1);
+  assert.equal(calls, 2);
+
+  const stats = await getCatalogStats(env);
+  assert.equal(stats.classified, 2);
+  assert.equal(stats.nonGame, 1);
+
+  // Resumability: calling again must not re-fetch either row.
+  await classifyCatalogTypes(env, { limit: 10 });
+  assert.equal(calls, 2, "an already-classified row must never be re-fetched");
+});
+
+test("classifyCatalogTypes: FPM_TYPE_BATCH bounds a single run; the remainder is picked up by the next run", async () => {
+  const env = makeEnv();
+  await ensureCatalogSchema(env);
+  const totalRows = FPM_TYPE_BATCH + 5;
+  const rows = [];
+  for (let i = 0; i < totalRows; i++) {
+    rows.push(catalogRowFromBulk(bulkRow({ appid: 30000 + i, name: `Game ${i}`, owners: `${5_000_000 - i} .. ${5_000_000 - i}` })));
+  }
+  await upsertCatalogRows(env, rows, 1000);
+
+  let calls = 0;
+  globalThis.fetch = async (url) => {
+    calls++;
+    const u = new URL(url);
+    const appid = u.searchParams.get("appids");
+    return jsonResponse({ [appid]: { success: true, data: { type: "game" } } });
+  };
+
+  const first = await classifyCatalogTypes(env);
+  assert.equal(first.attempted, FPM_TYPE_BATCH);
+  assert.equal(calls, FPM_TYPE_BATCH);
+
+  const statsAfterFirst = await getCatalogStats(env);
+  assert.equal(statsAfterFirst.classified, FPM_TYPE_BATCH);
+
+  const second = await classifyCatalogTypes(env);
+  assert.equal(second.attempted, 5, "second run picks up exactly the remainder");
+
+  const statsAfterSecond = await getCatalogStats(env);
+  assert.equal(statsAfterSecond.classified, totalRows);
+});
+
+test("classifyCatalogTypes: a failed/missing classification is retried after FPM_TYPE_TTL_DAYS, never sooner", async () => {
+  const env = makeEnv();
+  await ensureCatalogSchema(env);
+  await upsertCatalogRows(env, [catalogRowFromBulk(bulkRow({ appid: 1 }))], 1000);
+
+  globalThis.fetch = async () => jsonResponse({ 1: { success: false } }); // a real "no data" answer
+
+  const nowMs = 1000;
+  await classifyCatalogTypes(env, { limit: 10, now: nowMs });
+  const stats = await getCatalogStats(env);
+  assert.equal(stats.classified, 0, "a null classification is not counted as classified");
+
+  const row = await env.FPM_DB.prepare("SELECT type_checked_at FROM fpm_catalog WHERE appid = 1").first();
+  assert.equal(row.type_checked_at, nowMs);
+
+  let calls = 0;
+  globalThis.fetch = async (url) => {
+    calls++;
+    return jsonResponse({ 1: { success: false } });
+  };
+
+  const justBeforeTtl = nowMs + FPM_TYPE_TTL_DAYS * 24 * 60 * 60 * 1000 - 1;
+  await classifyCatalogTypes(env, { limit: 10, now: justBeforeTtl });
+  assert.equal(calls, 0, "must not retry before FPM_TYPE_TTL_DAYS has elapsed");
+
+  const afterTtl = nowMs + FPM_TYPE_TTL_DAYS * 24 * 60 * 60 * 1000 + 1;
+  await classifyCatalogTypes(env, { limit: 10, now: afterTtl });
+  assert.equal(calls, 1, "must retry once FPM_TYPE_TTL_DAYS has elapsed");
+});
+
+test("classifyCatalogTypes: backs off and retries the SAME appid on a throttle, never advancing on a bad response", async () => {
+  const env = makeEnv();
+  await ensureCatalogSchema(env);
+  await upsertCatalogRows(env, [catalogRowFromBulk(bulkRow({ appid: 1 }))], 1000);
+
+  let attempts = 0;
+  globalThis.fetch = async () => {
+    attempts++;
+    if (attempts < 3) return new Response(JSON.stringify(null), { status: 429 });
+    return jsonResponse({ 1: { success: true, data: { type: "game" } } });
+  };
+
+  const result = await classifyCatalogTypes(env, { limit: 10 });
+  assert.equal(attempts, 3, "must retry the same appid until it succeeds, never skip it");
+  assert.equal(result.classified, 1);
+});
+
+// ---------------------------------------------------------------------------
 // runFpmSyncPipeline / startFpmSync — the whole thing wired together.
 // ---------------------------------------------------------------------------
 
@@ -695,8 +1110,12 @@ test("runFpmSyncPipeline: crawl -> union owned/deal -> priority HLTB batch, end 
       const page = u.searchParams.get("page");
       if (page === "0") return new Response(JSON.stringify(page0), { status: 200 }); // partial page -> end of crawl
     }
+    const appdetailsRes = appdetailsBranch(url); // Increment 7.8: classification runs before HLTB selection
+    if (appdetailsRes) return appdetailsRes;
     return hltbFetch(url, options);
   };
+
+  assert.equal(getLastSyncStats(), null, "no run has completed yet");
 
   const ctx = makeCtx();
   await runFpmSyncPipeline(env, ctx, {
@@ -707,12 +1126,25 @@ test("runFpmSyncPipeline: crawl -> union owned/deal -> priority HLTB batch, end 
   const stats = await getCatalogStats(env);
   assert.equal(stats.total, 2);
   assert.equal(stats.matched, 2);
+  assert.equal(stats.classified, 2);
+  assert.equal(stats.nonGame, 0);
 
   const ownedRow = await env.FPM_DB.prepare("SELECT source_owned, source_deal FROM fpm_catalog WHERE appid=1").first();
   assert.equal(ownedRow.source_owned, 1);
   assert.equal(ownedRow.source_deal, 0);
   const dealRow = await env.FPM_DB.prepare("SELECT source_owned, source_deal FROM fpm_catalog WHERE appid=2").first();
   assert.equal(dealRow.source_deal, 1);
+
+  // Increment 7.8: the pipeline's HLTB/type funnel counters are now
+  // surfaced (previously computed but discarded) — getLastSyncStats reports
+  // the most recent run.
+  const lastRun = getLastSyncStats();
+  assert.equal(lastRun.typeAttempted, 2);
+  assert.equal(lastRun.typeClassified, 2);
+  assert.equal(lastRun.typeNonGame, 0);
+  assert.equal(lastRun.resolved, 2);
+  assert.equal(lastRun.cacheHits, 0);
+  assert.equal(lastRun.gaveUp, 0);
 });
 
 test("startFpmSync: a second call while a sync is running reports alreadyRunning, doesn't start a duplicate", async () => {
@@ -749,6 +1181,8 @@ test("runFpmSyncPipeline is resumable: a second run only enqueues rows the first
     if (u.hostname === "steamspy.com") {
       return new Response(JSON.stringify(page0), { status: 200 }); // partial page -> end of crawl every time
     }
+    const appdetailsRes = appdetailsBranch(url); // Increment 7.8: classification runs before HLTB selection
+    if (appdetailsRes) return appdetailsRes;
     if (u.pathname === "/api/bleed/init") return jsonResponse({ token: "tok", hpKey: "hpk", hpVal: "hpv" });
     if (u.pathname === "/api/bleed") {
       const body = JSON.parse(options.body);
