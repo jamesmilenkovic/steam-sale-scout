@@ -36,6 +36,15 @@ import {
   selectTypeClassificationBatch,
   recordAppType,
   classifyCatalogTypes,
+  ITAD_PRICE_BATCH_SIZE,
+  FPM_PRICE_SYNC_BATCH,
+  FPM_PRICE_TTL_HOURS,
+  FPM_PRICE_MAX_CONSECUTIVE_BAD,
+  fetchItadIdsBatch,
+  fetchItadPricesBatch,
+  selectPriceBatch,
+  recordPriceResult,
+  resolvePriceBatch,
   runFpmSyncPipeline,
   startFpmSync,
   isFpmSyncRunning,
@@ -50,6 +59,9 @@ import {
   __setTypePacingMsForTests,
   __setTypeBackoffMsForTests,
   __resetTypePacingForTests,
+  __setPricePacingMsForTests,
+  __setPriceBackoffMsForTests,
+  __resetPricePacingForTests,
   __setHltbPollingForTests,
   __resetHltbPollingForTests,
   __setHltbItemTimeoutMsForTests,
@@ -132,6 +144,8 @@ test.beforeEach(() => {
   __setCatalogBackoffMsForTests(0, 0);
   __setTypePacingMsForTests(0);
   __setTypeBackoffMsForTests(0, 0);
+  __setPricePacingMsForTests(0);
+  __setPriceBackoffMsForTests(0, 0);
   __setHltbPollingForTests(0, 50);
   __resetFpmSyncStateForTests();
   __resetLastSyncStatsForTests();
@@ -143,6 +157,7 @@ test.afterEach(() => {
   __setHltbMinIntervalMsForTests(1000);
   __resetCatalogPacingForTests();
   __resetTypePacingForTests();
+  __resetPricePacingForTests();
   __resetHltbPollingForTests();
   __resetHltbItemTimeoutForTests();
   __resetFpmAutoContinueMaxIterationsForTests();
@@ -273,7 +288,7 @@ test("ensureCatalogSchema is idempotent (safe to call repeatedly)", async () => 
   await ensureCatalogSchema(env);
   await ensureCatalogSchema(env);
   const stats = await getCatalogStats(env);
-  assert.deepEqual(stats, { total: 0, matched: 0, unmatched: 0, pending: 0, classified: 0, nonGame: 0 });
+  assert.deepEqual(stats, { total: 0, matched: 0, unmatched: 0, pending: 0, classified: 0, nonGame: 0, pricePending: 0 });
 });
 
 test("ensureCatalogSchema on a pre-7.8 install (table exists without app_type/type_checked_at) adds the columns without losing existing data", async () => {
@@ -305,6 +320,10 @@ test("ensureCatalogSchema on a pre-7.8 install (table exists without app_type/ty
   assert.equal(row.name, "Pre-existing Game", "pre-existing data must survive the ALTER TABLE");
   assert.equal(row.main_hours, 6.5);
   assert.equal(row.app_type, null, "new column exists and defaults to NULL, not dropped/errored data");
+  // Increment 8.5's price-backfill columns are added the same ALTER TABLE
+  // way, on the same pre-existing install.
+  assert.equal(row.price, null);
+  assert.equal(row.price_checked_at, null, "not yet checked — distinct from a checked-but-priceless row");
 
   // A second call must also be safe (column-already-exists is expected and
   // swallowed every time after the first).
@@ -575,7 +594,7 @@ test("getCatalogStats: total/matched/unmatched/pending are computed correctly ac
   // appid 3, 4: never checked
 
   const stats = await getCatalogStats(env);
-  assert.deepEqual(stats, { total: 4, matched: 1, unmatched: 1, pending: 3, classified: 0, nonGame: 0 });
+  assert.deepEqual(stats, { total: 4, matched: 1, unmatched: 1, pending: 3, classified: 0, nonGame: 0, pricePending: 0 });
 });
 
 test("getCatalogStats: classified/nonGame count app_type rows independently of the HLTB matched/unmatched/pending fields", async () => {
@@ -1097,6 +1116,264 @@ test("classifyCatalogTypes: backs off and retries the SAME appid on a throttle, 
 });
 
 // ---------------------------------------------------------------------------
+// Price backfill (Increment 8.5) — fetchItadIdsBatch/fetchItadPricesBatch's
+// typed-status contract, selectPriceBatch's priority/TTL, recordPriceResult,
+// and resolvePriceBatch's chunked write-through/backoff orchestration.
+// ---------------------------------------------------------------------------
+
+test("fetchItadIdsBatch: resolves 'app/<appid>' -> itad id per the real /lookup/id/shop/61/v1 shape", async () => {
+  let capturedBody;
+  globalThis.fetch = async (url, options) => {
+    const u = new URL(url);
+    assert.equal(u.pathname, "/lookup/id/shop/61/v1");
+    capturedBody = JSON.parse(options.body);
+    return jsonResponse({ "app/100": "itad-a", "app/200": null });
+  };
+
+  const result = await fetchItadIdsBatch(makeEnv({ ITAD_API_KEY: "k" }), [100, 200]);
+  assert.deepEqual(capturedBody, ["app/100", "app/200"]);
+  assert.equal(result.status, "ok");
+  assert.equal(result.idsByAppid.get(100), "itad-a");
+  assert.equal(result.idsByAppid.get(200), null);
+});
+
+test("fetchItadIdsBatch: a real HTTP 429 resolves to 'throttled', honoring retry-after when present", async () => {
+  globalThis.fetch = async () => new Response(JSON.stringify(null), { status: 429, headers: { "retry-after": "7" } });
+  const result = await fetchItadIdsBatch(makeEnv({ ITAD_API_KEY: "k" }), [100]);
+  assert.equal(result.status, "throttled");
+  assert.equal(result.retryAfterMs, 7000);
+});
+
+test("fetchItadIdsBatch: a network error resolves to 'error' rather than throwing", async () => {
+  globalThis.fetch = async () => {
+    throw new Error("network down");
+  };
+  const result = await fetchItadIdsBatch(makeEnv({ ITAD_API_KEY: "k" }), [100]);
+  assert.equal(result.status, "error");
+});
+
+test("fetchItadPricesBatch: shapes the real /games/prices/v2 response, omitted ids simply absent from the map", async () => {
+  let capturedUrl;
+  globalThis.fetch = async (url) => {
+    capturedUrl = new URL(url);
+    return jsonResponse([
+      {
+        id: "itad-a",
+        deals: [{ shop: { id: 61 }, price: { amount: 9.99, amountInt: 999 }, regular: { amount: 19.99 }, cut: 50 }],
+      },
+      // itad-b has no live Steam deal — simply absent from the array (verified-live shape).
+    ]);
+  };
+
+  const result = await fetchItadPricesBatch(makeEnv({ ITAD_API_KEY: "k" }), ["itad-a", "itad-b"]);
+  assert.equal(capturedUrl.searchParams.get("country"), "AU");
+  assert.equal(capturedUrl.searchParams.get("shops"), "61");
+  assert.equal(result.status, "ok");
+  assert.deepEqual(result.priceByItadId.get("itad-a"), { price: 9.99, priceCents: 999, regular: 19.99, cut: 50 });
+  assert.equal(result.priceByItadId.has("itad-b"), false);
+});
+
+test("fetchItadPricesBatch: a real HTTP 429 resolves to 'throttled'", async () => {
+  globalThis.fetch = async () => new Response(JSON.stringify(null), { status: 429 });
+  const result = await fetchItadPricesBatch(makeEnv({ ITAD_API_KEY: "k" }), ["itad-a"]);
+  assert.equal(result.status, "throttled");
+});
+
+test("selectPriceBatch: priority is deal-first, then owners desc, then reviews desc (mirrors selectHltbBatch)", async () => {
+  const env = makeEnv();
+  await ensureCatalogSchema(env);
+  await upsertCatalogRows(
+    env,
+    [
+      catalogRowFromBulk(bulkRow({ appid: 1, name: "Low owners", owners: "5,000 .. 20,000", positive: 100, negative: 0 })),
+      catalogRowFromBulk(bulkRow({ appid: 2, name: "On sale", owners: "5,000 .. 20,000", positive: 100, negative: 0 })),
+      catalogRowFromBulk(bulkRow({ appid: 3, name: "High owners", owners: "1,000,000 .. 2,000,000", positive: 100, negative: 0 })),
+    ],
+    1000,
+  );
+  await markAllGame(env, [1, 2, 3]);
+  await recordHltbResult(env, 1, { mainHours: 5, matchMethod: "name", checkedAtMs: 1000 });
+  await recordHltbResult(env, 2, { mainHours: 5, matchMethod: "name", checkedAtMs: 1000 });
+  await recordHltbResult(env, 3, { mainHours: 5, matchMethod: "name", checkedAtMs: 1000 });
+  await markDeal(env, [2]);
+
+  const rows = await selectPriceBatch(env, { limit: 10, staleCutoffMs: 500 });
+  assert.deepEqual(rows.map((r) => r.appid), [2, 3, 1]);
+});
+
+test("selectPriceBatch: owned rows are never selected — a price is never displayed for them", async () => {
+  const env = makeEnv();
+  await ensureCatalogSchema(env);
+  await upsertCatalogRows(env, [catalogRowFromBulk(bulkRow({ appid: 1 }))], 1000);
+  await markAllGame(env, [1]);
+  await recordHltbResult(env, 1, { mainHours: 5, matchMethod: "name", checkedAtMs: 1000 });
+  await markOwned(env, [1]);
+
+  const rows = await selectPriceBatch(env, { limit: 10, staleCutoffMs: 500 });
+  assert.deepEqual(rows, []);
+});
+
+test("selectPriceBatch: an unclassified or unmatched row is never selected — same gating as selectHltbBatch", async () => {
+  const env = makeEnv();
+  await ensureCatalogSchema(env);
+  await upsertCatalogRows(env, [catalogRowFromBulk(bulkRow({ appid: 1 })), catalogRowFromBulk(bulkRow({ appid: 2 }))], 1000);
+  await markAllGame(env, [1]); // appid 1 classified but never HLTB-matched; appid 2 not even classified
+  await recordHltbResult(env, 2, { mainHours: 5, matchMethod: "name", checkedAtMs: 1000 }); // matched but not classified
+
+  const rows = await selectPriceBatch(env, { limit: 10, staleCutoffMs: 500 });
+  assert.deepEqual(rows, []);
+});
+
+test("selectPriceBatch: a checked row (priced or not) is retried once price_checked_at is older than FPM_PRICE_TTL_HOURS, not before", async () => {
+  const env = makeEnv();
+  await ensureCatalogSchema(env);
+  await upsertCatalogRows(env, [catalogRowFromBulk(bulkRow({ appid: 1 }))], 1000);
+  await markAllGame(env, [1]);
+  await recordHltbResult(env, 1, { mainHours: 5, matchMethod: "name", checkedAtMs: 1000 });
+  await recordPriceResult(env, 1, { price: null, priceCents: null, regular: null, cut: null, itadId: null, checkedAtMs: 5000 });
+
+  const due = await selectPriceBatch(env, { limit: 10, staleCutoffMs: 6000 });
+  assert.deepEqual(due.map((r) => r.appid), [1]);
+  assert.deepEqual(await selectPriceBatch(env, { limit: 10, staleCutoffMs: 4000 }), []);
+});
+
+test("recordPriceResult: writes price/discount fields and stamps price_checked_at", async () => {
+  const env = makeEnv();
+  await ensureCatalogSchema(env);
+  await upsertCatalogRows(env, [catalogRowFromBulk(bulkRow({ appid: 1 }))], 1000);
+
+  await recordPriceResult(env, 1, { price: 9.99, priceCents: 999, regular: 19.99, cut: 50, itadId: "itad-a", checkedAtMs: 5000 });
+
+  const row = await env.FPM_DB.prepare("SELECT * FROM fpm_catalog WHERE appid = 1").first();
+  assert.equal(row.price, 9.99);
+  assert.equal(row.price_cents, 999);
+  assert.equal(row.regular, 19.99);
+  assert.equal(row.cut, 50);
+  assert.equal(row.itad_id, "itad-a");
+  assert.equal(row.price_checked_at, 5000);
+});
+
+test("recordPriceResult: a 'no price' result stamps price_checked_at with every price field left null — never a silent blank", async () => {
+  const env = makeEnv();
+  await ensureCatalogSchema(env);
+  await upsertCatalogRows(env, [catalogRowFromBulk(bulkRow({ appid: 1 }))], 1000);
+
+  await recordPriceResult(env, 1, { price: null, priceCents: null, regular: null, cut: null, itadId: null, checkedAtMs: 5000 });
+
+  const row = await env.FPM_DB.prepare("SELECT * FROM fpm_catalog WHERE appid = 1").first();
+  assert.equal(row.price, null);
+  assert.equal(row.price_checked_at, 5000, "checked-but-priceless is distinguishable from never-checked (price_checked_at IS NULL)");
+});
+
+test("resolvePriceBatch: priced and priceless items both write through, itad-id resolution failures counted as priceless too", async () => {
+  const env = makeEnv({ ITAD_API_KEY: "k" });
+  await ensureCatalogSchema(env);
+  await upsertCatalogRows(
+    env,
+    [1, 2, 3].map((appid) => catalogRowFromBulk(bulkRow({ appid }))),
+    1000,
+  );
+  globalThis.fetch = async (url) => {
+    const u = new URL(url);
+    if (u.pathname === "/lookup/id/shop/61/v1") {
+      return jsonResponse({ "app/1": "itad-1", "app/2": "itad-2", "app/3": null });
+    }
+    if (u.pathname === "/games/prices/v2") {
+      return jsonResponse([
+        { id: "itad-1", deals: [{ shop: { id: 61 }, price: { amount: 9.99, amountInt: 999 }, regular: { amount: 19.99 }, cut: 50 }] },
+        // itad-2 resolves an id but ITAD has no live Steam deal for it right now.
+      ]);
+    }
+    throw new Error(`unexpected: ${url}`);
+  };
+
+  const items = [{ appid: 1, name: "Priced" }, { appid: 2, name: "No live deal" }, { appid: 3, name: "No ITAD id" }];
+  const result = await resolvePriceBatch(env, items);
+
+  assert.deepEqual(result, { attempted: 3, priced: 1, noPrice: 2, gaveUp: 0 });
+  const row1 = await env.FPM_DB.prepare("SELECT price, itad_id, price_checked_at FROM fpm_catalog WHERE appid=1").first();
+  assert.equal(row1.price, 9.99);
+  assert.equal(row1.itad_id, "itad-1");
+  assert.ok(row1.price_checked_at);
+  const row2 = await env.FPM_DB.prepare("SELECT price, itad_id, price_checked_at FROM fpm_catalog WHERE appid=2").first();
+  assert.equal(row2.price, null);
+  assert.equal(row2.itad_id, "itad-2");
+  assert.ok(row2.price_checked_at, "checked, ITAD confirmed no live deal — must still be stamped");
+  const row3 = await env.FPM_DB.prepare("SELECT price, itad_id, price_checked_at FROM fpm_catalog WHERE appid=3").first();
+  assert.equal(row3.itad_id, null);
+  assert.ok(row3.price_checked_at, "no resolvable ITAD id is also a genuine checked-no-price outcome");
+});
+
+test("resolvePriceBatch: chunks at ITAD_PRICE_BATCH_SIZE per ITAD call, never fewer, larger requests", async () => {
+  const env = makeEnv({ ITAD_API_KEY: "k" });
+  await ensureCatalogSchema(env);
+  await upsertCatalogRows(
+    env,
+    Array.from({ length: ITAD_PRICE_BATCH_SIZE + 50 }, (_, i) => catalogRowFromBulk(bulkRow({ appid: i + 1 }))),
+    1000,
+  );
+  const idBatchSizes = [];
+  globalThis.fetch = async (url, options) => {
+    const u = new URL(url);
+    if (u.pathname === "/lookup/id/shop/61/v1") {
+      idBatchSizes.push(JSON.parse(options.body).length);
+      return jsonResponse({});
+    }
+    throw new Error(`unexpected: ${url}`); // no ids resolved -> /games/prices/v2 never called
+  };
+
+  const items = Array.from({ length: ITAD_PRICE_BATCH_SIZE + 50 }, (_, i) => ({ appid: i + 1, name: `Game ${i}` }));
+  const result = await resolvePriceBatch(env, items);
+
+  assert.deepEqual(idBatchSizes, [ITAD_PRICE_BATCH_SIZE, 50]);
+  assert.equal(result.attempted, items.length);
+  assert.equal(result.noPrice, items.length, "no ids resolved anywhere -> every item is a genuine no-price result");
+});
+
+test("resolvePriceBatch: backs off and retries the SAME chunk on a throttle, never advancing on a bad response", async () => {
+  const env = makeEnv({ ITAD_API_KEY: "k" });
+  await ensureCatalogSchema(env);
+  await upsertCatalogRows(env, [catalogRowFromBulk(bulkRow({ appid: 1 }))], 1000);
+  let attempts = 0;
+  globalThis.fetch = async (url) => {
+    const u = new URL(url);
+    if (u.pathname === "/lookup/id/shop/61/v1") {
+      attempts++;
+      if (attempts < 3) return new Response(JSON.stringify(null), { status: 429 });
+      return jsonResponse({ "app/1": null });
+    }
+    throw new Error(`unexpected: ${url}`);
+  };
+
+  const result = await resolvePriceBatch(env, [{ appid: 1, name: "Game" }]);
+  assert.equal(attempts, 3, "must retry the same chunk until it succeeds, never skip it");
+  assert.equal(result.noPrice, 1);
+});
+
+test("resolvePriceBatch: gives up after FPM_PRICE_MAX_CONSECUTIVE_BAD throttles, leaving remaining items unattempted (price_checked_at untouched) for the next run", async () => {
+  const env = makeEnv({ ITAD_API_KEY: "k" });
+  await ensureCatalogSchema(env);
+  await upsertCatalogRows(env, [catalogRowFromBulk(bulkRow({ appid: 1 }))], 1000);
+
+  globalThis.fetch = async () => new Response(JSON.stringify(null), { status: 429 });
+
+  const result = await resolvePriceBatch(env, [{ appid: 1, name: "Game" }]);
+  assert.equal(result.gaveUp, 1);
+  assert.equal(result.attempted, 0);
+
+  const row = await env.FPM_DB.prepare("SELECT price_checked_at FROM fpm_catalog WHERE appid=1").first();
+  assert.equal(row.price_checked_at, null, "never attempted this run — must stay selectable by the next sync run");
+});
+
+test("resolvePriceBatch: with zero items, resolves immediately without touching fetch", async () => {
+  globalThis.fetch = async () => {
+    throw new Error("must not be called");
+  };
+  const result = await resolvePriceBatch(makeEnv({ ITAD_API_KEY: "k" }), []);
+  assert.deepEqual(result, { attempted: 0, priced: 0, noPrice: 0, gaveUp: 0 });
+});
+
+// ---------------------------------------------------------------------------
 // runFpmSyncPipeline / startFpmSync — the whole thing wired together.
 // ---------------------------------------------------------------------------
 
@@ -1154,6 +1431,94 @@ test("runFpmSyncPipeline: crawl -> union owned/deal -> priority HLTB batch, end 
   assert.equal(lastRun.resolved, 2);
   assert.equal(lastRun.cacheHits, 0);
   assert.equal(lastRun.gaveUp, 0);
+});
+
+test("runFpmSyncPipeline: with ITAD_API_KEY set, also price-checks newly-matched unowned rows in the SAME run — owned rows are skipped entirely", async () => {
+  const env = makeEnv({ ITAD_API_KEY: "k" });
+
+  const page0 = {
+    1: bulkRow({ appid: 1, name: "Owned Game", owners: "5,000 .. 20,000", positive: 100, negative: 0 }),
+    2: bulkRow({ appid: 2, name: "Deal Game", owners: "1,000,000 .. 2,000,000", positive: 100, negative: 0 }),
+  };
+  const hltbFetch = makeHltbFetch({
+    searchResultsByQuery: {
+      "Owned Game": [rawHltbEntry({ game_name: "Owned Game", comp_main: 18000 })],
+      "Deal Game": [rawHltbEntry({ game_name: "Deal Game", comp_main: 7200 })],
+    },
+  });
+  let priceIdsRequested;
+  globalThis.fetch = async (url, options) => {
+    const u = new URL(url);
+    if (u.hostname === "steamspy.com") {
+      const page = u.searchParams.get("page");
+      if (page === "0") return new Response(JSON.stringify(page0), { status: 200 });
+    }
+    const appdetailsRes = appdetailsBranch(url);
+    if (appdetailsRes) return appdetailsRes;
+    if (u.pathname === "/lookup/id/shop/61/v1") {
+      priceIdsRequested = JSON.parse(options.body);
+      return jsonResponse({ "app/2": "itad-2" }); // only Deal Game is ever asked about (Owned Game is source_owned=1)
+    }
+    if (u.pathname === "/games/prices/v2") {
+      return jsonResponse([
+        { id: "itad-2", deals: [{ shop: { id: 61 }, price: { amount: 4.99, amountInt: 499 }, regular: { amount: 9.99 }, cut: 50 }] },
+      ]);
+    }
+    return hltbFetch(url, options);
+  };
+
+  const ctx = makeCtx();
+  await runFpmSyncPipeline(env, ctx, {
+    loadOwnedAppIds: async () => new Set([1]),
+    loadDealAppIds: async () => [2],
+  });
+
+  assert.deepEqual(priceIdsRequested, ["app/2"], "the owned row (appid 1) is never even asked about — no ITAD budget spent on it");
+
+  const ownedRow = await env.FPM_DB.prepare("SELECT price, price_checked_at FROM fpm_catalog WHERE appid=1").first();
+  assert.equal(ownedRow.price, null);
+  assert.equal(ownedRow.price_checked_at, null, "owned rows are never price-checked — a price is never displayed for them");
+
+  const dealRow = await env.FPM_DB.prepare("SELECT price, cut, price_checked_at FROM fpm_catalog WHERE appid=2").first();
+  assert.equal(dealRow.price, 4.99);
+  assert.equal(dealRow.cut, 50);
+  assert.ok(dealRow.price_checked_at);
+
+  const stats = await getCatalogStats(env);
+  assert.equal(stats.pricePending, 0);
+
+  const lastRun = getLastSyncStats();
+  assert.equal(lastRun.priceAttempted, 1);
+  assert.equal(lastRun.priced, 1);
+  assert.equal(lastRun.noPrice, 0);
+});
+
+test("runFpmSyncPipeline: without ITAD_API_KEY, the price step is skipped entirely — no ITAD calls, existing behaviour unchanged", async () => {
+  const env = makeEnv(); // no ITAD_API_KEY
+
+  const page0 = { 1: bulkRow({ appid: 1, name: "Game One" }) };
+  const hltbFetch = makeHltbFetch({
+    searchResultsByQuery: { "Game One": [rawHltbEntry({ game_name: "Game One", comp_main: 3600 })] },
+  });
+  globalThis.fetch = async (url, options) => {
+    const u = new URL(url);
+    if (u.hostname === "steamspy.com") return new Response(JSON.stringify(page0), { status: 200 });
+    const appdetailsRes = appdetailsBranch(url);
+    if (appdetailsRes) return appdetailsRes;
+    if (u.pathname === "/lookup/id/shop/61/v1" || u.pathname === "/games/prices/v2") {
+      throw new Error("must never be called without an ITAD_API_KEY");
+    }
+    return hltbFetch(url, options);
+  };
+
+  const ctx = makeCtx();
+  await runFpmSyncPipeline(env, ctx, { loadOwnedAppIds: async () => new Set(), loadDealAppIds: async () => [] });
+
+  const lastRun = getLastSyncStats();
+  assert.equal(lastRun.priceAttempted, 0);
+  assert.equal(lastRun.priced, 0);
+  assert.equal(lastRun.noPrice, 0);
+  assert.equal(lastRun.priceGaveUp, 0);
 });
 
 test("startFpmSync: a second call while a sync is running reports alreadyRunning, doesn't start a duplicate", async () => {
@@ -1252,6 +1617,50 @@ test("runFpmSyncUntilComplete: a catalog that fully resolves in one batch stops 
   const stats = await getCatalogStats(env);
   assert.equal(stats.pending, 0);
   assert.equal(stats.classified, stats.total);
+});
+
+test("runFpmSyncUntilComplete: with ITAD_API_KEY set, the loop also waits on the price-backfill funnel (Increment 8.5), not just classification/HLTB", async () => {
+  const env = makeEnv({ ITAD_API_KEY: "k" });
+  await ensureCatalogSchema(env);
+  await upsertCatalogRows(env, [catalogRowFromBulk(bulkRow({ appid: 1, name: "Game One" }))], 1000);
+
+  let priceLookupCalls = 0;
+  globalThis.fetch = async (url, options = {}) => {
+    const u = new URL(url);
+    if (u.hostname === "steamspy.com") return jsonResponse({}); // empty page -> immediate end of crawl, every run
+    const appdetailsRes = appdetailsBranch(url);
+    if (appdetailsRes) return appdetailsRes;
+    if (u.pathname === "/api/bleed/init") return jsonResponse({ token: "tok", hpKey: "hpk", hpVal: "hpv" });
+    if (u.pathname === "/api/bleed") {
+      const body = JSON.parse(options.body);
+      return jsonResponse({ count: 1, data: [rawHltbEntry({ game_name: body.searchTerms.join(" "), comp_main: 3600 })] });
+    }
+    if (u.pathname === "/lookup/id/shop/61/v1") {
+      priceLookupCalls++;
+      // Throttled for FPM_PRICE_MAX_CONSECUTIVE_BAD calls in a row —
+      // resolvePriceBatch's own internal retry (within one pipeline run)
+      // exhausts its give-up budget and stops, leaving the row pending;
+      // succeeds starting the NEXT pipeline run's first attempt.
+      if (priceLookupCalls <= FPM_PRICE_MAX_CONSECUTIVE_BAD) return new Response(JSON.stringify(null), { status: 429 });
+      return jsonResponse({ "app/1": "itad-1" });
+    }
+    if (u.pathname === "/games/prices/v2") return jsonResponse([]); // no live deal -> a genuine, terminal "no price"
+    throw new Error(`unexpected: ${url}`);
+  };
+
+  const ctx = makeCtx();
+  const result = await runFpmSyncUntilComplete(env, ctx, { loadOwnedAppIds: async () => new Set(), loadDealAppIds: async () => [] });
+
+  assert.equal(result.stoppedEarly, false);
+  assert.equal(
+    result.iterations,
+    2,
+    "pass 1: classification+HLTB finish but price gives up after its own retry budget (still pending); pass 2: price recovers",
+  );
+  const stats = await getCatalogStats(env);
+  assert.equal(stats.pending, 0);
+  assert.equal(stats.classified, stats.total);
+  assert.equal(stats.pricePending, 0);
 });
 
 test("runFpmSyncUntilComplete: keeps calling the batch step across an HLTB outage until both funnels are empty (throttle-pause self-recovery)", async () => {

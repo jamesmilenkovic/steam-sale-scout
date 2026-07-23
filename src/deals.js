@@ -14,8 +14,31 @@
 // shape instead of a URL. Same purpose (a pure, testable appid extraction
 // step) and same acceptance behaviour, different (correct) input shape.
 
-/** Max ITAD game ids to fetch from /deals/v2 across all pages. */
-export const DEALS_FETCH_CAP = 1000;
+/**
+ * Max ITAD game ids to fetch from /deals/v2 across all pages.
+ *
+ * INCREMENT 8.5: re-measured live on a real sale day (2026-07-23) — the old
+ * 1000 cap was NOT "never reached in practice" (that claim, added at
+ * increment 8, was wrong); it was saturating exactly at 1000/1000 with
+ * `hasMore=true` at offset 1000. Because the upstream sort is -cut (cut
+ * descending), a live probe found a huge tie-plateau at identical cut%
+ * straddling the old cap boundary (offsets ~800-1400 were ALL cut=90%), so
+ * equally-deep-cut titles were being arbitrarily dropped by truncation, not
+ * out-ranked (confirmed: "Krater", cut=90%, sat at offset ~1000, just past
+ * the old cap).
+ *
+ * Raised to 3000 (3x headroom): live probe on that same sale day found
+ * cut% stayed >=90% through offset ~1400 and >=85% through offset ~2000, so
+ * 3000 comfortably covers both plateaus with room to spare, without going
+ * as high as BESTOF_FETCH_CAP=5000 (a different pool/purpose — rank-sorted
+ * popularity, not cut depth). Cost: each 200-item page is one ITAD request,
+ * so a cold 3000-cap pass costs ~15 requests for the deals fetch itself
+ * (was ~5), plus the existing appid-resolution/historical-low batches this
+ * feeds (each ~cap/200 requests, mitigated by their own 7-day caches) —
+ * trivial against the ITAD 1,000 req / 5 min budget even with other lanes
+ * (Best-of, FPM sync) running concurrently.
+ */
+export const DEALS_FETCH_CAP = 3000;
 
 /** Deals-per-page requested from ITAD /deals/v2 (their documented max). */
 export const DEALS_PAGE_LIMIT = 200;

@@ -35,11 +35,15 @@ import {
   __setTypePacingMsForTests,
   __setTypeBackoffMsForTests,
   __resetTypePacingForTests,
+  __setPricePacingMsForTests,
+  __setPriceBackoffMsForTests,
+  __resetPricePacingForTests,
   __setHltbPollingForTests,
   __resetHltbPollingForTests,
   __resetFpmSyncStateForTests,
   __resetLastSyncStatsForTests,
   isFpmSyncRunning,
+  recordPriceResult,
 } from "../src/catalog.js";
 import { ensureDismissalsSchema, addDismissal } from "../src/dismissals.js";
 
@@ -218,6 +222,8 @@ test.beforeEach(() => {
   __setCatalogBackoffMsForTests(0, 0);
   __setTypePacingMsForTests(0);
   __setTypeBackoffMsForTests(0, 0);
+  __setPricePacingMsForTests(0);
+  __setPriceBackoffMsForTests(0, 0);
   __setHltbPollingForTests(0, 50);
   __resetFpmSyncStateForTests();
   __resetLastSyncStatsForTests();
@@ -229,6 +235,7 @@ test.afterEach(() => {
   __setHltbMinIntervalMsForTests(1000);
   __resetCatalogPacingForTests();
   __resetTypePacingForTests();
+  __resetPricePacingForTests();
   __resetHltbPollingForTests();
 });
 
@@ -588,15 +595,19 @@ test("?refresh=1 bypasses the cached owned status too, not just deal prices (rev
   assert.equal(afterBody.fpm[0].owned, true, "refresh=1 must bypass the stale owned-status cache, not just deal prices");
 });
 
-test("deal annotation: an unowned matched row picks up price/cut/historicalLow from the deal pool", async () => {
+test("deal annotation (Increment 8.5): an unowned matched row's price/cut come from its own D1 price-backfill columns; historicalLow still comes from the deal pool", async () => {
   const cache = makeMockCache();
   globalThis.caches = { default: cache };
   const env = makeEnv();
 
   await primeMatchedRow(env, { appid: 200, name: "Portal 2" });
+  await recordPriceResult(env, 200, { price: 4.99, priceCents: 499, regular: 19.99, cut: 75, itadId: "itad-200", checkedAtMs: 1000 });
   primeLibrary(cache, env, []);
+  // Deliberately DIFFERENT cut/price than the D1 row above — proves price/
+  // cut genuinely come from D1 now, not silently still from this pool.
+  // historicalLow (out of scope this increment) is still sourced from here.
   primeFpmPool(cache, [
-    deal({ itadId: "itad-200", appid: 200, title: "Portal 2", cut: 75, price: 4.99, atHistoricalLow: true, historicalLow: 4.99 }),
+    deal({ itadId: "itad-200", appid: 200, title: "Portal 2", cut: 90, price: 1.99, atHistoricalLow: true, historicalLow: 4.99 }),
   ]);
   globalThis.fetch = stubGetItemsFetch();
 
@@ -609,6 +620,68 @@ test("deal annotation: an unowned matched row picks up price/cut/historicalLow f
   assert.equal(entry.cut, 75);
   assert.equal(entry.price, 4.99);
   assert.equal(entry.atHistoricalLow, true);
+  assert.equal(entry.historicalLow, 4.99);
+});
+
+test("price-blind/no-price counts (Increment 8.5, gate a/f): distinguishes never-checked from checked-but-ITAD-has-no-deal, both unowned only", async () => {
+  const cache = makeMockCache();
+  globalThis.caches = { default: cache };
+  const env = makeEnv();
+
+  await primeMatchedRow(env, { appid: 1, name: "Never checked" });
+  await primeMatchedRow(env, { appid: 2, name: "Checked, priced" });
+  await recordPriceResult(env, 2, { price: 9.99, priceCents: 999, regular: 19.99, cut: 50, itadId: "itad-2", checkedAtMs: 1000 });
+  await primeMatchedRow(env, { appid: 3, name: "Checked, no live deal" });
+  await recordPriceResult(env, 3, { price: null, priceCents: null, regular: null, cut: null, itadId: null, checkedAtMs: 1000 });
+  await primeMatchedRow(env, { appid: 4, name: "Owned, never checked" });
+  primeLibrary(cache, env, [ownedGame({ appid: 4 })]);
+  primeFpmPool(cache, []);
+  globalThis.fetch = stubGetItemsFetch();
+
+  const ctx = makeCtx();
+  const res = await worker.fetch(new Request("https://x/api/fpm"), env, ctx);
+  const body = await res.json();
+
+  // appid 4 is owned — never counted either way, regardless of its own
+  // (absent) price_checked_at, since a price is never displayed for it.
+  assert.equal(body.priceBlindCount, 1, "only 'Never checked' (appid 1) is price-blind");
+  assert.equal(body.noPriceCount, 1, "only 'Checked, no live deal' (appid 3) is a genuine no-price residual");
+});
+
+test("price-blind/no-price counts (review fix, round 1): stay at the real full-set numbers under ?owned=only and ?owned=hide, never silently 0", async () => {
+  // Regression test for a review-caught bug: priceBlindCount/noPriceCount
+  // used to be computed AFTER the ?owned= filter reassigned `annotated`,
+  // so under ?owned=only (which narrows annotated to JUST owned rows) the
+  // unowned-only counts silently came out 0 — wrong, not "no price-blind
+  // rows left". Same fixture as the test above; only the query param and
+  // the pre-fix-vs-post-fix expectation differ.
+  const cache = makeMockCache();
+  globalThis.caches = { default: cache };
+  const env = makeEnv();
+
+  await primeMatchedRow(env, { appid: 1, name: "Never checked" });
+  await primeMatchedRow(env, { appid: 2, name: "Checked, priced" });
+  await recordPriceResult(env, 2, { price: 9.99, priceCents: 999, regular: 19.99, cut: 50, itadId: "itad-2", checkedAtMs: 1000 });
+  await primeMatchedRow(env, { appid: 3, name: "Checked, no live deal" });
+  await recordPriceResult(env, 3, { price: null, priceCents: null, regular: null, cut: null, itadId: null, checkedAtMs: 1000 });
+  await primeMatchedRow(env, { appid: 4, name: "Owned, never checked" });
+  primeLibrary(cache, env, [ownedGame({ appid: 4 })]);
+  primeFpmPool(cache, []);
+  globalThis.fetch = stubGetItemsFetch();
+
+  const ctx = makeCtx();
+
+  const onlyRes = await worker.fetch(new Request("https://x/api/fpm?owned=only"), env, ctx);
+  const onlyBody = await onlyRes.json();
+  assert.deepEqual(onlyBody.fpm.map((r) => r.title), ["Owned, never checked"], "sanity check: ?owned=only really did narrow the visible rows");
+  assert.equal(onlyBody.priceBlindCount, 1, "?owned=only must not silently zero out the full-catalog price-blind count");
+  assert.equal(onlyBody.noPriceCount, 1, "?owned=only must not silently zero out the full-catalog no-price count");
+
+  const hideRes = await worker.fetch(new Request("https://x/api/fpm?owned=hide"), env, ctx);
+  const hideBody = await hideRes.json();
+  assert.equal(hideBody.fpm.length, 3, "sanity check: ?owned=hide really did narrow out the owned row");
+  assert.equal(hideBody.priceBlindCount, 1);
+  assert.equal(hideBody.noPriceCount, 1);
 });
 
 test("?owned=hide filters owned rows out; ?owned=only keeps only owned rows; default 'all' keeps both", async () => {

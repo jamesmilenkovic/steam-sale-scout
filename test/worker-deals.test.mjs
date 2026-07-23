@@ -543,6 +543,52 @@ test("pagination: stops early (no second page fetched) once a full page's last i
   assert.equal(body.deals.length, 199);
 });
 
+test("pagination: cap headroom (increment 8.5) — a same-cut tie-plateau past the OLD 1000-item cap now sources (regression proof for the live 'Krater' cap-truncation finding)", async () => {
+  // Mirrors the live finding: a huge tie-plateau at identical cut% (90%)
+  // straddles the old DEALS_FETCH_CAP=1000 boundary. Six full pages
+  // (offsets 0,200,...,1000) are all cut=90 — the old cap would have
+  // stopped paging at offset=1000 and silently dropped everything from the
+  // 6th page onward, including a title sitting right past that boundary.
+  const pagesByOffset = {};
+  for (let i = 0; i < 6; i++) {
+    const offset = i * 200;
+    const list = Array.from({ length: 200 }, (_, j) => rawDeal(`o${offset}-${j}`, `Deal ${offset}-${j}`, 90, 10));
+    if (offset === 1000) list[0] = rawDeal("krater", "Krater", 90, 10); // the past-old-cap title
+    pagesByOffset[offset] = { list, hasMore: true };
+  }
+  // A short final page ends pagination naturally, well under the new cap.
+  pagesByOffset[1200] = { list: [rawDeal("last", "Last Deal", 90, 10)], hasMore: false };
+
+  let dealsCallCount = 0;
+  const maxOffsetRequested = { value: -1 };
+  globalThis.fetch = makeItadFetch({
+    dealsPagesByOffset: pagesByOffset,
+    onCall: (u) => {
+      if (u.pathname === "/deals/v2") {
+        dealsCallCount++;
+        maxOffsetRequested.value = Math.max(maxOffsetRequested.value, Number(u.searchParams.get("offset")));
+      }
+    },
+  });
+  globalThis.caches = { default: makeMockCache() };
+
+  const env = makeEnv();
+  const ctx = makeCtx();
+  const res = await worker.fetch(new Request("https://x/api/deals?minCut=60"), env, ctx);
+  await ctx.flush();
+
+  assert.equal(res.status, 200);
+  // 7 pages fetched (offsets 0,200,400,600,800,1000,1200) — paging continued
+  // well past the old 1000-item cap because the tie-plateau never dropped
+  // below minCut and the new DEALS_FETCH_CAP=3000 wasn't reached yet.
+  assert.equal(dealsCallCount, 7);
+  assert.equal(maxOffsetRequested.value, 1200); // proves offset=1000 (past the old cap) was actually requested
+  const body = await res.json();
+  const titles = body.deals.map((d) => d.title);
+  assert.ok(titles.includes("Krater"), "a deal sitting past the OLD cap boundary must now surface");
+  assert.ok(titles.includes("Last Deal"));
+});
+
 // ---------------------------------------------------------------------------
 // Increment 5: /api/deals enrichment (tagNames, batteryFriendly, deck) and
 // the cache-control regression lock (reviewer issue #2).
@@ -673,7 +719,7 @@ test("Deals-pool-unchanged regression: /api/deals still sources sort=-cut, indep
   assert.deepEqual(capturedSorts, ["-cut"]);
   assert.notEqual(BESTOF_SORT, "-cut");
   assert.notEqual(BESTOF_SORT, capturedSorts[0]); // the two pools' sort axes never collide
-  assert.equal(DEALS_FETCH_CAP, 1000);
+  assert.equal(DEALS_FETCH_CAP, 3000);
   assert.notEqual(DEALS_FETCH_CAP, BESTOF_FETCH_CAP); // the two pools' caps coexist independently
 });
 

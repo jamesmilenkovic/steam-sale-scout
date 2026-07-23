@@ -601,14 +601,25 @@ async function handleDeals(request, env, ctx) {
   // status being joined at request time elsewhere in this file).
   //
   // AWARENESS NOTE (code review, non-blocking): this join runs AFTER
-  // mergeDealPages' DEALS_FETCH_CAP=1000 truncation inside buildDealsFeed
-  // above — a dismissed appid doesn't free a slot in that upstream fetch
-  // cap, only in whatever's downstream of it (nothing, for Deals; there's
-  // no further cap on this response). In practice DEALS_FETCH_CAP is never
-  // reached at real ITAD volumes (minCut=60 typically returns well under
-  // 1000 items), so this is a theoretical gap, not a live one. The exact
-  // same caveat applies to handleRecs/handleHof below — they share this
-  // same buildDealsFeed/buildBestOfPool cap-then-filter shape.
+  // mergeDealPages' DEALS_FETCH_CAP truncation inside buildDealsFeed above
+  // — a dismissed appid doesn't free a slot in that upstream fetch cap,
+  // only in whatever's downstream of it (nothing, for Deals; there's no
+  // further cap on this response).
+  //
+  // CORRECTION (increment 8.5): the increment-8 version of this note claimed
+  // "DEALS_FETCH_CAP is never reached at real ITAD volumes" — that was
+  // wrong. Live-measured on a real sale day (2026-07-23) at the old cap of
+  // 1000: exactly 1000/1000 fetched with `hasMore=true`, i.e. genuinely
+  // saturated, and a real deep-cut title ("Krater", cut=90%) was sitting
+  // just past the old cap inside a tie-plateau of same-cut% titles — see
+  // DEALS_FETCH_CAP's own doc comment in src/deals.js for the full
+  // measurement and the reasoning for the new 3000 value. This gap is real,
+  // not theoretical, though the higher cap now gives it much more headroom.
+  // The exact same caveat applies to handleRecs below (shares this same
+  // buildDealsFeed cap-then-filter shape and the same DEALS_FETCH_CAP).
+  // handleHof uses a separate cap, BESTOF_FETCH_CAP (unchanged this
+  // increment — no live saturation observed on it, per SPEC.md's "don't
+  // touch on spec alone").
   const dismissedAppIds = await getDismissedAppIds(env);
   const undismissed = excludeDismissed(deals, dismissedAppIds);
   const enriched = await enrichDeals(env, ctx, undismissed);
@@ -1780,6 +1791,19 @@ async function handleFpm(request, env, ctx) {
       fpm: fpmScore(wilsonQuality, mainHours, { reviewCount, formula, qualityExp, breadthWeight }),
       funPerHour,
       why: fpmWhyLine(qualityPercent, mainHours, funPerHour, formula),
+      // Increment 8.5: price/discount straight off the D1 catalog row's own
+      // price-backfill columns (src/catalog.js's selectPriceBatch/
+      // resolvePriceBatch) — covers EVERY floor-passing unowned row, not
+      // just whichever appids happened to be in the old BESTOF_FETCH_CAP-
+      // limited loadFpmPool join below. priceCheckedAt distinguishes
+      // "never checked" (null) from "checked, ITAD has no live deal"
+      // (set, price null) — see the priceBlindCount/noPriceCount summary
+      // built below, the fail-soft "no price" state SPEC.md requires.
+      price: row.price ?? null,
+      priceCents: row.price_cents ?? null,
+      regular: row.regular ?? null,
+      cut: row.cut ?? null,
+      priceCheckedAt: row.price_checked_at ?? null,
     });
   }
 
@@ -1794,15 +1818,22 @@ async function handleFpm(request, env, ctx) {
   const dismissedAppIds = await getDismissedAppIds(env);
   const undismissedRows = excludeDismissed(rows, dismissedAppIds);
 
-  // Annotation joins at request time (Increment 7.7) — owned/deal status are
-  // never a sourcing decision here, just a live join against the exact same
-  // helpers/caches every other lane already uses. getOwnedAppIds is already
-  // best-effort (never throws — empty Set on any failure); loadFpmPool is
-  // now consulted purely as a price/cut/historicalLow lookup. `refresh` is
-  // threaded through to BOTH (bug fix, flagged by review): the "Refresh
-  // prices/owned" button's label promises fresh owned status too, not just
-  // fresh deal prices — without this, ?refresh=1 silently left owned status
-  // up to 24h stale despite the button claiming otherwise.
+  // Annotation joins at request time (Increment 7.7) — owned status is never
+  // a sourcing decision here, just a live join against the exact same
+  // helper every other lane already uses (getOwnedAppIds, best-effort,
+  // never throws — empty Set on any failure). `refresh` is threaded through
+  // (bug fix, flagged by review): the "Refresh prices/owned" button's label
+  // promises fresh owned status too, not just fresh deal prices — without
+  // this, ?refresh=1 silently left owned status up to 24h stale despite the
+  // button claiming otherwise.
+  //
+  // Increment 8.5: price/discount now come straight off each row's own D1
+  // columns (set above, from the price-backfill catalog job) — this is the
+  // fix for the coverage gap, so loadFpmPool is no longer consulted for
+  // price at all. It's STILL consulted for historicalLow/atHistoricalLow
+  // (out of scope for this increment — SPEC.md's item A is price/discount
+  // only), so its old BESTOF_FETCH_CAP-limited coverage for THAT one field
+  // is unchanged/accepted.
   const ownedAppIds = await getOwnedAppIds(env, ctx, refresh);
   let dealPool;
   try {
@@ -1820,14 +1851,34 @@ async function handleFpm(request, env, ctx) {
     return {
       ...row,
       owned,
-      price: dealEntry?.price ?? null,
-      priceCents: dealEntry?.priceCents ?? null,
-      regular: dealEntry?.regular ?? null,
-      cut: dealEntry?.cut ?? null,
+      price: owned ? null : row.price,
+      priceCents: owned ? null : row.priceCents,
+      regular: owned ? null : row.regular,
+      cut: owned ? null : row.cut,
       atHistoricalLow: dealEntry?.atHistoricalLow ?? false,
       historicalLow: dealEntry?.historicalLow ?? null,
     };
   });
+
+  // Increment 8.5 (SPEC.md gate a/f — "a visible count in the API
+  // response", never a silent blank): computed over the FULL undismissed
+  // set, BEFORE the ownedMode filter below reassigns/narrows `annotated` —
+  // review fix (round 1): this used to run AFTER the ownedMode filter, so
+  // under `?owned=only` `annotated` had already been narrowed to JUST the
+  // owned rows, `unownedRows` came out empty, and both counts silently read
+  // 0 instead of the real catalog-wide number — exactly the "silent blank"
+  // gate (a) forbids, just wearing a 0 instead of a null. Computing it here,
+  // off the full set, means the counts reflect real catalog coverage
+  // regardless of which `?owned=` view the client requests. Only UNOWNED
+  // rows count, since owned rows are never price-checked at all (see
+  // selectPriceBatch's source_owned gate in src/catalog.js) — counting them
+  // would misrepresent price-backfill coverage as worse than it is.
+  // priceBlindCount (never checked yet) is the metric this increment's fix
+  // drives toward 0; noPriceCount (checked, ITAD genuinely has no live
+  // deal) is an honest, expected residual, not a bug.
+  const unownedRows = annotated.filter((r) => !r.owned);
+  const priceBlindCount = unownedRows.filter((r) => r.price == null && r.priceCheckedAt == null).length;
+  const noPriceCount = unownedRows.filter((r) => r.price == null && r.priceCheckedAt != null).length;
 
   if (ownedMode === "hide") annotated = annotated.filter((r) => !r.owned);
   else if (ownedMode === "only") annotated = annotated.filter((r) => r.owned);
@@ -1843,6 +1894,8 @@ async function handleFpm(request, env, ctx) {
       matched: stats.matched,
       pending: stats.pending,
       unmatchedCount: stats.unmatched,
+      priceBlindCount,
+      noPriceCount,
       count: fpm.length,
       fpm,
     }),

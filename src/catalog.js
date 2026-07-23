@@ -60,6 +60,7 @@
 import { qualifiesForFpmFloor, hltbInit, enqueueHltbFetch, getCachedHltb, hltbLengthSeconds, FPM_LENGTH_FIELD } from "./hltb.js";
 import { parseOwnersMidpoint } from "./spyQueue.js";
 import { quality } from "./score.js";
+import { chunk } from "./deals.js";
 
 const STEAMSPY_ALL_URL = "https://steamspy.com/api.php";
 
@@ -102,6 +103,29 @@ const FPM_SPY_TTL_MS = FPM_SPY_TTL_DAYS * 24 * 60 * 60 * 1000;
  * age (lengths are near-static). */
 export const FPM_HLTB_TTL_DAYS = 30;
 const FPM_HLTB_TTL_MS = FPM_HLTB_TTL_DAYS * 24 * 60 * 60 * 1000;
+
+/**
+ * Rows to check for a live price/discount per sync run (Increment 8.5).
+ * Unlike FPM_SYNC_BATCH (HLTB, gated by src/hltb.js's own ~1 req/sec
+ * throttled queue), price checks go straight to ITAD's BATCHED endpoints
+ * (<=200 ids/request — see ITAD_PRICE_BATCH_SIZE below), so a much larger
+ * per-run batch still costs very few actual ITAD requests: 2 requests per
+ * 200 rows (one id-lookup, one price-lookup). Even a cold run against
+ * today's whole matched+unowned catalog would cost well under 100 ITAD
+ * requests — trivial against the 1,000 req / 5 min budget, even alongside
+ * other lanes' concurrent ITAD usage. Deliberately large so a single sync
+ * run usually clears the whole due backlog rather than dribbling it out.
+ */
+export const FPM_PRICE_SYNC_BATCH = 6000;
+
+/** Price/discount changes daily (sales rotate) — a much shorter TTL than
+ * FPM_HLTB_TTL_DAYS (lengths are static). SPEC.md requires >=6h; this is
+ * exactly that floor — there's no benefit to staying "fresher" than the
+ * sale cadence, and every extra check spends ITAD budget for no visible
+ * gain. A row ITAD reports NO live deal for is retried on the same cycle
+ * (sales end and start all the time), never given up on permanently. */
+export const FPM_PRICE_TTL_HOURS = 6;
+const FPM_PRICE_TTL_MS = FPM_PRICE_TTL_HOURS * 60 * 60 * 1000;
 
 /** Batch size for the app-type classification backfill per sync run
  * (Increment 7.8) — ~500 rows at FPM_TYPE_PACING_MS's ~1 req/sec is ~8-9
@@ -257,7 +281,13 @@ const CREATE_TABLE_SQL = `CREATE TABLE IF NOT EXISTS fpm_catalog (
   spy_synced_at INTEGER,
   hltb_checked_at INTEGER,
   app_type TEXT,
-  type_checked_at INTEGER
+  type_checked_at INTEGER,
+  price REAL,
+  price_cents INTEGER,
+  regular REAL,
+  cut INTEGER,
+  itad_id TEXT,
+  price_checked_at INTEGER
 )`;
 
 // Increment 7.8: app_type/type_checked_at are also added via ALTER TABLE for
@@ -267,9 +297,18 @@ const CREATE_TABLE_SQL = `CREATE TABLE IF NOT EXISTS fpm_catalog (
 // has no `ADD COLUMN IF NOT EXISTS`, so each statement is wrapped in a
 // try/catch below and simply ignored once the column already exists — same
 // "safe to call on every request" idempotence as CREATE_TABLE_SQL.
+//
+// Increment 8.5 adds the price-backfill columns the same way, for the same
+// reason (an existing live install already has rows without them).
 const ALTER_TABLE_STATEMENTS = [
   "ALTER TABLE fpm_catalog ADD COLUMN app_type TEXT",
   "ALTER TABLE fpm_catalog ADD COLUMN type_checked_at INTEGER",
+  "ALTER TABLE fpm_catalog ADD COLUMN price REAL",
+  "ALTER TABLE fpm_catalog ADD COLUMN price_cents INTEGER",
+  "ALTER TABLE fpm_catalog ADD COLUMN regular REAL",
+  "ALTER TABLE fpm_catalog ADD COLUMN cut INTEGER",
+  "ALTER TABLE fpm_catalog ADD COLUMN itad_id TEXT",
+  "ALTER TABLE fpm_catalog ADD COLUMN price_checked_at INTEGER",
 ];
 
 /** Create the catalog table if it doesn't exist yet, and add any columns a
@@ -406,14 +445,23 @@ export async function recordHltbResult(env, appid, { mainHours, matchMethod, che
  * complement of `matched`. `matched`/`unmatched`/`pending` are intentionally
  * NOT gated on app_type (Increment 7.8) — they track HLTB fill progress
  * exactly as before; `classified`/`nonGame` (new) separately track the
- * app-type backfill's own progress. */
+ * app-type backfill's own progress.
+ *
+ * `pricePending` (Increment 8.5) is the price-backfill funnel's own "still
+ * to do" count: matched, game-classified, UNOWNED rows never yet checked for
+ * a price (price_checked_at IS NULL). Deliberately NOT "price IS NULL" —
+ * a row ITAD genuinely has no live deal for is checked-and-done, not
+ * pending (see FPM_PRICE_TTL_HOURS's doc comment); it just retries on the
+ * normal TTL cycle like every other "checked, no result" row in this file. */
 export async function getCatalogStats(env) {
   const row = await env.FPM_DB.prepare(
     `SELECT COUNT(*) AS total,
             SUM(CASE WHEN main_hours IS NOT NULL THEN 1 ELSE 0 END) AS matched,
             SUM(CASE WHEN match_method = 'none' THEN 1 ELSE 0 END) AS unmatched,
             SUM(CASE WHEN app_type IS NOT NULL THEN 1 ELSE 0 END) AS classified,
-            SUM(CASE WHEN app_type IS NOT NULL AND app_type != 'game' THEN 1 ELSE 0 END) AS nonGame
+            SUM(CASE WHEN app_type IS NOT NULL AND app_type != 'game' THEN 1 ELSE 0 END) AS nonGame,
+            SUM(CASE WHEN main_hours IS NOT NULL AND app_type = 'game' AND source_owned = 0
+                          AND price_checked_at IS NULL THEN 1 ELSE 0 END) AS pricePending
      FROM fpm_catalog`,
   ).first();
   const total = row?.total || 0;
@@ -421,7 +469,8 @@ export async function getCatalogStats(env) {
   const unmatched = row?.unmatched || 0;
   const classified = row?.classified || 0;
   const nonGame = row?.nonGame || 0;
-  return { total, matched, unmatched, pending: total - matched, classified, nonGame };
+  const pricePending = row?.pricePending || 0;
+  return { total, matched, unmatched, pending: total - matched, classified, nonGame, pricePending };
 }
 
 /** Every matched (main_hours NOT NULL) catalog row — the lane's actual
@@ -432,10 +481,17 @@ export async function getCatalogStats(env) {
  * choke point. An unclassified row (app_type IS NULL) fails the SQL
  * equality check the same as an explicitly non-game row, so both are
  * excluded by construction (the PO's "exclude-until-classified" decision) —
- * they stay in D1 (data is data) but never render here. */
+ * they stay in D1 (data is data) but never render here.
+ *
+ * Increment 8.5: also carries the price-backfill columns (price/price_cents/
+ * regular/cut/price_checked_at) — handleFpm reads price/discount straight
+ * off these instead of the old BESTOF_FETCH_CAP-limited loadFpmPool join,
+ * since that join only ever covered whichever appids happened to be in
+ * ITAD's rank-sorted feed, not every floor-passing catalog row. */
 export async function selectMatchedCatalogRows(env) {
   const result = await env.FPM_DB.prepare(
-    `SELECT appid, name, owners, positive, negative, wilson, main_hours, match_method
+    `SELECT appid, name, owners, positive, negative, wilson, main_hours, match_method,
+            price, price_cents, regular, cut, price_checked_at
      FROM fpm_catalog WHERE main_hours IS NOT NULL AND app_type = 'game'`,
   ).all();
   return result.results || [];
@@ -907,6 +963,315 @@ export async function resolveHltbBatch(env, ctx, items) {
 }
 
 // ---------------------------------------------------------------------------
+// Price backfill (Increment 8.5) — extends price/discount annotation to
+// EVERY floor-passing unowned matched catalog row, not just whichever
+// appids happen to be in the small BESTOF_FETCH_CAP-limited rank-sorted
+// pool src/worker.js's loadFpmPool sources (the 7.7 "top-300" gap). Mirrors
+// the app-type classification section above: D1-persisted, resumable-by-
+// construction (selectPriceBatch's WHERE clause below is the whole
+// resumability story — no queue, no separate cache layer needed), write-
+// through per item so a kill mid-batch loses no progress.
+//
+// Unlike HLTB/appdetails (one appid per request), ITAD's price endpoints are
+// natively BATCHED (<=200 ids/call — the same endpoints/shape src/worker.js's
+// resolveWishlistItadIds/fetchWishlistPrices already use for the Wishlist
+// lane, confirmed still live/working per the increment's live probe), so
+// this fetches by CHUNK of appids, not one at a time — a different rhythm
+// than fetchAppType's per-appid loop above, reusing deals.js's chunk().
+// ---------------------------------------------------------------------------
+
+const ITAD_API_BASE = "https://api.isthereanydeal.com";
+const ITAD_SHOP_ID_STEAM = 61;
+const ITAD_COUNTRY = "AU";
+
+/** Max appids/ITAD-ids per price-backfill request — ITAD's documented batch
+ * limit, same value already proven live for this exact purpose (see
+ * src/worker.js's BATCH_SIZE / resolveWishlistItadIds / fetchWishlistPrices). */
+export const ITAD_PRICE_BATCH_SIZE = 200;
+
+/** Gentle pacing between ITAD price-backfill requests. Batched calls are
+ * already cheap (<=200 rows/request, ~2 requests per 200 catalog rows), so
+ * this just avoids firing a burst of dozens of requests back-to-back; well
+ * under the 1,000 req / 5 min budget even stacked on top of other lanes'
+ * concurrent ITAD calls. */
+export const FPM_PRICE_PACING_MS = 300;
+
+/** Backoff on a throttle (HTTP 429) or error. Same "start well above a
+ * naive guess, double, cap" discipline as CATALOG_BACKOFF_BASE_MS/
+ * FPM_TYPE_BACKOFF_BASE_MS above — a 429's `retry-after` header (if present)
+ * is honored as a floor on top of this. */
+export const FPM_PRICE_BACKOFF_BASE_MS = 30_000;
+export const FPM_PRICE_BACKOFF_MAX_MS = 300_000;
+
+/** Consecutive bad (throttled/error) ITAD calls to tolerate before giving up
+ * on this run's remaining price batch — mirrors FPM_TYPE_MAX_CONSECUTIVE_BAD.
+ * Cheap to resume: price_checked_at was never written for anything not yet
+ * reached, so the next sync run's batch selection picks it right back up. */
+export const FPM_PRICE_MAX_CONSECUTIVE_BAD = 10;
+
+let pricePacingMs = FPM_PRICE_PACING_MS;
+let priceBackoffBaseMs = FPM_PRICE_BACKOFF_BASE_MS;
+let priceBackoffMaxMs = FPM_PRICE_BACKOFF_MAX_MS;
+
+/** TEST-ONLY seam: shrink pacing so price-backfill tests don't burn real
+ * wall-clock time. Never called from production code. */
+export function __setPricePacingMsForTests(ms) {
+  pricePacingMs = ms;
+}
+
+/** TEST-ONLY seam: shrink backoff so throttle-retry tests don't burn real
+ * wall-clock time. Never called from production code. */
+export function __setPriceBackoffMsForTests(baseMs, maxMs) {
+  priceBackoffBaseMs = baseMs;
+  priceBackoffMaxMs = maxMs;
+}
+
+/** TEST-ONLY seam: restore production pacing/backoff between tests. */
+export function __resetPricePacingForTests() {
+  pricePacingMs = FPM_PRICE_PACING_MS;
+  priceBackoffBaseMs = FPM_PRICE_BACKOFF_BASE_MS;
+  priceBackoffMaxMs = FPM_PRICE_BACKOFF_MAX_MS;
+}
+
+/**
+ * Resolve Steam appids -> ITAD ids for one batch (<=200) via
+ * POST /lookup/id/shop/61/v1. Body must be the "app/<appid>" string form —
+ * ITAD returns null for bare integers (same live-verified shape
+ * src/worker.js's resolveWishlistItadIds already relies on). Never throws.
+ * @returns {Promise<{status: 'ok'|'throttled'|'error', idsByAppid?: Map<number, string|null>, retryAfterMs?: number}>}
+ */
+export async function fetchItadIdsBatch(env, appids) {
+  const url = new URL(`${ITAD_API_BASE}/lookup/id/shop/${ITAD_SHOP_ID_STEAM}/v1`);
+  url.searchParams.set("key", env.ITAD_API_KEY);
+
+  let res;
+  try {
+    res = await fetch(url.toString(), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(appids.map((appid) => `app/${appid}`)),
+    });
+  } catch {
+    return { status: "error" };
+  }
+
+  if (res.status === 429) {
+    const retryAfter = Number(res.headers.get("retry-after"));
+    return { status: "throttled", retryAfterMs: Number.isFinite(retryAfter) ? retryAfter * 1000 : undefined };
+  }
+  if (!res.ok) return { status: "error" };
+
+  let json;
+  try {
+    json = await res.json();
+  } catch {
+    return { status: "error" };
+  }
+  if (!json || typeof json !== "object") return { status: "error" };
+
+  const idsByAppid = new Map();
+  for (const appid of appids) {
+    idsByAppid.set(appid, json[`app/${appid}`] ?? null);
+  }
+  return { status: "ok", idsByAppid };
+}
+
+/**
+ * Fetch current Steam price/cut for one batch (<=200) of ITAD ids via
+ * POST /games/prices/v2 (country=AU, shops=61) — the exact same endpoint/
+ * shape src/worker.js's fetchWishlistPrices already uses. Ids with no live
+ * Steam deal are OMITTED from the response (verified live) — that omission
+ * IS the "ITAD has no price for this one right now" signal, not an error.
+ * Never throws.
+ * @returns {Promise<{status: 'ok'|'throttled'|'error', priceByItadId?: Map<string, object>, retryAfterMs?: number}>}
+ */
+export async function fetchItadPricesBatch(env, itadIds) {
+  const url = new URL(`${ITAD_API_BASE}/games/prices/v2`);
+  url.searchParams.set("key", env.ITAD_API_KEY);
+  url.searchParams.set("country", ITAD_COUNTRY);
+  url.searchParams.set("shops", String(ITAD_SHOP_ID_STEAM));
+
+  let res;
+  try {
+    res = await fetch(url.toString(), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(itadIds),
+    });
+  } catch {
+    return { status: "error" };
+  }
+
+  if (res.status === 429) {
+    const retryAfter = Number(res.headers.get("retry-after"));
+    return { status: "throttled", retryAfterMs: Number.isFinite(retryAfter) ? retryAfter * 1000 : undefined };
+  }
+  if (!res.ok) return { status: "error" };
+
+  let json;
+  try {
+    json = await res.json();
+  } catch {
+    return { status: "error" };
+  }
+  if (!Array.isArray(json)) return { status: "error" };
+
+  const priceByItadId = new Map();
+  for (const entry of json) {
+    const dealEntry = (entry.deals || []).find((d) => d.shop?.id === ITAD_SHOP_ID_STEAM);
+    if (!dealEntry) continue;
+    priceByItadId.set(entry.id, {
+      price: dealEntry.price?.amount ?? null,
+      priceCents: dealEntry.price?.amountInt ?? null,
+      regular: dealEntry.regular?.amount ?? null,
+      cut: dealEntry.cut ?? null,
+    });
+  }
+  return { status: "ok", priceByItadId };
+}
+
+/**
+ * Select up to `limit` matched, game-classified, UNOWNED rows due for a
+ * price check, in priority order: currently-in-the-deal-pool first (already
+ * suspected on sale, per source_deal — same informational flag the HLTB
+ * batch prioritizes on), then owners/reviews descending. A row is due if
+ * it's never been checked, or was checked more than FPM_PRICE_TTL_HOURS ago
+ * — unlike HLTB's "a match is permanent" rule, EVERY price check is
+ * eventually retried, including a confirmed "no live deal" one (see
+ * FPM_PRICE_TTL_HOURS's doc comment — sales rotate).
+ *
+ * `source_owned = 0` gate: owned rows never need a price (the Owned badge
+ * always wins — see src/worker.js's handleFpm) so backfilling one would
+ * just spend ITAD budget for a value that's never displayed. Like every
+ * other use of source_owned in this file, this is an informational,
+ * priority-time-only flag (set once by markOwned, never cleared) — a game
+ * un-owned again later (e.g. a refund) simply stops getting fresh price
+ * checks until markOwned's own union logic is revisited; flagged as an
+ * accepted edge case, same convention as source_owned's existing use above.
+ * @param {object} env
+ * @param {{limit: number, staleCutoffMs: number}} options
+ * @returns {Promise<Array<{appid: number, name: string}>>}
+ */
+export async function selectPriceBatch(env, { limit, staleCutoffMs }) {
+  const result = await env.FPM_DB.prepare(
+    `SELECT appid, name FROM fpm_catalog
+     WHERE main_hours IS NOT NULL
+       AND app_type = 'game'
+       AND source_owned = 0
+       AND (price_checked_at IS NULL OR price_checked_at < ?)
+     ORDER BY source_deal DESC, owners DESC, (positive + negative) DESC
+     LIMIT ?`,
+  )
+    .bind(staleCutoffMs, limit)
+    .all();
+  return result.results || [];
+}
+
+/** Write back one price-check result. Every field null (with itadId
+ * possibly also null) records a checked-but-priceless row — ITAD genuinely
+ * has no live Steam deal for it right now (or no ITAD id could even be
+ * resolved) — retried on the normal FPM_PRICE_TTL_HOURS cycle, same
+ * "checked, no result" convention as recordHltbResult/recordAppType. */
+export async function recordPriceResult(env, appid, { price, priceCents, regular, cut, itadId, checkedAtMs }) {
+  await env.FPM_DB.prepare(
+    "UPDATE fpm_catalog SET price = ?, price_cents = ?, regular = ?, cut = ?, itad_id = ?, price_checked_at = ? WHERE appid = ?",
+  )
+    .bind(price ?? null, priceCents ?? null, regular ?? null, cut ?? null, itadId ?? null, checkedAtMs, appid)
+    .run();
+}
+
+/**
+ * Price-check a batch of {appid, name} rows against ITAD, chunked into
+ * <=ITAD_PRICE_BATCH_SIZE-id calls, and write each result through to D1.
+ * For each chunk: resolve appid->itadId, then batch-price whichever ids
+ * resolved, then record every item in the chunk (priced or genuinely
+ * priceless — both stamp price_checked_at). A throttle/error on either
+ * call backs off and retries the SAME chunk (never advances on a bad
+ * response), mirroring classifyCatalogTypes/crawlAndUpsertCatalog exactly.
+ * Gives up on the run's remaining chunks after FPM_PRICE_MAX_CONSECUTIVE_BAD
+ * throttles/errors in a row — cheap to resume, nothing in an unattempted
+ * chunk had price_checked_at written, so the next sync run's selection
+ * picks the exact same rows right back up. Never throws.
+ * @param {object} env - needs env.FPM_DB and env.ITAD_API_KEY.
+ * @param {Array<{appid: number, name: string}>} items
+ * @param {number} [nowMs]
+ * @returns {Promise<{attempted: number, priced: number, noPrice: number, gaveUp: number}>}
+ */
+export async function resolvePriceBatch(env, items, nowMs = Date.now()) {
+  if (!items || items.length === 0) return { attempted: 0, priced: 0, noPrice: 0, gaveUp: 0 };
+
+  let attempted = 0;
+  let priced = 0;
+  let noPrice = 0;
+  let backoff = priceBackoffBaseMs;
+  let lastFetchAt = 0;
+  let consecutiveBad = 0;
+
+  for (const batchItems of chunk(items, ITAD_PRICE_BATCH_SIZE)) {
+    const appids = batchItems.map((item) => item.appid);
+
+    let idResult;
+    for (;;) {
+      const wait = computeCatalogWaitMs(lastFetchAt, Date.now(), pricePacingMs);
+      if (wait > 0) await sleep(wait);
+      lastFetchAt = Date.now();
+
+      idResult = await fetchItadIdsBatch(env, appids);
+      if (idResult.status === "ok") {
+        consecutiveBad = 0;
+        backoff = priceBackoffBaseMs;
+        break;
+      }
+      consecutiveBad++;
+      if (consecutiveBad >= FPM_PRICE_MAX_CONSECUTIVE_BAD) {
+        return { attempted, priced, noPrice, gaveUp: items.length - attempted };
+      }
+      await sleep(Math.max(backoff, idResult.retryAfterMs || 0));
+      backoff = Math.min(backoff * 2, priceBackoffMaxMs);
+    }
+
+    const idsToPrice = Array.from(new Set(Array.from(idResult.idsByAppid.values()).filter((id) => id != null)));
+
+    let priceResult = { status: "ok", priceByItadId: new Map() };
+    if (idsToPrice.length > 0) {
+      for (;;) {
+        const wait = computeCatalogWaitMs(lastFetchAt, Date.now(), pricePacingMs);
+        if (wait > 0) await sleep(wait);
+        lastFetchAt = Date.now();
+
+        priceResult = await fetchItadPricesBatch(env, idsToPrice);
+        if (priceResult.status === "ok") {
+          consecutiveBad = 0;
+          backoff = priceBackoffBaseMs;
+          break;
+        }
+        consecutiveBad++;
+        if (consecutiveBad >= FPM_PRICE_MAX_CONSECUTIVE_BAD) {
+          return { attempted, priced, noPrice, gaveUp: items.length - attempted };
+        }
+        await sleep(Math.max(backoff, priceResult.retryAfterMs || 0));
+        backoff = Math.min(backoff * 2, priceBackoffMaxMs);
+      }
+    }
+
+    for (const item of batchItems) {
+      const itadId = idResult.idsByAppid.get(item.appid) ?? null;
+      const priceEntry = itadId != null ? priceResult.priceByItadId.get(itadId) : undefined;
+      attempted++;
+      if (priceEntry) {
+        await recordPriceResult(env, item.appid, { ...priceEntry, itadId, checkedAtMs: nowMs });
+        priced++;
+      } else {
+        await recordPriceResult(env, item.appid, { price: null, priceCents: null, regular: null, cut: null, itadId, checkedAtMs: nowMs });
+        noPrice++;
+      }
+    }
+  }
+
+  return { attempted, priced, noPrice, gaveUp: 0 };
+}
+
+// ---------------------------------------------------------------------------
 // Sync orchestration — the whole POST /api/fpm/sync pipeline. Takes the
 // owned-appid-set/deal-pool loaders as injected callbacks rather than
 // importing them from src/worker.js: worker.js is the `main` module and
@@ -950,14 +1315,22 @@ export function __resetLastSyncStatsForTests() {
 /**
  * The full sync pipeline: ensure schema -> crawl+upsert the whole catalog ->
  * union owned/deal floor-passers (informational source flags, used to
- * prioritize both the classification and HLTB batches below) -> classify up
+ * prioritize the classification/HLTB/price batches below) -> classify up
  * to FPM_TYPE_BATCH unclassified rows against storefront appdetails
  * (Increment 7.8 — matched rows first, so a previously-visible leaderboard
  * reappears as fast as possible) -> select up to FPM_SYNC_BATCH NULL-
  * main_hours, app_type='game' rows in priority order -> resolve them
- * against HLTB, writing through to D1. Never throws — a failure in any one
- * step just means this run made less progress than hoped; the next sync run
- * picks up from whatever's already in D1 (resumable by construction).
+ * against HLTB, writing through to D1 -> select up to FPM_PRICE_SYNC_BATCH
+ * matched/game/unowned rows due for a price check and batch-price them
+ * against ITAD (Increment 8.5), writing through to D1. Never throws — a
+ * failure in any one step just means this run made less progress than
+ * hoped; the next sync run picks up from whatever's already in D1
+ * (resumable by construction).
+ *
+ * The price step only runs when env.ITAD_API_KEY is configured (same
+ * fail-soft convention as src/worker.js's handleFpm) — without a key there
+ * is nothing this step could do, so it's skipped rather than spending a
+ * whole run's consecutive-bad budget on calls that can only fail.
  * @param {object} env
  * @param {object} ctx
  * @param {{loadOwnedAppIds: () => Promise<Set<number>>, loadDealAppIds: () => Promise<number[]>}} deps
@@ -983,9 +1356,16 @@ export async function runFpmSyncPipeline(env, ctx, deps) {
 
   const typeResult = await classifyCatalogTypes(env);
 
-  const staleCutoffMs = Date.now() - FPM_HLTB_TTL_MS;
-  const batch = await selectHltbBatch(env, { limit: FPM_SYNC_BATCH, staleCutoffMs });
+  const hltbStaleCutoffMs = Date.now() - FPM_HLTB_TTL_MS;
+  const batch = await selectHltbBatch(env, { limit: FPM_SYNC_BATCH, staleCutoffMs: hltbStaleCutoffMs });
   const hltbResult = await resolveHltbBatch(env, ctx, batch);
+
+  let priceResult = { attempted: 0, priced: 0, noPrice: 0, gaveUp: 0 };
+  if (env.ITAD_API_KEY) {
+    const priceStaleCutoffMs = Date.now() - FPM_PRICE_TTL_MS;
+    const priceBatch = await selectPriceBatch(env, { limit: FPM_PRICE_SYNC_BATCH, staleCutoffMs: priceStaleCutoffMs });
+    priceResult = await resolvePriceBatch(env, priceBatch);
+  }
 
   lastSyncStats = {
     typeAttempted: typeResult.attempted,
@@ -994,10 +1374,15 @@ export async function runFpmSyncPipeline(env, ctx, deps) {
     cacheHits: hltbResult.cacheHits,
     resolved: hltbResult.resolved,
     gaveUp: hltbResult.gaveUp,
+    priceAttempted: priceResult.attempted,
+    priced: priceResult.priced,
+    noPrice: priceResult.noPrice,
+    priceGaveUp: priceResult.gaveUp,
   };
   console.log(
     `[fpm-sync] type: ${typeResult.classified} classified (${typeResult.nonGame} non-game) of ${typeResult.attempted} attempted` +
-      ` · hltb: ${hltbResult.cacheHits} cache hits, ${hltbResult.resolved} resolved, ${hltbResult.gaveUp} gave up`,
+      ` · hltb: ${hltbResult.cacheHits} cache hits, ${hltbResult.resolved} resolved, ${hltbResult.gaveUp} gave up` +
+      ` · price: ${priceResult.priced} priced, ${priceResult.noPrice} no-price, ${priceResult.gaveUp} gave up`,
   );
 }
 
@@ -1080,13 +1465,19 @@ export function __resetFpmAutoContinueStateForTests() {
 }
 
 /**
- * Repeatedly runs runFpmSyncPipeline (unchanged) until BOTH the type
- * classification funnel (classified >= total) and the HLTB funnel
- * (pending === 0) are empty, a stop is requested, or
+ * Repeatedly runs runFpmSyncPipeline (unchanged) until the type
+ * classification funnel (classified >= total), the HLTB funnel
+ * (pending === 0), AND the price-backfill funnel (pricePending === 0,
+ * Increment 8.5) are all empty, a stop is requested, or
  * FPM_AUTO_CONTINUE_MAX_ITERATIONS is reached. Never throws — same
  * resumable-by-construction discipline as the pipeline itself: whatever
  * progress got written to D1 this run stands regardless of how the loop
  * ends.
+ *
+ * priceDone is vacuously true when env.ITAD_API_KEY isn't configured — the
+ * price step never runs in that case (see runFpmSyncPipeline), so gating
+ * completion on it would loop forever for no reason; same reasoning as
+ * runFpmSyncPipeline's own ITAD_API_KEY skip.
  * @param {object} env
  * @param {object} ctx
  * @param {object} deps - same shape runFpmSyncPipeline takes.
@@ -1118,7 +1509,8 @@ export async function runFpmSyncUntilComplete(env, ctx, deps) {
     }
     const classificationDone = stats.total > 0 && stats.classified >= stats.total;
     const hltbDone = stats.pending === 0;
-    if (classificationDone && hltbDone) break;
+    const priceDone = !env.ITAD_API_KEY || stats.pricePending === 0;
+    if (classificationDone && hltbDone && priceDone) break;
   }
 
   return { iterations, stoppedEarly };
