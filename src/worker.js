@@ -1998,6 +1998,13 @@ async function handleFpmSyncStatus(request, env, ctx) {
         pending: 0,
         classified: 0,
         nonGame: 0,
+        // Increment 9: the tag funnel's counters, zeroed – same shape as
+        // the real branch below, so a client never has to special-case the
+        // no-DB response (0 + 0 + 0 === total 0, the funnel still adds up).
+        tagged: 0,
+        tagsEmpty: 0,
+        tagsPending: 0,
+        tagsKvSeeded: 0,
         running: false,
         autoContinue: false,
         dbReady: false,
@@ -2011,6 +2018,22 @@ async function handleFpmSyncStatus(request, env, ctx) {
   const stats = await getCatalogStats(env);
   return new Response(
     // classified/nonGame (Increment 7.8) come straight through from stats;
+    // so does Increment 9's tag funnel – `tagged`/`tagsEmpty`/`tagsPending`
+    // (the catalog-wide picture, which sums to `total` by construction) plus
+    // `tagsKvSeeded`, the catalog-wide kv_seeded leg counted off the
+    // tags_source column so it survives restarts and the many auto-continue
+    // runs one fill takes (round-1 review, blocker 1). SPEC.md §3.5's
+    // `skipped` leg stays per-run under lastRun, split across `tagsSkipped`
+    // (rows the live pass walked past, round-2 review CR-9) and `tagsGaveUp`
+    // (rows abandoned when a whole pass gave up). Neither is a catalog-wide
+    // count, because neither kind of row is ever stamped – both are by
+    // definition still inside tagsPending.
+    //
+    // Note lastRun ALSO carries `tagsKvSeeded`/`tagsEmpty` – the same names
+    // scoped to the most recent run rather than the catalog. The nesting is
+    // what disambiguates them, exactly as it already does for the type/HLTB
+    // counters. Read the top-level ones for SPEC.md §7's final funnel;
+    // lastRun's answer "what did the run I just watched actually do".
     // lastRun surfaces the most recent sync run's HLTB/type-classification
     // funnel counters (cacheHits/resolved/gaveUp, classified/nonGame/
     // attempted) — null until the first sync run completes. autoContinue

@@ -58,7 +58,7 @@
 // was investigated and rejected.
 
 import { qualifiesForFpmFloor, hltbInit, enqueueHltbFetch, getCachedHltb, hltbLengthSeconds, FPM_LENGTH_FIELD } from "./hltb.js";
-import { parseOwnersMidpoint } from "./spyQueue.js";
+import { parseOwnersMidpoint, getCachedSpy, awaitSpySlot } from "./spyQueue.js";
 import { quality } from "./score.js";
 import { chunk } from "./deals.js";
 
@@ -287,7 +287,10 @@ const CREATE_TABLE_SQL = `CREATE TABLE IF NOT EXISTS fpm_catalog (
   regular REAL,
   cut INTEGER,
   itad_id TEXT,
-  price_checked_at INTEGER
+  price_checked_at INTEGER,
+  tags TEXT,
+  tags_checked_at INTEGER,
+  tags_source TEXT
 )`;
 
 // Increment 7.8: app_type/type_checked_at are also added via ALTER TABLE for
@@ -300,6 +303,35 @@ const CREATE_TABLE_SQL = `CREATE TABLE IF NOT EXISTS fpm_catalog (
 //
 // Increment 8.5 adds the price-backfill columns the same way, for the same
 // reason (an existing live install already has rows without them).
+//
+// Increment 9 adds the tag-backfill columns (tags/tags_checked_at) for the
+// same reason again – the live install already holds 18,306 rows written
+// before these columns existed, and only the ALTER entries reach them.
+// `tags` stores SteamSpy's `appdetails` tag dict VERBATIM as JSON text
+// (`{"Roguelike": 4123, ...}`, tag name → vote count) – no normalised form
+// is invented here, because the existing scoring code inc 11 will feed it
+// to already understands exactly that shape. `tags_checked_at` is the same
+// freshness stamp as hltb_checked_at/type_checked_at/price_checked_at.
+//
+// DELIBERATE DEVIATION FROM SPEC.md §2 (round-1 review, blocker 1 – needs
+// James's sign-off at the diff gate, and is called out in the handoff and in
+// the increment's review folder rather than slipped in): §2 names exactly
+// TWO columns. `tags_source` is a third, holding 'kv' (the row's tags came
+// free from the 30d KV cache, zero SteamSpy requests) or 'live' (we spent a
+// request), and NULL only while the row is still unchecked.
+//
+// It exists because SPEC.md §7 Output 1 requires the FINAL kv_seeded leg of
+// the funnel and there is no other way to produce it. lastSyncStats is
+// overwritten by every pipeline run, the fill spans many auto-continue
+// iterations, and §3.6 forbids re-fetching a stamped row – so a per-run
+// counter can only ever report the LAST batch (and since owned rows are
+// filled first, that is exactly where KV hits cluster, so it would read near
+// zero). A module-scoped cumulative counter is no better: gate (a) requires a
+// kill/restart mid-fill, which would zero it. A column makes the split a SQL
+// question, answerable forever and immune to restarts.
+//
+// Additive and reversible: nothing but getCatalogStats' tagsKvSeeded reads
+// it, so dropping it later breaks nothing.
 const ALTER_TABLE_STATEMENTS = [
   "ALTER TABLE fpm_catalog ADD COLUMN app_type TEXT",
   "ALTER TABLE fpm_catalog ADD COLUMN type_checked_at INTEGER",
@@ -309,6 +341,9 @@ const ALTER_TABLE_STATEMENTS = [
   "ALTER TABLE fpm_catalog ADD COLUMN cut INTEGER",
   "ALTER TABLE fpm_catalog ADD COLUMN itad_id TEXT",
   "ALTER TABLE fpm_catalog ADD COLUMN price_checked_at INTEGER",
+  "ALTER TABLE fpm_catalog ADD COLUMN tags TEXT",
+  "ALTER TABLE fpm_catalog ADD COLUMN tags_checked_at INTEGER",
+  "ALTER TABLE fpm_catalog ADD COLUMN tags_source TEXT",
 ];
 
 /** Create the catalog table if it doesn't exist yet, and add any columns a
@@ -452,7 +487,36 @@ export async function recordHltbResult(env, appid, { mainHours, matchMethod, che
  * a price (price_checked_at IS NULL). Deliberately NOT "price IS NULL" —
  * a row ITAD genuinely has no live deal for is checked-and-done, not
  * pending (see FPM_PRICE_TTL_HOURS's doc comment); it just retries on the
- * normal TTL cycle like every other "checked, no result" row in this file. */
+ * normal TTL cycle like every other "checked, no result" row in this file.
+ *
+ * `tagged`/`tagsEmpty`/`tagsPending` (Increment 9) are the tag-backfill
+ * funnel. They partition the catalog EXACTLY – every row is either tagged
+ * (stamped, tags NOT NULL), checked-but-empty (stamped, tags NULL), or never
+ * checked – so `tagged + tagsEmpty + tagsPending === total` by construction,
+ * which is what SPEC.md gate (c) ("the numbers add up to the catalog row
+ * count") asks for. Deliberately not gated on app_type/main_hours: unlike
+ * pricePending these count the whole table, so the funnel can never appear
+ * to be missing rows.
+ *
+ * `tagged` requires tags_checked_at IS NOT NULL as well as tags IS NOT NULL
+ * (round-1 review, minor 11). recordTagsResult always writes both together,
+ * so today the extra clause changes nothing – but without it the partition
+ * would rest on that convention rather than on the query, and a row with
+ * tags but no stamp would be counted in BOTH `tagged` and `tagsPending`,
+ * pushing the sum past `total`. Defence in depth for the gate's property.
+ *
+ * `tagsKvSeeded` (round-1 review, blocker 1) is the funnel's kv_seeded leg,
+ * counted catalog-wide off the tags_source column rather than per-run in
+ * memory. See the ALTER_TABLE_STATEMENTS comment for why the column exists:
+ * the fill spans many auto-continue runs and survives restarts, so the only
+ * durable place to record how a row was filled is the row itself.
+ *
+ * It means exactly what SPEC.md §3.3 means by it – "filled WITHOUT spending a
+ * SteamSpy request" – so it is a subset of `tagged + tagsEmpty`, NOT a fourth
+ * partition slice. Do not add it to the sum. (It is very nearly a subset of
+ * `tagged` alone, since only a non-empty cached dict is ever seeded; the gap
+ * is the pathological case where every vote in that dict fails the write
+ * boundary's numeric check and nothing survives to store.) */
 export async function getCatalogStats(env) {
   const row = await env.FPM_DB.prepare(
     `SELECT COUNT(*) AS total,
@@ -461,7 +525,11 @@ export async function getCatalogStats(env) {
             SUM(CASE WHEN app_type IS NOT NULL THEN 1 ELSE 0 END) AS classified,
             SUM(CASE WHEN app_type IS NOT NULL AND app_type != 'game' THEN 1 ELSE 0 END) AS nonGame,
             SUM(CASE WHEN main_hours IS NOT NULL AND app_type = 'game' AND source_owned = 0
-                          AND price_checked_at IS NULL THEN 1 ELSE 0 END) AS pricePending
+                          AND price_checked_at IS NULL THEN 1 ELSE 0 END) AS pricePending,
+            SUM(CASE WHEN tags_checked_at IS NOT NULL AND tags IS NOT NULL THEN 1 ELSE 0 END) AS tagged,
+            SUM(CASE WHEN tags_checked_at IS NOT NULL AND tags IS NULL THEN 1 ELSE 0 END) AS tagsEmpty,
+            SUM(CASE WHEN tags_checked_at IS NULL THEN 1 ELSE 0 END) AS tagsPending,
+            SUM(CASE WHEN tags_source = 'kv' THEN 1 ELSE 0 END) AS tagsKvSeeded
      FROM fpm_catalog`,
   ).first();
   const total = row?.total || 0;
@@ -470,7 +538,23 @@ export async function getCatalogStats(env) {
   const classified = row?.classified || 0;
   const nonGame = row?.nonGame || 0;
   const pricePending = row?.pricePending || 0;
-  return { total, matched, unmatched, pending: total - matched, classified, nonGame, pricePending };
+  const tagged = row?.tagged || 0;
+  const tagsEmpty = row?.tagsEmpty || 0;
+  const tagsPending = row?.tagsPending || 0;
+  const tagsKvSeeded = row?.tagsKvSeeded || 0;
+  return {
+    total,
+    matched,
+    unmatched,
+    pending: total - matched,
+    classified,
+    nonGame,
+    pricePending,
+    tagged,
+    tagsEmpty,
+    tagsPending,
+    tagsKvSeeded,
+  };
 }
 
 /** Every matched (main_hours NOT NULL) catalog row — the lane's actual
@@ -810,6 +894,544 @@ export async function classifyCatalogTypes(env, options = {}) {
   }
 
   return { attempted, classified, nonGame };
+}
+
+// ---------------------------------------------------------------------------
+// Tag backfill (Increment 9) – persists each catalog row's SteamSpy tag dict
+// into D1. Fourth instance of this file's established resumable-batch shape
+// (crawl / app-type / price were the first three): a select-batch + record
+// pair, a paced runner with doubling backoff that retries the SAME item on a
+// bad response, write-through per row, never throws.
+//
+// LIVE-PROBED (2026-08-28, scratchpad/probe-findings-9.md):
+//   - `GET https://steamspy.com/api.php?request=appdetails&appid=N` returns
+//     `tags` as a name → vote-count OBJECT for a populated app (always
+//     exactly 20 tags today), and as an empty ARRAY `[]` for an app SteamSpy
+//     has nothing for – never `{}`. Both arrive as HTTP 200 with a JSON
+//     content-type, so SHAPE is the only signal there is.
+//   - "Empty" is a normal outcome, not an error. It was witnessed on appid 5
+//     ("Dedicated Server", a real non-game app), on the nonexistent appid
+//     999999999, and on the unknown appid 1969360 – i.e. only ever on
+//     non-game or unknown appids. CORRECTED in round-1 review (major 3): an
+//     earlier version of this comment claimed 1969360 was "A Castle Full of
+//     Cats, a genuine floor-passing game with no tags at all". It is not.
+//     1969360 returns `name: null` and has no catalog row; A Castle Full of
+//     Cats is appid 2070550, it IS in the catalog, and it returns a full
+//     20-tag dict. NO catalogued game has been observed returning empty, so
+//     no volume prediction for the empty leg of the funnel has a measured
+//     basis – the live fill will produce the real number. Behaviour is
+//     unaffected either way: fetchSpyTags keys purely on the SHAPE of the
+//     response, never on which appid was asked about.
+//   - The bulk `all` feed carries no `tags` field at all (re-confirmed), so
+//     there is no batched shortcut – this is a per-appid walk.
+//   - The throttle could not be reproduced on the probe day (Cloudflare's
+//     24h edge cache absorbed the burst), so this codes against the
+//     increment-7.7 throttle contract unchanged and REUSES isThrottledBody
+//     rather than re-deriving it.
+// ---------------------------------------------------------------------------
+
+/** Same api.php base as spyQueue.js's per-request tag cache calls, with
+ * `request=appdetails` – deliberately the exact endpoint the app already
+ * uses, so this backfill inherits its known behaviour rather than adding a
+ * second, differently-behaved SteamSpy integration. */
+const STEAMSPY_APPDETAILS_URL = "https://steamspy.com/api.php";
+
+/** Rows to attempt per sync run. Matched to FPM_SYNC_BATCH (3000), NOT to
+ * FPM_TYPE_BATCH's 500 (round-1 review, major 4).
+ *
+ * The instinct was that "one upstream request per row" argues for a small
+ * batch, as it does for classification. It does not, because of how
+ * auto-continue works: runFpmSyncUntilComplete re-runs the ENTIRE pipeline
+ * each iteration, crawlAndUpsertCatalog included, and that crawl is a full
+ * ~86-page walk of SteamSpy's `request=all` feed at ~350 KB/page with no
+ * "recently crawled" short-circuit. So every extra loop iteration costs a
+ * whole re-crawl. At 500/iteration the tag step would need ~37 iterations to
+ * cover ~18.3k rows, making it the loop DRIVER where the loop previously
+ * terminated in far fewer – roughly 3,200 extra bulk-feed requests, ~1.1 GB
+ * and ~79 extra minutes of wall-clock that SPEC.md §3.7's sizing never
+ * accounted for, in exactly the burst shape the 7.7 probe found throttles
+ * the `all` endpoint.
+ *
+ * At 3000 the tag step needs ~6 iterations – at or below the pre-existing
+ * HLTB-driven baseline, so it stops being the loop driver. The per-run
+ * wall-clock is longer (a run is a bigger chunk of work), but the TOTAL is
+ * substantially shorter, and nothing here depends on a run being short:
+ * every write is write-through, so a kill mid-run loses nothing. */
+export const FPM_TAGS_BATCH = 3000;
+
+/** Gentle pacing between tag requests – the ~1 req/sec ceiling spyQueue.js
+ * already holds itself to for this same endpoint. Held deliberately despite
+ * the probe failing to trigger a throttle at far higher rates: that probe
+ * shows what SteamSpy PERMITS behind a warm Cloudflare cache, not what it is
+ * willing to serve for a 3-hour unattended walk of the whole catalog.
+ *
+ * This is the INTERVAL only. The clock it is measured against is
+ * spyQueue.js's module-scoped one, shared with /api/recs's background queue
+ * via awaitSpySlot – so the two callers cannot each independently run at
+ * 1 req/sec and jointly hit 2 (round-1 review, major 5). */
+export const FPM_TAGS_PACING_MS = 1000;
+
+/** Backoff on a throttle/error signal. SPEC.md §3.1 sets an explicit >60s
+ * cooldown floor for this endpoint's throttle; this starts meaningfully
+ * above that floor (the 7.7 lesson: a retry 65s after a throttle was still
+ * throttled) and doubles, capped, on repeated hits. */
+export const FPM_TAGS_BACKOFF_BASE_MS = 90_000;
+export const FPM_TAGS_BACKOFF_MAX_MS = 600_000;
+
+/** Consecutive bad (throttled/error) responses to tolerate before giving up
+ * on this run's remaining rows – mirrors FPM_TYPE_MAX_CONSECUTIVE_BAD.
+ * Cheap to abandon: nothing in an unattempted row was stamped, so the next
+ * run's selection picks the exact same rows right back up. */
+export const FPM_TAGS_MAX_CONSECUTIVE_BAD = 20;
+
+/** Attempts to spend on ONE row before advancing past it (round-2 review,
+ * major CR-9). The pass-level valve above is not enough on its own: it only
+ * ever fires or does not, and the retry loop it guards has no other exit, so
+ * a single row whose response is never classifiable as `ok` burns the whole
+ * consecutive-bad budget, abandons the rest of the run, is left UNSTAMPED,
+ * and is then reselected FIRST next run by selectTagsBatch's deterministic
+ * ORDER BY – forever. The fill would look busy and make zero progress, which
+ * is exactly what SPEC.md §3.5 forbids ("one stuck item must never zero a
+ * batch", the inc-7.8 discipline).
+ *
+ * The two valves are complementary, not redundant: this one handles ONE
+ * poisoned row, FPM_TAGS_MAX_CONSECUTIVE_BAD handles SteamSpy being down.
+ * Five clears any plausible transient (four backoff sleeps, ~20 min from a
+ * fresh backoff) while bounding the damage one row can do. A skipped row is
+ * left unstamped exactly like a given-up one, so nothing is baked in – it is
+ * simply retried on a later run instead of blocking this one. */
+export const FPM_TAGS_MAX_ROW_ATTEMPTS = 5;
+
+/** Consecutive D1 write failures to tolerate before abandoning the run
+ * (round-2 review, minor CR-12). Write failures deliberately do NOT feed
+ * consecutiveBad – that counter is about the upstream – so without this a
+ * broken D1 would let a run spend a full FPM_TAGS_BATCH of SteamSpy requests
+ * (~50 min) storing nothing, and then do it again next iteration. Small and
+ * dedicated rather than shared with the upstream valve: a D1 write is local
+ * and unthrottled, so five refusals in a row is already a clear verdict. */
+export const FPM_TAGS_MAX_CONSECUTIVE_WRITE_FAILURES = 5;
+
+/** How often the tag step's backoff sleep looks up to see whether a stop has
+ * been requested (round-2 review, major SEC-7). One second is far below any
+ * human's patience threshold and adds at most one extra timer per second of
+ * an already-idle wait. */
+const FPM_TAGS_STOP_CHECK_INTERVAL_MS = 1000;
+
+let tagsPacingMs = FPM_TAGS_PACING_MS;
+let tagsBackoffBaseMs = FPM_TAGS_BACKOFF_BASE_MS;
+let tagsBackoffMaxMs = FPM_TAGS_BACKOFF_MAX_MS;
+
+/** TEST-ONLY seam: shrink pacing so tag-backfill tests don't burn real
+ * wall-clock time. Never called from production code. */
+export function __setTagsPacingMsForTests(ms) {
+  tagsPacingMs = ms;
+}
+
+/** TEST-ONLY seam: shrink backoff so throttle-retry tests don't burn real
+ * wall-clock time. Never called from production code. */
+export function __setTagsBackoffMsForTests(baseMs, maxMs) {
+  tagsBackoffBaseMs = baseMs;
+  tagsBackoffMaxMs = maxMs;
+}
+
+/** TEST-ONLY seam: restore production pacing/backoff between tests. */
+export function __resetTagsPacingForTests() {
+  tagsPacingMs = FPM_TAGS_PACING_MS;
+  tagsBackoffBaseMs = FPM_TAGS_BACKOFF_BASE_MS;
+  tagsBackoffMaxMs = FPM_TAGS_BACKOFF_MAX_MS;
+}
+
+/**
+ * Fetch one appid's SteamSpy tag dict. Never throws – mirrors
+ * fetchAppType's/fetchSteamSpyAllPage's typed-outcome contract exactly.
+ * @param {number} appid
+ * @returns {Promise<{status: 'ok'|'throttled'|'error', tags: object|null}>}
+ *   status 'ok' with tags:null is the GENUINE empty outcome (the live `[]`
+ *   array shape, or `{}`, or a missing/non-object field) – a real answer,
+ *   recorded and stamped by the caller, never retried via backoff.
+ *
+ *   The one deliberate deviation from fetchSteamSpyAllPage: a 200 whose body
+ *   does not parse to a plain JSON object CARRYING AN `appid` FIELD is
+ *   classified 'throttled', NOT 'error'. Per the probe, a plain-text 200 IS
+ *   the throttle signal on this host, so an unrecognisable 200 must back off
+ *   rather than be recorded as a real answer – treating it as data would
+ *   stamp a transient upstream failure as "this game has no tags"
+ *   permanently, and §3.6 never revisits a stamped row.
+ */
+export async function fetchSpyTags(appid) {
+  const url = new URL(STEAMSPY_APPDETAILS_URL);
+  url.searchParams.set("request", "appdetails");
+  url.searchParams.set("appid", String(appid));
+
+  let res;
+  try {
+    res = await fetch(url.toString());
+  } catch {
+    return { status: "error", tags: null };
+  }
+
+  let text;
+  try {
+    text = await res.text();
+  } catch {
+    return { status: "error", tags: null };
+  }
+
+  // A bare 500 (empty body) and the plain-text throttle message are the same
+  // "back off and retry" case – the 7.7 contract, reused not re-derived.
+  if (res.status === 500 || isThrottledBody(text)) {
+    return { status: "throttled", tags: null };
+  }
+  if (!res.ok) {
+    return { status: "error", tags: null };
+  }
+
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    return { status: "throttled", tags: null };
+  }
+  if (!json || typeof json !== "object" || Array.isArray(json)) {
+    return { status: "throttled", tags: null };
+  }
+
+  // Round-1 review, blocker 2: an "empty" answer is IRREVERSIBLE (§3.6 never
+  // re-fetches a stamped row), so only a body that actually looks like an
+  // appdetails row may produce one. A JSON ERROR ENVELOPE – say
+  // `{"error":"db down"}` – is a plain object with no `tags` field, and
+  // without this gate it would be read as "this game has no tags" and baked
+  // into the catalog permanently for a whole bad SteamSpy hour's worth of
+  // rows. `appid` is the safe discriminator: the probe shows SteamSpy
+  // SYNTHESISES a full row carrying `appid` even for the nonexistent appid
+  // 999999999, so a genuine empty answer always has it and this gate cannot
+  // misfire on one. Anything else is classified 'throttled' – retried, not
+  // stamped.
+  if (!("appid" in json)) {
+    return { status: "throttled", tags: null };
+  }
+
+  const tags = json.tags;
+  // The live empty shape is an EMPTY array. A NON-empty array is a shape
+  // nobody has ever observed (round-1 review, minor 10) – speculative, but
+  // stamping it would permanently lose real tags, so treat it as 'throttled'
+  // and retry rather than assuming it means "nothing".
+  if (Array.isArray(tags)) {
+    return tags.length === 0 ? { status: "ok", tags: null } : { status: "throttled", tags: null };
+  }
+  if (!tags || typeof tags !== "object" || Object.keys(tags).length === 0) {
+    return { status: "ok", tags: null }; // `{}` / missing – a real answer, same as `[]`
+  }
+  return { status: "ok", tags };
+}
+
+/**
+ * Select up to `limit` rows that have never had a tag-fetch attempt
+ * concluded, in SPEC.md §3.4's priority order: owned rows first (their tags
+ * are inc 11's taste-profile input), then on-sale rows, then the remainder
+ * by owners descending.
+ *
+ * DELIBERATE DEVIATION, not an omission: unlike selectHltbBatch /
+ * selectTypeClassificationBatch / selectPriceBatch this takes NO
+ * `staleCutoffMs` and has no TTL retry. SPEC.md §3.6 is explicit – tags are
+ * near-static, a row with tags_checked_at set is done for this increment
+ * (whether it came back tagged or empty), and any refresh TTL is a future
+ * decision rather than something to build now.
+ * @param {object} env
+ * @param {{limit: number}} options
+ * @returns {Promise<Array<{appid: number, name: string}>>}
+ */
+export async function selectTagsBatch(env, { limit }) {
+  const result = await env.FPM_DB.prepare(
+    `SELECT appid, name FROM fpm_catalog
+     WHERE tags_checked_at IS NULL
+     ORDER BY source_owned DESC, source_deal DESC, owners DESC, (positive + negative) DESC
+     LIMIT ?`,
+  )
+    .bind(limit)
+    .all();
+  return result.results || [];
+}
+
+/** Maximum tag entries stored per row. SteamSpy returns exactly 20 today
+ * (every populated capture in the probe), so this is pure belt-and-braces
+ * against an unbounded response rather than a normalisation – it can only
+ * bite if SteamSpy doubles what it serves. Kept well above 20 so it is never
+ * silently reshaping today's data. */
+const TAGS_MAX_ENTRIES = 40;
+
+/**
+ * Defensive coercion at the write boundary (round-1 review, minor 9). Keeps
+ * only entries with a string key and a positive, finite vote count, stores
+ * the vote as a NUMBER, and caps to the top TAGS_MAX_ENTRIES by votes.
+ *
+ * NOT a normalisation: SPEC.md §2 says store the live shape, and a
+ * tag-name → number dict is exactly that. This only guards against a value
+ * that is not a number at all. src/profile.js's buildTagVector filters on
+ * `Number(votes) > 0` but then sums the RAW value, so a numeric-STRING vote
+ * would make its running total a string and turn every inc-11 tag weight
+ * into NaN. Every one of the 180 tag values in the live captures is a real
+ * number, so this is latent hardening – but this increment is the write
+ * boundary, so it is the cheapest possible place to make it impossible.
+ * @param {object|null|undefined} tags
+ * @returns {Object<string, number>|null} null when nothing usable survives.
+ */
+function sanitizeTagDict(tags) {
+  if (!tags || typeof tags !== "object" || Array.isArray(tags)) return null;
+  const entries = [];
+  for (const [name, votes] of Object.entries(tags)) {
+    if (typeof name !== "string" || name.length === 0) continue;
+    const n = Number(votes);
+    if (!Number.isFinite(n) || n <= 0) continue;
+    entries.push([name, n]);
+  }
+  if (entries.length === 0) return null;
+  entries.sort((a, b) => b[1] - a[1]);
+  return Object.fromEntries(entries.slice(0, TAGS_MAX_ENTRIES));
+}
+
+/** Write back one tag-fetch outcome. `tags` as an object is sanitized (see
+ * sanitizeTagDict) and stored as JSON text (D1 binds JSON in a TEXT column
+ * as an ordinary string parameter); `tags: null` records a checked-but-empty
+ * row – SteamSpy answered and has nothing, the same "checked, no result"
+ * convention as recordHltbResult / recordAppType. BOTH stamp
+ * tags_checked_at, so neither is ever reselected by selectTagsBatch. Returns
+ * the dict actually STORED (or null), so callers can count what D1 holds
+ * rather than what the network returned.
+ *
+ * `source` is 'kv' (tags came free from the 30d KV cache) or 'live' (a
+ * SteamSpy request was spent). It is written for BOTH outcomes including
+ * empty, so tags_source is non-NULL exactly when tags_checked_at is – see
+ * the ALTER_TABLE_STATEMENTS comment for why the column exists at all.
+ *
+ * DELIBERATE DEVIATION FROM SPEC.md §3.5 (round-1 review, minor 13 –
+ * declared here so inc 11's consumer finds it rather than discovers it):
+ * §3.5 says record `{}` for the empty outcome. This records SQL NULL
+ * instead. Recording `{}` would make `tags IS NOT NULL` true for an empty
+ * row, so getCatalogStats' `tagged` would count rows with no tags and the
+ * gate (c) partition would stop meaning anything. The stamp in
+ * tags_checked_at already carries the "we asked and got nothing" fact, which
+ * is the part §3.5 actually needs. Inc 11 must therefore read a NULL `tags`
+ * column as "checked, genuinely no tags", not as "not yet fetched" – that
+ * distinction lives in tags_checked_at. */
+export async function recordTagsResult(env, appid, { tags, checkedAtMs, source }) {
+  const clean = sanitizeTagDict(tags);
+  const json = clean ? JSON.stringify(clean) : null;
+  await env.FPM_DB.prepare("UPDATE fpm_catalog SET tags = ?, tags_checked_at = ?, tags_source = ? WHERE appid = ?")
+    .bind(json, checkedAtMs, source ?? null, appid)
+    .run();
+  return clean;
+}
+
+/**
+ * Sleep up to `totalMs`, waking early if an auto-continue stop has been
+ * requested (round-2 review, major SEC-7). Checks at most
+ * FPM_TAGS_STOP_CHECK_INTERVAL_MS apart, so a Stop during the tag step's
+ * long backoff is honoured in about a second instead of up to 2h50m.
+ * @returns {Promise<boolean>} true if the full interval elapsed, false if a
+ *   stop was requested (the caller must then return its counters).
+ */
+async function sleepUnlessStopRequested(totalMs) {
+  const deadline = Date.now() + totalMs;
+  for (;;) {
+    if (isFpmStopRequested()) return false;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return true;
+    await sleep(Math.min(remaining, FPM_TAGS_STOP_CHECK_INTERVAL_MS));
+  }
+}
+
+/**
+ * Backfill up to FPM_TAGS_BATCH rows' tags. TWO SEQUENTIAL PASSES over the
+ * batch, not two stages per row (round-1 review, minor 8):
+ *
+ *  PASS 1 – KV seed (SPEC.md §3.3). The per-request tag cache (30d) already
+ *    holds a usable tag dict for thousands of catalog rows, all free. Seeded
+ *    rows are written straight through to D1 and make ZERO SteamSpy
+ *    requests. Doing the WHOLE batch's KV pass first matters during a
+ *    SteamSpy outage: the old per-row interleaving meant the live-fetch
+ *    give-up valve abandoned the rest of the batch INCLUDING rows that would
+ *    have cost nothing, so each auto-continue iteration achieved nothing
+ *    while burning one of the 200. Now the free wins always land.
+ *
+ *  PASS 2 – live fetch for whatever pass 1 missed, paced through
+ *    spyQueue.js's SHARED slot reservation (awaitSpySlot) so this and
+ *    /api/recs's background queue jointly respect ONE ~1 req/sec ceiling on
+ *    the SteamSpy host rather than one each (round-1 review, major 5).
+ *    Doubling backoff-and-retry on the SAME appid, then THREE valves, each
+ *    covering a failure the others cannot (round-2 review, CR-9 / CR-12):
+ *      - per ROW, after FPM_TAGS_MAX_ROW_ATTEMPTS bad responses: advance to
+ *        the next row, leave this one unstamped, count it in `skipped`. One
+ *        permanently unclassifiable response must never stall the fill.
+ *      - per PASS, after FPM_TAGS_MAX_CONSECUTIVE_BAD bad responses in a
+ *        row: abandon the run's remaining rows (`gaveUp`). SteamSpy is down.
+ *      - per PASS, after FPM_TAGS_MAX_CONSECUTIVE_WRITE_FAILURES refused D1
+ *        writes in a row: abandon too, so a broken database stops spending
+ *        third-party request budget on answers it cannot store.
+ *    Writes through per row, so a kill mid-run loses nothing recorded.
+ *
+ * NEVER THROWS – and that is now true rather than aspirational (round-1
+ * review, major 6; round-2 review, CR-13/SEC-9). Every D1 call is
+ * individually wrapped, the batch SELECT included: a write failure
+ * increments `writeFailed`, logs, and leaves the row unstamped for the next
+ * run; a failed SELECT logs and returns a zeroed result. Neither throws all
+ * the way out through runFpmSyncPipeline and runFpmSyncUntilComplete into
+ * startFpmAutoContinue's silent `.catch(() => {})`, which would leave an
+ * operator unable to tell "finished" from "died twenty minutes in".
+ *
+ * A KV value of `null` is a seed MISS, not an empty (the subtlest decision
+ * in this increment, per probe 4): spyQueue.js caches `null` for three
+ * different reasons – genuine no-tags, a non-2xx, and a network error – and
+ * the cached value cannot tell them apart. Writing one into D1 as a
+ * definitive "empty" would permanently bake a transient SteamSpy blip into
+ * the catalog, so those rows fall through to the live fetch, where the
+ * outcome gets classified honestly.
+ * @param {object} env - needs env.FPM_DB and env.TAG_CACHE.
+ * @param {{limit?: number, now?: number}} [options]
+ * @returns {Promise<{attempted: number, tagged: number, kvSeeded: number, empty: number, kvFailed: number, writeFailed: number, skipped: number, gaveUp: number}>}
+ *   `attempted` counts rows that got a real answer from either pass AND were
+ *   successfully recorded; `tagged` counts those that stored tags; `kvSeeded`
+ *   counts rows filled WITHOUT spending a SteamSpy request (SPEC.md §3.3's
+ *   sense), so it overlaps `tagged` rather than being disjoint from it – do
+ *   not add it to the other legs; `kvFailed` counts KV reads that threw – normally 0, but a
+ *   large number means the cache is effectively unavailable (e.g. TAG_CACHE
+ *   unbound) and the run is silently spending hours on live fetches it did
+ *   not need to, which is exactly the gate (d) signal that was previously
+ *   swallowed (round-1 review, minor 12); `writeFailed` counts rows that got
+ *   a good answer D1 then refused to store; `skipped` counts rows the live
+ *   pass walked PAST after FPM_TAGS_MAX_ROW_ATTEMPTS bad responses, the
+ *   `skipped` leg SPEC.md §3.5's counter set names; `gaveUp` is the rows
+ *   abandoned unresolved when a pass-level valve trips. Neither `skipped`
+ *   nor `gaveUp` rows are ever stamped, so both are retried next run and
+ *   both remain counted in the funnel's `tagsPending`.
+ */
+export async function backfillCatalogTags(env, options = {}) {
+  const limit = options.limit ?? FPM_TAGS_BATCH;
+  const nowMs = options.now ?? Date.now();
+
+  // The one D1 call that was still unwrapped (round-2 review, CR-13 +
+  // SEC-9). A throw here propagated out of the pipeline into
+  // startFpmAutoContinue's silent .catch(), killing a multi-hour unattended
+  // run with no counter and no log line – the exact failure the "never
+  // throws" contract above exists to prevent.
+  let rows;
+  try {
+    rows = await selectTagsBatch(env, { limit });
+  } catch (err) {
+    console.log(`[fpm-sync] tags: batch selection failed – nothing attempted this run: ${err?.message ?? err}`);
+    return { attempted: 0, tagged: 0, kvSeeded: 0, empty: 0, kvFailed: 0, writeFailed: 0, skipped: 0, gaveUp: 0 };
+  }
+
+  let attempted = 0;
+  let tagged = 0;
+  let kvSeeded = 0;
+  let empty = 0;
+  let kvFailed = 0;
+  let writeFailed = 0;
+  let skipped = 0;
+  let consecutiveWriteFailed = 0;
+
+  /** One snapshot of every counter, so the live pass's four exits (finished,
+   * upstream valve, write valve, stop requested) cannot drift apart. */
+  const tally = (gaveUp = 0) => ({ attempted, tagged, kvSeeded, empty, kvFailed, writeFailed, skipped, gaveUp });
+
+  /** Record one outcome, counting it only if D1 actually took it. Counters
+   * key off what was STORED (recordTagsResult returns its sanitized dict, or
+   * null), not off what was fetched, so `tagged`/`empty` can never drift
+   * from the columns getCatalogStats reads back. */
+  const record = async (appid, tags, source) => {
+    let stored;
+    try {
+      stored = await recordTagsResult(env, appid, { tags, checkedAtMs: nowMs, source });
+    } catch (err) {
+      writeFailed++;
+      consecutiveWriteFailed++;
+      console.log(`[fpm-sync] tags: D1 write failed for appid ${appid} – left unstamped for the next run: ${err?.message ?? err}`);
+      return false;
+    }
+    consecutiveWriteFailed = 0;
+    attempted++;
+    if (stored) tagged++;
+    else empty++;
+    return true;
+  };
+
+  // --- Pass 1: KV seed the whole batch (free, no SteamSpy traffic) --------
+  const kvMisses = [];
+  for (const row of rows) {
+    let seeded = null;
+    try {
+      const cached = await getCachedSpy(env, row.appid);
+      const cachedTags = cached.cached && cached.data && typeof cached.data === "object" ? cached.data.tags : null;
+      if (cachedTags && typeof cachedTags === "object" && !Array.isArray(cachedTags) && Object.keys(cachedTags).length > 0) {
+        seeded = cachedTags;
+      }
+    } catch {
+      // A KV read failure is just a missed free win – fall through to the
+      // live fetch rather than failing the row. Counted, not swallowed.
+      kvFailed++;
+    }
+    if (!seeded) {
+      kvMisses.push(row);
+      continue;
+    }
+    if (await record(row.appid, seeded, "kv")) kvSeeded++;
+  }
+
+  // --- Pass 2: live fetch the misses -------------------------------------
+  let backoff = tagsBackoffBaseMs;
+  let consecutiveBad = 0;
+
+  for (let i = 0; i < kvMisses.length; i++) {
+    const row = kvMisses[i];
+    let rowAttempts = 0;
+
+    for (;;) {
+      await awaitSpySlot(tagsPacingMs);
+
+      rowAttempts++;
+      const result = await fetchSpyTags(row.appid);
+
+      if (result.status !== "ok") {
+        consecutiveBad++;
+        if (consecutiveBad >= FPM_TAGS_MAX_CONSECUTIVE_BAD) {
+          return tally(kvMisses.length - i); // upstream is down – abandon the rest
+        }
+        if (rowAttempts >= FPM_TAGS_MAX_ROW_ATTEMPTS) {
+          // Round-2 review, CR-9: the ONLY path that advances past a row
+          // which never answers usably. Without it this loop has no exit but
+          // success or the pass valve, so one poisoned row stalls the whole
+          // fill permanently (it is left unstamped and reselected first next
+          // run, by the same deterministic ORDER BY).
+          skipped++;
+          console.log(`[fpm-sync] tags: appid ${row.appid} skipped after ${rowAttempts} unusable responses – left unstamped, retried on a later run`);
+          break;
+        }
+        // Interruptible (round-2 review, SEC-7): a Stop requested during
+        // this backoff is honoured within a second instead of after up to
+        // 2h50m of doubling sleeps. Nothing is in flight here, so bailing
+        // out mid-batch leaves exactly the same state as the valve above.
+        if (!(await sleepUnlessStopRequested(backoff))) return tally(kvMisses.length - i);
+        backoff = Math.min(backoff * 2, tagsBackoffMaxMs);
+        continue; // retry the same appid – never advance on ONE bad response
+      }
+
+      consecutiveBad = 0;
+      backoff = tagsBackoffBaseMs;
+      const stored = await record(row.appid, result.tags, "live");
+      // Round-2 review, CR-12: write failures never touch consecutiveBad
+      // (that valve is about the upstream), so a broken D1 would otherwise
+      // let this run spend its whole SteamSpy budget storing nothing, then
+      // do it again next iteration.
+      if (!stored && consecutiveWriteFailed >= FPM_TAGS_MAX_CONSECUTIVE_WRITE_FAILURES) {
+        console.log(`[fpm-sync] tags: giving up this run after ${consecutiveWriteFailed} consecutive D1 write failures – not spending further SteamSpy requests`);
+        return tally(kvMisses.length - i);
+      }
+      break;
+    }
+  }
+
+  return tally();
 }
 
 // ---------------------------------------------------------------------------
@@ -1318,7 +1940,9 @@ export function __resetLastSyncStatsForTests() {
  * prioritize the classification/HLTB/price batches below) -> classify up
  * to FPM_TYPE_BATCH unclassified rows against storefront appdetails
  * (Increment 7.8 — matched rows first, so a previously-visible leaderboard
- * reappears as fast as possible) -> select up to FPM_SYNC_BATCH NULL-
+ * reappears as fast as possible) -> backfill up to FPM_TAGS_BATCH rows'
+ * SteamSpy tags, KV-seeded where possible (Increment 9 – stored only;
+ * nothing reads the tags column yet) -> select up to FPM_SYNC_BATCH NULL-
  * main_hours, app_type='game' rows in priority order -> resolve them
  * against HLTB, writing through to D1 -> select up to FPM_PRICE_SYNC_BATCH
  * matched/game/unowned rows due for a price check and batch-price them
@@ -1356,6 +1980,14 @@ export async function runFpmSyncPipeline(env, ctx, deps) {
 
   const typeResult = await classifyCatalogTypes(env);
 
+  // Increment 9: tag backfill runs straight after classification, so the
+  // catalog's app-type picture is as complete as possible before this step
+  // spends any SteamSpy budget. Every existing step's relative order is
+  // untouched. Note the batch selection itself deliberately does NOT gate on
+  // app_type: SPEC.md gate (c) wants a funnel that adds up to the whole
+  // catalog row count, which an app_type gate would quietly break.
+  const tagsResult = await backfillCatalogTags(env);
+
   const hltbStaleCutoffMs = Date.now() - FPM_HLTB_TTL_MS;
   const batch = await selectHltbBatch(env, { limit: FPM_SYNC_BATCH, staleCutoffMs: hltbStaleCutoffMs });
   const hltbResult = await resolveHltbBatch(env, ctx, batch);
@@ -1371,6 +2003,26 @@ export async function runFpmSyncPipeline(env, ctx, deps) {
     typeAttempted: typeResult.attempted,
     typeClassified: typeResult.classified,
     typeNonGame: typeResult.nonGame,
+    tagsAttempted: tagsResult.attempted,
+    tagsTagged: tagsResult.tagged,
+    tagsKvSeeded: tagsResult.kvSeeded,
+    tagsEmpty: tagsResult.empty,
+    // Round-2 review, CR-9: SPEC.md §3.5's counter set is
+    // tagged / kv_seeded / empty / pending / skipped. `tagsSkipped` is that
+    // last leg – rows the live pass walked past after too many unusable
+    // responses. Distinct from `tagsGaveUp`, which is the rows abandoned
+    // when a whole pass gives up. Both stay in tagsPending (never stamped).
+    tagsSkipped: tagsResult.skipped,
+    tagsGaveUp: tagsResult.gaveUp,
+    // Round-1 review, majors 6 / minor 12: two failure counters that were
+    // previously swallowed entirely. A non-zero tagsWriteFailed means D1
+    // refused writes (rows left unstamped, retried next run); a large
+    // tagsKvFailed means the tag cache is effectively unavailable and the
+    // run is spending live requests it did not need to. Both were invisible
+    // before, which made "the run died" indistinguishable from "the run
+    // finished" from the status endpoint.
+    tagsKvFailed: tagsResult.kvFailed,
+    tagsWriteFailed: tagsResult.writeFailed,
     cacheHits: hltbResult.cacheHits,
     resolved: hltbResult.resolved,
     gaveUp: hltbResult.gaveUp,
@@ -1381,6 +2033,8 @@ export async function runFpmSyncPipeline(env, ctx, deps) {
   };
   console.log(
     `[fpm-sync] type: ${typeResult.classified} classified (${typeResult.nonGame} non-game) of ${typeResult.attempted} attempted` +
+      ` · tags: ${tagsResult.tagged} tagged (${tagsResult.kvSeeded} kv-seeded), ${tagsResult.empty} empty, ${tagsResult.skipped} skipped, ${tagsResult.gaveUp} gave up,` +
+      ` ${tagsResult.kvFailed} kv-read failures, ${tagsResult.writeFailed} d1-write failures` +
       ` · hltb: ${hltbResult.cacheHits} cache hits, ${hltbResult.resolved} resolved, ${hltbResult.gaveUp} gave up` +
       ` · price: ${priceResult.priced} priced, ${priceResult.noPrice} no-price, ${priceResult.gaveUp} gave up`,
   );
@@ -1452,9 +2106,27 @@ export function isFpmAutoContinueActive() {
 /** Ask a running auto-continue loop to stop after its current in-flight
  * batch step finishes — never interrupts mid-batch (that would abandon a
  * partially-classified/resolved batch outside its own resumable-by-D1-write
- * discipline). A no-op if no auto-continue is running. */
+ * discipline). A no-op if no auto-continue is running.
+ *
+ * ONE deliberate exception, added in Increment 9 (round-2 review, major
+ * SEC-7): the tag step wakes out of its BACKOFF SLEEP when this is set,
+ * rather than making the operator wait out up to 2h50m of doubling backoff
+ * for a Stop that reported success immediately. That exception is safe
+ * precisely because it happens while nothing is in flight – no row is
+ * half-written, and every unresolved row is left unstamped and reselected
+ * next run, which is the same state a given-up row is already in. */
 export function requestFpmAutoContinueStop() {
   fpmAutoContinueStopRequested = true;
+}
+
+/** Internal read of the stop flag, for code EARLIER in this file than the
+ * flag's declaration – specifically the tag step's interruptible backoff
+ * (round-2 review, major SEC-7). A hoisted function declaration, so nothing
+ * had to be reordered. Not exported: this is a within-module detail, and the
+ * public surface stays requestFpmAutoContinueStop /
+ * isFpmAutoContinueActive. */
+function isFpmStopRequested() {
+  return fpmAutoContinueStopRequested;
 }
 
 /** TEST-ONLY seam: reset the module-scoped auto-continue flags between
@@ -1467,8 +2139,9 @@ export function __resetFpmAutoContinueStateForTests() {
 /**
  * Repeatedly runs runFpmSyncPipeline (unchanged) until the type
  * classification funnel (classified >= total), the HLTB funnel
- * (pending === 0), AND the price-backfill funnel (pricePending === 0,
- * Increment 8.5) are all empty, a stop is requested, or
+ * (pending === 0), the price-backfill funnel (pricePending === 0,
+ * Increment 8.5), AND the tag-backfill funnel (tagsPending === 0,
+ * Increment 9) are all empty, a stop is requested, or
  * FPM_AUTO_CONTINUE_MAX_ITERATIONS is reached. Never throws — same
  * resumable-by-construction discipline as the pipeline itself: whatever
  * progress got written to D1 this run stands regardless of how the loop
@@ -1510,7 +2183,12 @@ export async function runFpmSyncUntilComplete(env, ctx, deps) {
     const classificationDone = stats.total > 0 && stats.classified >= stats.total;
     const hltbDone = stats.pending === 0;
     const priceDone = !env.ITAD_API_KEY || stats.pricePending === 0;
-    if (classificationDone && hltbDone && priceDone) break;
+    // Increment 9: one trigger must walk the tag funnel to pending = 0
+    // unattended too (SPEC.md gate (b)). No TTL is involved – a row is done
+    // once tags_checked_at is stamped, tagged or empty – so this reaches 0
+    // and stays there rather than re-arming on a refresh cycle.
+    const tagsDone = stats.tagsPending === 0;
+    if (classificationDone && hltbDone && priceDone && tagsDone) break;
   }
 
   return { iterations, stoppedEarly };

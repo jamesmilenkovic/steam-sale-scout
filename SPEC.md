@@ -1,81 +1,106 @@
-# Increment 8.5 — FPM price coverage + Deals cap headroom (hardening slice)
+# Increment 9 — Tag backfill (Phase 4, slice 1: the global layer completes)
 
-**Type:** Data-integrity / hardening slice. **No engine, ranking-formula, or floor changes.**
-**Base:** `main` @ `401ccfa` (inc 8; Phase-2 "daily-drivable" gate passed)
-**Scoped:** 2026-07-22 (PO, Cowork)
-**Why now:** four of James's six recurring queries run on clipped or price-blind data today. Both fixes are *upstream* of inc 9's LLM re-rank — clean the candidate set before improving the ranker.
-
----
-
-## Problem
-
-Two data-integrity gaps, both sitting directly under James's real usage. Neither is polish; both make the tool give **incomplete answers** (the failure class that produced the app-wide historical-low bug and the DLC/demo contamination — both caught late).
-
-### A. FPM price coverage — 2,918 unowned rows are price-blind
-Since 7.7, FPM is catalog-wide with its own D1 database; price/discount on an FPM row is a **lookup annotation** from the top-300 ITAD batch-price pool (`loadFpmPool` demoted to price-annotation in 7.7). Any floor-passing FPM game **outside the top-300 pool has no price** → invisible to the on-sale filter and the min-price control. 2,918 unowned rows affected (7.8 finding).
-
-### B. `DEALS_FETCH_CAP=1000` at 99% saturation
-Measured live at **990/1000** during inc-8 review under real sale volume. ITAD `/deals/v2` default ordering is trending/recency, **not** cut depth — so heavily-discounted-but-untrending titles past the cap can be silently dropped. The inc-8 awareness comment ("never reached in practice") is measurably wrong.
+**Scoped:** 2026-07-25 (PO session; PRD Rev 2 approved same day)
+**Base:** `main` @ `e8c7fcc` (inc 8.5)
+**Branch suggestion:** `tags`
+**PRD:** `PRDs/2-in-progress/2026-07-04-steam-sale-recommender.md` — Rev 2, Phase 4, increment 9
 
 ---
 
-## Usage evidence (James, 2026-07-22)
+## 1. Goal
 
-His six recurring queries, mapped:
+Persist per-appid SteamSpy tags into the D1 catalog for every floor-passing row.
+Tags are the entire similarity input and the one static per-game fact the
+catalog is missing. After this increment the global layer is complete enough
+for inc 11 (Recs sourcing swap) to be a pure sourcing change.
 
-1. Top FPM ranking — FPM only, no price. ✅ fine today.
-2. "Will any FPM make me play something now" — FPM only. ✅ fine today.
-3. "Any FPM on sale?" — needs price on FPM rows → **hit by A.**
-4. "What's recommended to me (no discount)" — pure taste. ✅ fine today (this is inc 9's target).
-5. "Heavily discounted + high FPM / similar" — **hit by A and B.**
-6. "Outrageously discounted, relevant to me" — deepest cuts → **hit by B.**
+**This increment changes NO user-visible behaviour** beyond sync/funnel
+counters. Recs keeps its current (deal-feed) sourcing until inc 11. FPM,
+Best-of, Deals, Wishlist, scoring, `FPM_FORMULA` (locked `sqrt`), and all
+floors are untouched.
 
-Items 3, 5, 6 are getting incomplete answers now. That is why hardening precedes inc 9.
+## 2. Schema (additive migration, same pattern as 7.8 / 8.5 columns)
 
----
+Add to `fpm_catalog`:
 
-## Scope (committed — two items, nothing else)
+- `tags` TEXT — JSON object exactly as SteamSpy returns it (`{"Roguelike": 4123, ...}`,
+  tag name → vote count). Store the live shape; do not invent a normalised form
+  in this increment (inc 11 consumes it via the existing scoring code, which
+  already understands SteamSpy tag dicts).
+- `tags_checked_at` INTEGER — epoch ms, set whenever a fetch attempt concludes
+  (success, empty, or give-up), the same freshness-stamp discipline as
+  `hltb_checked_at` / `type_checked_at` / `price_checked_at`.
 
-### A. FPM price coverage
-- Extend price annotation to **all floor-passing unowned FPM rows**, not just the top-300 pool.
-- Source = the **same ITAD batch-price endpoint** the top-300 pool already uses. Batched, hard-cached (own cache key, ≥6h TTL). If a one-shot pass exceeds the ITAD rate budget, reuse the catalog-fill discipline (D1-backed, resumable, batch-per-run) rather than a blocking loop.
-- **Probe-first** (use context7): confirm the batch-price endpoint's batch size / limits before writing.
-- Respect ITAD **1,000 req / 5 min**. No 429 storm.
-- Rows ITAD genuinely has no price for → explicit "no price" state **with a visible count**, never a silent blank (fail-soft, but honest — the count is the QA signal).
-- Owned rows keep current behavior (Owned badge wins; price optional).
+## 3. Fill mechanics
 
-### B. Deals cap headroom + honesty
-- Re-measure live saturation on a real sale day.
-- **Confirm the deals-fetch sort order.** If it is *not* cut-sorted, source a deep-cut title that was sitting past the old cap and show it now appears (the load-bearing proof for query 6).
-- Raise `DEALS_FETCH_CAP` to a **documented headroom value** (rationale in the comment), bounded by the ITAD rate budget. Correct the wrong "never reached in practice" comment.
-- No sourcing-logic change beyond the cap value + comment. `BESTOF_FETCH_CAP` / any Recs cap: note saturation if observed, but **only change** if the same saturation is demonstrated live — don't touch on spec.
+1. **Source:** SteamSpy `appdetails?appid=N` — the exact endpoint `spyQueue`
+   already calls. ~1 req/sec, existing throttle lesson applies (throttle =
+   HTTP 200 with a plain-text body — detect by body shape, cooldown >60s).
+2. **Resumable D1 batch job** in `src/catalog.js`, mirroring the established
+   discipline: `selectTagsBatch` / `recordTagsResult` pair, wired into
+   `runFpmSyncPipeline` / `startFpmSync` / auto-continue so one trigger walks
+   to pending=0 unattended (inc-8 behaviour). Write-through per row; survives
+   `wrangler dev` restarts by construction.
+3. **KV seed first (free wins):** the per-request tag cache (30d KV) already
+   holds tags for every game that has ever entered a candidate pool. Before
+   fetching, read KV; on hit, write through to D1 and count it as a KV-seeded
+   fill (no SteamSpy request). Count these separately in the funnel.
+4. **Priority order:** `source_owned=1` first (owned games' tags are the taste
+   -profile input for inc 11), then on-sale rows, then remainder by `owners`
+   descending.
+5. **Outcome recording:** success (non-empty tags) / empty (SteamSpy returns
+   no tags — record `{}`, stamp checked, count it) / give-up after the
+   standard per-item skip pattern (inc-7.8 discipline: one stuck item must
+   never zero a batch). All three visible as counters on the sync status
+   endpoint (`tagged / kv_seeded / empty / pending / skipped`).
+6. **No re-fetch policy:** rows with `tags_checked_at` set are done for this
+   increment. Tags are near-static; any refresh TTL is a future decision, not
+   built now.
+7. **Sizing expectation:** ≤18,306 SteamSpy requests at ~1 req/sec ≈ ~5h
+   worst-case, minus KV seeds. Auto-continue owns it; record actual wall-clock
+   + funnel in the result file.
 
----
+## 4. Mandatory first step — live probes (before writing code)
 
-## Non-goals (explicitly deferred — do not build)
+1. SteamSpy `appdetails` current response: confirm `tags` is a name→votes
+   dict on a known game (e.g. Celeste 504230) and confirm the empty-tags shape
+   on some obscure appid (SteamSpy returns `"tags": []` as an ARRAY when
+   empty — historical quirk; confirm live and handle both shapes).
+2. Confirm the bulk `all` feed still carries no tags field (spec assumption).
+3. Confirm throttle behaviour unchanged (200 + plain-text body).
+4. Fixtures must mirror the live shapes captured in the probe (inc-6 lesson:
+   green tests with wrong-shaped mocks are worthless).
 
-- LLM re-rank → **inc 9**
-- Similarity sort on Recs → inc 9 territory (re-ranking relevance is that increment's whole point)
-- Cron / scheduled sync → **blocked on the deploy decision**, pointless local-only
-- `/api/fpm` pagination → localhost-latency-only, not biting
-- Curated prologue exclusion → accepted cosmetic gap (7.8)
-- Deploy question → separate Phase-3 decision, not an increment
-- `FPM_FORMULA` (`sqrt`) — **LOCKED, do not touch**
-- FPM qualification floors — **do not touch**
+## 5. Out of scope (hard)
 
----
+- Recs sourcing/scoring changes (inc 11). Similarity is NOT computed here.
+- Table rename `fpm_catalog` → `game_catalog` (deferred to inc 11+, when the
+  catalog stops being FPM-branded; a rename in a data slice is risk for zero
+  behaviour).
+- Full price coverage (inc 10).
+- Any UI beyond sync-status counters.
+- `FPM_FORMULA`, floors, Best-of/Deals/Wishlist paths.
 
-## Acceptance / live-proof QA (gates a–f)
+## 6. Gates
 
-- **(a)** Every on-sale **unowned** FPM row shows price + discount. Count of price-blind unowned FPM rows → **0**, or a residual with a logged per-row reason (ITAD truly has no price). "Any FPM on sale?" returns the complete set.
-- **(b)** Regression demo: a "high FPM + heavily discounted" title that was hidden by the price gap now surfaces.
-- **(c)** `DEALS_FETCH_CAP` — live saturation re-measured; deals-fetch sort order confirmed; if not cut-sorted, a deep-cut title past the old cap is proven to now source.
-- **(d)** Rate budget respected — no ITAD 429 storm; price backfill cache-hard and (if batched) resumable across dev-server restarts.
-- **(e)** Zero-diff regression: FPM ranking order unchanged where price was already present; Best-of / Recs / Deals rankings unchanged **except** newly-sourced deep-cut deals appearing.
-- **(f)** Full unit suite green + new tests: price-coverage completeness, cap-headroom, cache-hardness, fail-soft "no price" state.
+| Gate | Pass condition |
+|---|---|
+| (a) Migration + durability | Additive migration; kill + restart `wrangler dev` mid-fill → resume with zero loss, zero re-fetch of checked rows (the 7.7 acceptance-critical property, re-proven for tags) |
+| (b) Unattended fill | One trigger + auto-continue walks tags to pending=0 with no manual re-triggering; wall-clock recorded |
+| (c) Honest funnel | `tagged / kv_seeded / empty / pending / skipped` counters on the sync status endpoint; numbers add up to the catalog row count; no silent blanks |
+| (d) Rate discipline | ~1 req/sec ceiling respected; throttle detection works live; KV seeds make zero SteamSpy requests |
+| (e) Zero-diff regression | `/api/fpm`, Recs, Best-of, Deals, Wishlist responses byte-identical vs base (nothing consumes tags yet) |
+| (f) Tests | Full suite green; new tests mirror live probe shapes; at least one test proves the empty-tags array/dict duality and one proves resume-without-refetch |
 
----
+## 7. ⛩ REVIEW
 
-## Constraints
-
-Local-only (`wrangler dev`, no deploy). Probe-first for the ITAD batch-price shape. `use context7` on any ITAD / D1 / wrangler API touch. Fail-soft everywhere. Library + Wishlist exemptions and dismissals behavior intact. `sqrt` formula and FPM floors are **locked** — any change to either is out of scope and a review-blocker.
+- **Gate TLDR:** tags stored for the overwhelming majority of floor-passing
+  rows, the remainder in a visible funnel — and nothing else changed.
+- **Output (produce as part of the increment, in the result file):**
+  1. The final funnel: tagged / kv_seeded / empty / skipped counts + total
+     wall-clock, from the live sync status endpoint.
+  2. A 10-row spot-check table — games James knows (suggested: Celeste, Hades,
+     Slay the Spire, Balatro, Stardew Valley, Terraria, The Witcher 3, Vampire
+     Survivors, A Castle Full of Cats, Euro Truck Simulator 2) — with each
+     row's top-8 tags by votes, straight from D1. James eyeballs that the tags
+     look like the games.

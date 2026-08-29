@@ -138,6 +138,34 @@ function sleep(ms) {
 }
 
 /**
+ * Reserve the next SteamSpy request slot against the SHARED module-scoped
+ * pace, waiting until it comes round. Every caller that hits
+ * `api.php?request=appdetails` must go through this so ONE global ~1 req/sec
+ * ceiling governs the host (SPEC.md inc-9 gate (d)).
+ *
+ * Added in Increment 9 (round-1 review, major 5). Before it, the inc-9 tag
+ * backfill in src/catalog.js kept its OWN independent 1 req/sec pacer, so any
+ * /api/recs request landing during the multi-hour unattended tag fill put
+ * 2 req/sec on the same endpoint – two pacers each individually well-behaved
+ * and jointly over the ceiling.
+ *
+ * The reservation is stamped BEFORE the sleep, not after: two concurrent
+ * callers must not both read the same `spyLastFetchAt`, both wait the same
+ * amount and then both fire at once. Stamping first makes them queue.
+ *
+ * @param {number} [minIntervalMs] - the caller's own interval; the backfill
+ *   passes its configured pacing (identical in production) so its test seam
+ *   keeps working without a second module-scoped knob. The SHARED thing is
+ *   the timestamp, which is what the ceiling is actually made of.
+ */
+export async function awaitSpySlot(minIntervalMs = spyMinIntervalMs) {
+  const now = Date.now();
+  const wait = computeSpyWaitMs(spyLastFetchAt, now, minIntervalMs);
+  spyLastFetchAt = now + wait;
+  if (wait > 0) await sleep(wait);
+}
+
+/**
  * Fetch + classify + cache one appid from SteamSpy, pacing to ≤1 req/sec
  * across the whole queue via the module-scoped `spyLastFetchAt`. A thrown
  * network error or non-2xx response is cached `null` for only 1h
@@ -148,9 +176,7 @@ function sleep(ms) {
  * this appid, so there's less reason to expect a retry to help soon.
  */
 async function fetchAndCacheSpy(env, appid) {
-  const wait = computeSpyWaitMs(spyLastFetchAt, Date.now(), spyMinIntervalMs);
-  if (wait > 0) await sleep(wait);
-  spyLastFetchAt = Date.now();
+  await awaitSpySlot();
 
   let classified = null;
   let errored = false;

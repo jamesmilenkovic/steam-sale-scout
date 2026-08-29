@@ -11,7 +11,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { makeMockD1 } from "./helpers/mockD1.mjs";
+import { SPY_CELESTE, SPY_EMPTY_UNKNOWN_APPID } from "./fixtures/spy-appdetails.mjs";
 import { __setHltbMinIntervalMsForTests, __resetHltbQueueForTests } from "../src/hltb.js";
+// Increment 9: backfillCatalogTags reserves its SteamSpy slots through
+// spyQueue.js's module-scoped clock (awaitSpySlot), so every pipeline test in
+// this file now mutates that module's state — reset it between tests.
+import { __setSpyMinIntervalMsForTests, __resetSpyQueueForTests } from "../src/spyQueue.js";
 import {
   CATALOG_PAGE_SIZE,
   FPM_SYNC_BATCH,
@@ -28,6 +33,7 @@ import {
   markDeal,
   selectHltbBatch,
   recordHltbResult,
+  recordTagsResult,
   getCatalogStats,
   selectMatchedCatalogRows,
   crawlAndUpsertCatalog,
@@ -61,6 +67,9 @@ import {
   __resetTypePacingForTests,
   __setPricePacingMsForTests,
   __setPriceBackoffMsForTests,
+  __setTagsPacingMsForTests,
+  __setTagsBackoffMsForTests,
+  __resetTagsPacingForTests,
   __resetPricePacingForTests,
   __setHltbPollingForTests,
   __resetHltbPollingForTests,
@@ -140,12 +149,16 @@ function bulkRow(overrides = {}) {
 test.beforeEach(() => {
   __setHltbMinIntervalMsForTests(0);
   __resetHltbQueueForTests();
+  __setSpyMinIntervalMsForTests(0);
+  __resetSpyQueueForTests();
   __setCatalogPacingMsForTests(0);
   __setCatalogBackoffMsForTests(0, 0);
   __setTypePacingMsForTests(0);
   __setTypeBackoffMsForTests(0, 0);
   __setPricePacingMsForTests(0);
   __setPriceBackoffMsForTests(0, 0);
+  __setTagsPacingMsForTests(0);
+  __setTagsBackoffMsForTests(0, 0);
   __setHltbPollingForTests(0, 50);
   __resetFpmSyncStateForTests();
   __resetLastSyncStatsForTests();
@@ -155,9 +168,12 @@ test.beforeEach(() => {
 test.afterEach(() => {
   restoreGlobals();
   __setHltbMinIntervalMsForTests(1000);
+  __setSpyMinIntervalMsForTests(1000);
+  __resetSpyQueueForTests();
   __resetCatalogPacingForTests();
   __resetTypePacingForTests();
   __resetPricePacingForTests();
+  __resetTagsPacingForTests();
   __resetHltbPollingForTests();
   __resetHltbItemTimeoutForTests();
   __resetFpmAutoContinueMaxIterationsForTests();
@@ -181,6 +197,30 @@ function appdetailsBranch(url, type = "game") {
   if (u.hostname !== "store.steampowered.com" || u.pathname !== "/api/appdetails") return null;
   const appid = u.searchParams.get("appids");
   return new Response(JSON.stringify({ [appid]: { success: true, data: { type, name: "x" } } }), { status: 200 });
+}
+
+/** Fetch-mock branch for SteamSpy `appdetails` – Increment 9's tag backfill
+ * runs as part of every runFpmSyncPipeline call, so any test driving the full
+ * pipeline has to answer this endpoint, exactly as 7.8's classification step
+ * forced appdetailsBranch above.
+ *
+ * DELIBERATE, and it has to be (round-1 review, major 7): these pipeline
+ * stubs used to answer `steamspy.com` with a blanket `{}` meant for the CRAWL
+ * endpoint, and the tag step read that same `{}` as a genuine "this game has
+ * no tags" answer and stamped every row. The tests passed by accident. They
+ * also now WOULD fail, because fetchSpyTags only accepts a body carrying an
+ * `appid` field as a real answer – a bare `{}` is classified as a throttle
+ * and retried. So the crawl branch and the appdetails branch must be told
+ * apart on `request=`, not on hostname.
+ *
+ * Answers with a real live capture, re-appid'd to whichever row is being asked
+ * about, so the pipeline sees the true shape. Defaults to Celeste's 20-tag
+ * dict (the populated shape); pass SPY_EMPTY_UNKNOWN_APPID for the empty
+ * ARRAY shape where a test wants the tag step to be a cheap no-op. */
+function spyAppdetailsBranch(url, fixture = SPY_CELESTE) {
+  const u = new URL(url);
+  if (u.hostname !== "steamspy.com" || u.searchParams.get("request") !== "appdetails") return null;
+  return jsonResponse({ ...fixture, appid: Number(u.searchParams.get("appid")) });
 }
 
 // ---------------------------------------------------------------------------
@@ -288,7 +328,7 @@ test("ensureCatalogSchema is idempotent (safe to call repeatedly)", async () => 
   await ensureCatalogSchema(env);
   await ensureCatalogSchema(env);
   const stats = await getCatalogStats(env);
-  assert.deepEqual(stats, { total: 0, matched: 0, unmatched: 0, pending: 0, classified: 0, nonGame: 0, pricePending: 0 });
+  assert.deepEqual(stats, { total: 0, matched: 0, unmatched: 0, pending: 0, classified: 0, nonGame: 0, pricePending: 0, tagged: 0, tagsEmpty: 0, tagsPending: 0, tagsKvSeeded: 0 });
 });
 
 test("ensureCatalogSchema on a pre-7.8 install (table exists without app_type/type_checked_at) adds the columns without losing existing data", async () => {
@@ -324,6 +364,13 @@ test("ensureCatalogSchema on a pre-7.8 install (table exists without app_type/ty
   // way, on the same pre-existing install.
   assert.equal(row.price, null);
   assert.equal(row.price_checked_at, null, "not yet checked — distinct from a checked-but-priceless row");
+  // Increment 9's tag-backfill columns are added the same ALTER TABLE way,
+  // on the same pre-existing install (the live D1 already holds 18,306 rows
+  // written before these columns existed, and only the ALTER entries reach
+  // them). All three must arrive as NULL, with the prior row data intact.
+  assert.equal(row.tags, null);
+  assert.equal(row.tags_checked_at, null, "not yet checked — distinct from a checked-but-tagless row");
+  assert.equal(row.tags_source, null, "NULL only while the row is still unchecked");
 
   // A second call must also be safe (column-already-exists is expected and
   // swallowed every time after the first).
@@ -331,6 +378,20 @@ test("ensureCatalogSchema on a pre-7.8 install (table exists without app_type/ty
   const stats = await getCatalogStats(env);
   assert.equal(stats.total, 1);
   assert.equal(stats.classified, 0);
+  assert.equal(stats.tagged, 0);
+  assert.equal(stats.tagsEmpty, 0);
+  assert.equal(stats.tagsKvSeeded, 0);
+  assert.equal(stats.tagsPending, 1, "the migrated row enters the tag funnel as pending, not as a silent blank");
+  assert.equal(stats.tagged + stats.tagsEmpty + stats.tagsPending, stats.total);
+
+  // And the migrated install can actually be written to — the columns are
+  // real, not just present in a PRAGMA listing.
+  await recordTagsResult(env, 500, { tags: SPY_CELESTE.tags, checkedAtMs: 4242, source: "live" });
+  const filled = await env.FPM_DB.prepare("SELECT * FROM fpm_catalog WHERE appid = 500").first();
+  assert.deepEqual(JSON.parse(filled.tags), SPY_CELESTE.tags);
+  assert.equal(filled.tags_checked_at, 4242);
+  assert.equal(filled.tags_source, "live");
+  assert.equal(filled.main_hours, 6.5, "the pre-existing data is still untouched after the tag write");
 });
 
 test("upsertCatalogRows: a brand-new appid inserts with main_hours/match_method NULL and source_catalog=1", async () => {
@@ -546,7 +607,14 @@ test("FPM_SYNC_BATCH (3000) bounds per-run HLTB enqueues; a second run picks up 
   const searchedTitles = new Set();
   globalThis.fetch = async (url, options = {}) => {
     const u = new URL(url);
-    if (u.hostname === "steamspy.com") return new Response(JSON.stringify({}), { status: 200 }); // empty page -> immediate end of crawl, no new rows
+    // Increment 9: the tag backfill runs inside every pipeline run and would
+    // otherwise read the crawl's empty `{}` page as a tag answer. Answered
+    // deliberately with the live EMPTY-tags shape: this test is about
+    // FPM_SYNC_BATCH's HLTB-side bound, so every row's tag lookup should
+    // resolve in one call and stay out of the way.
+    const spyTagsRes = spyAppdetailsBranch(url, SPY_EMPTY_UNKNOWN_APPID);
+    if (spyTagsRes) return spyTagsRes;
+    if (u.hostname === "steamspy.com") return new Response(JSON.stringify({}), { status: 200 }); // empty CRAWL page -> immediate end of crawl, no new rows
     if (u.hostname === "store.steampowered.com") throw new Error("every row is pre-classified — appdetails must not be called");
     if (u.pathname === "/api/bleed/init") return jsonResponse({ token: "tok", hpKey: "hpk", hpVal: "hpv" });
     if (u.pathname === "/api/bleed") {
@@ -594,7 +662,7 @@ test("getCatalogStats: total/matched/unmatched/pending are computed correctly ac
   // appid 3, 4: never checked
 
   const stats = await getCatalogStats(env);
-  assert.deepEqual(stats, { total: 4, matched: 1, unmatched: 1, pending: 3, classified: 0, nonGame: 0, pricePending: 0 });
+  assert.deepEqual(stats, { total: 4, matched: 1, unmatched: 1, pending: 3, classified: 0, nonGame: 0, pricePending: 0, tagged: 0, tagsEmpty: 0, tagsPending: 4, tagsKvSeeded: 0 });
 });
 
 test("getCatalogStats: classified/nonGame count app_type rows independently of the HLTB matched/unmatched/pending fields", async () => {
@@ -1392,6 +1460,8 @@ test("runFpmSyncPipeline: crawl -> union owned/deal -> priority HLTB batch, end 
   });
   globalThis.fetch = async (url, options) => {
     const u = new URL(url);
+    const spyTagsRes = spyAppdetailsBranch(url); // Increment 9: the tag backfill runs inside every pipeline run
+    if (spyTagsRes) return spyTagsRes;
     if (u.hostname === "steamspy.com") {
       const page = u.searchParams.get("page");
       if (page === "0") return new Response(JSON.stringify(page0), { status: 200 }); // partial page -> end of crawl
@@ -1449,6 +1519,8 @@ test("runFpmSyncPipeline: with ITAD_API_KEY set, also price-checks newly-matched
   let priceIdsRequested;
   globalThis.fetch = async (url, options) => {
     const u = new URL(url);
+    const spyTagsRes = spyAppdetailsBranch(url); // Increment 9: the tag backfill runs inside every pipeline run
+    if (spyTagsRes) return spyTagsRes;
     if (u.hostname === "steamspy.com") {
       const page = u.searchParams.get("page");
       if (page === "0") return new Response(JSON.stringify(page0), { status: 200 });
@@ -1502,6 +1574,8 @@ test("runFpmSyncPipeline: without ITAD_API_KEY, the price step is skipped entire
   });
   globalThis.fetch = async (url, options) => {
     const u = new URL(url);
+    const spyTagsRes = spyAppdetailsBranch(url); // Increment 9: the tag backfill runs inside every pipeline run
+    if (spyTagsRes) return spyTagsRes;
     if (u.hostname === "steamspy.com") return new Response(JSON.stringify(page0), { status: 200 });
     const appdetailsRes = appdetailsBranch(url);
     if (appdetailsRes) return appdetailsRes;
@@ -1552,6 +1626,8 @@ test("runFpmSyncPipeline is resumable: a second run only enqueues rows the first
   const queriesSeen = [];
   globalThis.fetch = async (url, options = {}) => {
     const u = new URL(url);
+    const spyTagsRes = spyAppdetailsBranch(url); // Increment 9: the tag backfill runs inside every pipeline run
+    if (spyTagsRes) return spyTagsRes;
     if (u.hostname === "steamspy.com") {
       return new Response(JSON.stringify(page0), { status: 200 }); // partial page -> end of crawl every time
     }
@@ -1597,7 +1673,9 @@ test("runFpmSyncUntilComplete: a catalog that fully resolves in one batch stops 
 
   globalThis.fetch = async (url, options = {}) => {
     const u = new URL(url);
-    if (u.hostname === "steamspy.com") return jsonResponse({}); // empty page -> immediate end of crawl
+    const spyTagsRes = spyAppdetailsBranch(url); // Increment 9: the tag backfill runs inside every pipeline run
+    if (spyTagsRes) return spyTagsRes;
+    if (u.hostname === "steamspy.com") return jsonResponse({}); // empty CRAWL page -> immediate end of crawl
     const appdetailsRes = appdetailsBranch(url);
     if (appdetailsRes) return appdetailsRes; // classification always succeeds
     if (u.pathname === "/api/bleed/init") return jsonResponse({ token: "tok", hpKey: "hpk", hpVal: "hpv" });
@@ -1627,7 +1705,9 @@ test("runFpmSyncUntilComplete: with ITAD_API_KEY set, the loop also waits on the
   let priceLookupCalls = 0;
   globalThis.fetch = async (url, options = {}) => {
     const u = new URL(url);
-    if (u.hostname === "steamspy.com") return jsonResponse({}); // empty page -> immediate end of crawl, every run
+    const spyTagsRes = spyAppdetailsBranch(url); // Increment 9: the tag backfill runs inside every pipeline run
+    if (spyTagsRes) return spyTagsRes;
+    if (u.hostname === "steamspy.com") return jsonResponse({}); // empty CRAWL page -> immediate end of crawl, every run
     const appdetailsRes = appdetailsBranch(url);
     if (appdetailsRes) return appdetailsRes;
     if (u.pathname === "/api/bleed/init") return jsonResponse({ token: "tok", hpKey: "hpk", hpVal: "hpv" });
@@ -1675,7 +1755,9 @@ test("runFpmSyncUntilComplete: keeps calling the batch step across an HLTB outag
   let hltbInitCalls = 0;
   globalThis.fetch = async (url, options = {}) => {
     const u = new URL(url);
-    if (u.hostname === "steamspy.com") return jsonResponse({}); // empty page -> immediate end of crawl, every run
+    const spyTagsRes = spyAppdetailsBranch(url); // Increment 9: the tag backfill runs inside every pipeline run
+    if (spyTagsRes) return spyTagsRes;
+    if (u.hostname === "steamspy.com") return jsonResponse({}); // empty CRAWL page -> immediate end of crawl, every run
     const appdetailsRes = appdetailsBranch(url);
     if (appdetailsRes) return appdetailsRes; // classification always succeeds, both rows, run 1
     if (u.pathname === "/api/bleed/init") {
@@ -1717,7 +1799,9 @@ test("runFpmSyncUntilComplete: a stop request takes effect after the current bat
   // should end the loop early rather than running forever.
   globalThis.fetch = async (url, options = {}) => {
     const u = new URL(url);
-    if (u.hostname === "steamspy.com") return jsonResponse({});
+    const spyTagsRes = spyAppdetailsBranch(url); // Increment 9: the tag backfill runs inside every pipeline run
+    if (spyTagsRes) return spyTagsRes;
+    if (u.hostname === "steamspy.com") return jsonResponse({}); // empty CRAWL page
     const appdetailsRes = appdetailsBranch(url);
     if (appdetailsRes) return appdetailsRes;
     if (u.pathname === "/api/bleed/init") return jsonResponse({ token: "tok", hpKey: "hpk", hpVal: "hpv" });
@@ -1749,7 +1833,9 @@ test("runFpmSyncUntilComplete: gives up after the safety-bound iteration count r
   // NEVER reaches 0 — this run can only stop via the safety bound.
   globalThis.fetch = async (url) => {
     const u = new URL(url);
-    if (u.hostname === "steamspy.com") return jsonResponse({});
+    const spyTagsRes = spyAppdetailsBranch(url); // Increment 9: the tag backfill runs inside every pipeline run
+    if (spyTagsRes) return spyTagsRes;
+    if (u.hostname === "steamspy.com") return jsonResponse({}); // empty CRAWL page
     const appdetailsRes = appdetailsBranch(url);
     if (appdetailsRes) return appdetailsRes;
     if (u.pathname === "/api/bleed/init") return new Response("down", { status: 503 });
