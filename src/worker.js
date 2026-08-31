@@ -2005,6 +2005,13 @@ async function handleFpmSyncStatus(request, env, ctx) {
         tagsEmpty: 0,
         tagsPending: 0,
         tagsKvSeeded: 0,
+        // Increment 10: the experience funnel's counters, zeroed – same
+        // shape as the real branch below and the same reason (0+0+0+0 ===
+        // total 0, so the four-way partition still adds up).
+        experienceScored: 0,
+        experienceUnscored: 0,
+        experiencePending: 0,
+        experienceNotApplicable: 0,
         running: false,
         autoContinue: false,
         dbReady: false,
@@ -2028,6 +2035,17 @@ async function handleFpmSyncStatus(request, env, ctx) {
     // (rows abandoned when a whole pass gave up). Neither is a catalog-wide
     // count, because neither kind of row is ever stamped – both are by
     // definition still inside tagsPending.
+    //
+    // Increment 10's experience funnel comes through the same way:
+    // `experienceScored`/`experienceUnscored`/`experiencePending`/
+    // `experienceNotApplicable`, a FOUR-way partition that sums to `total`
+    // (see getCatalogStats for why the fourth leg exists – the fill gates on
+    // app_type = 'game', so "pending" has to mean "the fill will attempt
+    // this" or it could never reach 0). SPEC.md §4.5's `ghosts_dropped` and
+    // `failed_batches` legs stay per-run under lastRun, as
+    // `experienceGhostsDropped` / `experienceFailedBatches` – neither is a
+    // catalog-wide count, because a dropped ghost is by definition a row
+    // that was never written anywhere.
     //
     // Note lastRun ALSO carries `tagsKvSeeded`/`tagsEmpty` – the same names
     // scoped to the most recent run rather than the catalog. The nesting is

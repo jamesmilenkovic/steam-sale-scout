@@ -1,0 +1,202 @@
+[
+ {
+  "batch": 1,
+  "size": 25,
+  "ms": 27595,
+  "returned": 25,
+  "kept": 25,
+  "model": "claude-opus-5",
+  "usd": 0.174002,
+  "elapsedMin": 0.5
+ },
+ {
+  "batch": 2,
+  "size": 25,
+  "ms": 28614,
+  "returned": 25,
+  "kept": 25,
+  "model": "claude-opus-5",
+  "usd": 0.177159,
+  "elapsedMin": 0.9
+ },
+ {
+  "batch": 3,
+  "size": 25,
+  "ms": 31284,
+  "returned": 25,
+  "kept": 25,
+  "model": "claude-opus-5",
+  "usd": 0.17644,
+  "elapsedMin": 1.5
+ },
+ {
+  "batch": 4,
+  "size": 25,
+  "ms": 28691,
+  "returned": 25,
+  "kept": 25,
+  "model": "claude-opus-5",
+  "usd": 0.172652,
+  "elapsedMin": 1.9
+ },
+ {
+  "batch": 5,
+  "size": 25,
+  "ms": 27833,
+  "returned": 25,
+  "kept": 25,
+  "model": "claude-opus-5",
+  "usd": 0.17143,
+  "elapsedMin": 2.4
+ },
+ {
+  "batch": 6,
+  "size": 25,
+  "ms": 30348,
+  "returned": 26,
+  "kept": 25,
+  "model": "claude-opus-5",
+  "usd": 0.17740399999999998,
+  "elapsedMin": 2.9
+ },
+ {
+  "batch": 7,
+  "size": 25,
+  "ms": 30719,
+  "returned": 25,
+  "kept": 25,
+  "model": "claude-opus-5",
+  "usd": 0.17821800000000002,
+  "elapsedMin": 3.4
+ },
+ {
+  "batch": 8,
+  "size": 25,
+  "ms": 28745,
+  "returned": 25,
+  "kept": 25,
+  "model": "claude-opus-5",
+  "usd": 0.17361499999999996,
+  "elapsedMin": 3.9
+ },
+ {
+  "batch": 9,
+  "size": 25,
+  "ms": 28300,
+  "returned": 25,
+  "kept": 25,
+  "model": "claude-opus-5",
+  "usd": 0.174636,
+  "elapsedMin": 4.4
+ },
+ {
+  "batch": 10,
+  "size": 25,
+  "ms": 29391,
+  "returned": 25,
+  "kept": 25,
+  "model": "claude-opus-5",
+  "usd": 0.17483,
+  "elapsedMin": 4.9
+ },
+ {
+  "batch": 11,
+  "size": 25,
+  "ms": 29109,
+  "returned": 25,
+  "kept": 25,
+  "model": "claude-opus-5",
+  "usd": 0.17599700000000001,
+  "elapsedMin": 5.3
+ },
+ {
+  "batch": 12,
+  "size": 25,
+  "ms": 29582,
+  "returned": 26,
+  "kept": 25,
+  "model": "claude-opus-5",
+  "usd": 0.18135099999999998,
+  "elapsedMin": 5.8
+ },
+ {
+  "batch": 13,
+  "size": 25,
+  "ms": 30101,
+  "returned": 25,
+  "kept": 25,
+  "model": "claude-opus-5",
+  "usd": 0.18238500000000002,
+  "elapsedMin": 6.3
+ },
+ {
+  "batch": 14,
+  "size": 25,
+  "ms": 30712,
+  "returned": 25,
+  "kept": 25,
+  "model": "claude-opus-5",
+  "usd": 0.180381,
+  "elapsedMin": 6.9
+ },
+ {
+  "batch": 15,
+  "size": 25,
+  "ms": 28434,
+  "returned": 25,
+  "kept": 25,
+  "model": "claude-opus-5",
+  "usd": 0.17831600000000003,
+  "elapsedMin": 7.3
+ },
+ {
+  "batch": 16,
+  "size": 25,
+  "ms": 29090,
+  "returned": 27,
+  "kept": 25,
+  "model": "claude-opus-5",
+  "usd": 0.18111900000000003,
+  "elapsedMin": 7.8
+ },
+ {
+  "batch": 17,
+  "size": 25,
+  "ms": 29387,
+  "returned": 25,
+  "kept": 25,
+  "model": "claude-opus-5",
+  "usd": 0.178842,
+  "elapsedMin": 8.3
+ },
+ {
+  "batch": 18,
+  "size": 25,
+  "ms": 30531,
+  "returned": 25,
+  "kept": 25,
+  "model": "claude-opus-5",
+  "usd": 0.17918,
+  "elapsedMin": 8.8
+ },
+ {
+  "batch": 19,
+  "size": 25,
+  "ms": 28840,
+  "returned": 25,
+  "kept": 25,
+  "model": "claude-opus-5",
+  "usd": 0.17799,
+  "elapsedMin": 9.3
+ },
+ {
+  "batch": 20,
+  "size": 25,
+  "ms": 29204,
+  "returned": 25,
+  "kept": 25,
+  "model": "claude-opus-5",
+  "usd": 0.178747,
+  "elapsedMin": 9.8
+ }
+]

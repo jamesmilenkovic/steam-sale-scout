@@ -28,6 +28,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import worker from "../src/worker.js";
 import { makeMockD1 } from "./helpers/mockD1.mjs";
+import { assertNoExperienceLeak } from "./helpers/laneShape.mjs";
 import { ensureDismissalsSchema, addDismissal } from "../src/dismissals.js";
 import {
   TAG_CACHE_TTL_SECONDS,
@@ -911,4 +912,74 @@ test("background fetch caches a thrown network error as null with the short 1h e
   assert.equal(env.TAG_CACHE.ttlByKey.get(v2Key(1)), TAG_CACHE_ERROR_TTL_SECONDS);
   assert.equal(JSON.parse(env.TAG_CACHE.store.get(v2Key(2))).tags.Roguelike, 10);
   assert.equal(env.TAG_CACHE.ttlByKey.get(v2Key(2)), TAG_CACHE_TTL_SECONDS);
+});
+
+// ---------------------------------------------------------------------------
+// QA TC-5 — SPEC.md gate (f), the zero-diff regression, asserted rather than
+// inferred. Increment 10 adds eight columns to fpm_catalog; gate (f) says no
+// lane response changes at all until increment 11 consumes them. The only way
+// to make that a test rather than a claim is an EXHAUSTIVE key set: any
+// assertion that only checks the fields it knows about passes happily while a
+// ninth field rides along beside them.
+//
+// If this test fails after a deliberate lane change, update the list here in
+// the same commit — that is the point. It is a tripwire, not a straitjacket.
+// ---------------------------------------------------------------------------
+
+test("gate (f): a /api/recs entry's key set is EXACTLY the pre-increment-10 set, and no experience column leaks anywhere in the body", async () => {
+  globalThis.fetch = async () => {
+    throw new Error("fully warm cache — nothing should be fetched");
+  };
+  const cache = makeMockCache();
+  globalThis.caches = { default: cache };
+
+  const env = makeEnv();
+  const ownedAppid = 1;
+  const candidateAppid = 100;
+  primeLibrary(cache, env, [
+    ownedGame({ appid: ownedAppid, name: "Slay the Spire", playtime_forever: 10800 }),
+    ownedGame({ appid: 2, name: "Barely Played", playtime_forever: 1 }),
+  ]);
+  primeDeals(cache, 60, [deal({ appid: candidateAppid, title: "Balatro-like Deal" })]);
+  env.TAG_CACHE.store.set(
+    v2Key(ownedAppid),
+    JSON.stringify(goodSpyEntry({ tags: { Roguelike: 100, Deckbuilder: 50 }, median: 600 })),
+  );
+  env.TAG_CACHE.store.set(v2Key(2), JSON.stringify(goodSpyEntry({ tags: { Simulation: 50 } })));
+  env.TAG_CACHE.store.set(
+    v2Key(candidateAppid),
+    JSON.stringify(goodSpyEntry({ tags: { Roguelike: 80, Deckbuilder: 40 }, median: 600, owners: 120000 })),
+  );
+  env.TAG_CACHE.store.set(`deck:${candidateAppid}`, JSON.stringify({ deck: 3, os: 3, frame: 0 }));
+
+  const ctx = makeCtx();
+  const res = await worker.fetch(new Request("https://x/api/recs"), env, ctx);
+  const body = await res.json();
+
+  assert.deepEqual(Object.keys(body).sort(), ["excludedCount", "fetched", "pendingCount", "qualityExcludedCount", "ready", "recs", "total"]);
+  assert.equal(body.recs.length, 1);
+  assert.deepEqual(Object.keys(body.recs[0]).sort(), [
+      "appid",
+      "atHistoricalLow",
+      "batteryFriendly",
+      "cut",
+      "deck",
+      "expiry",
+      "flag",
+      "historicalLow",
+      "itadId",
+      "owners",
+      "price",
+      "priceCents",
+      "quality",
+      "rankScore",
+      "regular",
+      "reviewCount",
+      "reviewPercent",
+      "similarity",
+      "tagNames",
+      "title",
+      "why",
+    ]);
+  assertNoExperienceLeak(body, assert);
 });

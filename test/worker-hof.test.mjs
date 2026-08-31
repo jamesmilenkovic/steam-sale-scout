@@ -13,12 +13,17 @@ import { __setSpyMinIntervalMsForTests, __resetSpyQueueForTests } from "../src/s
 import { BESTOF_FETCH_CAP, BESTOF_MIN_CUT, BESTOF_PAGE_LIMIT, BESTOF_SORT } from "../src/deals.js";
 import { makeMockD1 } from "./helpers/mockD1.mjs";
 import { ensureDismissalsSchema, addDismissal } from "../src/dismissals.js";
+import { makeOfflineFetchGuard } from "./helpers/offlineFetchGuard.mjs";
+import { assertNoExperienceLeak } from "./helpers/laneShape.mjs";
 
-const originalFetch = globalThis.fetch;
 const originalCaches = globalThis.caches;
 
+/** QA TC-6. See test/helpers/offlineFetchGuard.mjs – this file's header claim
+ * of "NEVER makes a real network call" was untrue for two tests. */
+let offlineGuard = makeOfflineFetchGuard("worker-hof");
+
 function restoreGlobals() {
-  globalThis.fetch = originalFetch;
+  globalThis.fetch = makeOfflineFetchGuard("worker-hof (between tests)");
   if (originalCaches === undefined) {
     delete globalThis.caches;
   } else {
@@ -204,13 +209,33 @@ function makeBestOfItadFetch({ dealsPagesByOffset = {}, appIdsById = {}, lowsByI
   };
 }
 
+/** QA TC-6. Offline stand-in for the one upstream /api/best-of reaches when a
+ * candidate has no primed `deck:` KV entry: Steam's GetItems (src/deckCompat.js).
+ * Answers it emptily; anything else is a bug in the test. */
+function stubDeckFetch() {
+  return async (url) => {
+    const u = new URL(url);
+    if (u.hostname === "api.steampowered.com" && u.pathname.includes("GetItems")) {
+      return jsonResponse({ response: { store_items: [] } });
+    }
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+}
+
 test.beforeEach(() => {
+  offlineGuard = makeOfflineFetchGuard("worker-hof");
+  globalThis.fetch = offlineGuard;
   __setSpyMinIntervalMsForTests(0);
   __resetSpyQueueForTests();
 });
 
 test.afterEach(() => {
   restoreGlobals();
+  assert.deepEqual(
+    offlineGuard.calls,
+    [],
+    "QA TC-6: this test called fetch without stubbing it — before the guard existed that was a real TLS connection",
+  );
   __setSpyMinIntervalMsForTests(1000);
 });
 
@@ -300,6 +325,7 @@ test("only candidates clearing HOF_MIN_REVIEWS/HOF_MIN_RATIO appear, ordered by 
 test("a dismissed appid is excluded from /api/best-of even though it clears every Hall-of-Fame bar", async () => {
   const cache = makeMockCache();
   globalThis.caches = { default: cache };
+  globalThis.fetch = stubDeckFetch(); // QA TC-6: was a real GetItems call
   const env = makeEnv();
 
   primeLibrary(cache, env, [ownedGame({ appid: 1, playtime_forever: 600 })]);
@@ -333,6 +359,7 @@ test("dismissal slot-freeing (rank promotion): dismissing the top-ranked Hall-of
   // just exclusion" reasoning as the Recs sibling test.
   const cache = makeMockCache();
   globalThis.caches = { default: cache };
+  globalThis.fetch = stubDeckFetch(); // QA TC-6: was a real GetItems call
   const env = makeEnv();
 
   primeLibrary(cache, env, [ownedGame({ appid: 1, playtime_forever: 600 })]);
@@ -665,4 +692,62 @@ test("Best-of pool cache: a primed pool is served without refetching ITAD; ?refr
   const repopulated = cache.store.get("https://steam-sale-scout.cache/api/best-of/pool");
   const repopulatedBody = await repopulated.clone().json();
   assert.deepEqual(repopulatedBody.deals.map((d) => d.title), ["Fresh pooled deal"]);
+});
+
+// ---------------------------------------------------------------------------
+// QA TC-5 — SPEC.md gate (f), the zero-diff regression, asserted rather than
+// inferred. Increment 10 adds eight columns to fpm_catalog; gate (f) says no
+// lane response changes at all until increment 11 consumes them. The only way
+// to make that a test rather than a claim is an EXHAUSTIVE key set: any
+// assertion that only checks the fields it knows about passes happily while a
+// ninth field rides along beside them.
+//
+// If this test fails after a deliberate lane change, update the list here in
+// the same commit — that is the point. It is a tripwire, not a straitjacket.
+// ---------------------------------------------------------------------------
+
+test("gate (f): a /api/best-of entry's key set is EXACTLY the pre-increment-10 set, and no experience column leaks anywhere in the body", async () => {
+  const cache = makeMockCache();
+  globalThis.caches = { default: cache };
+  globalThis.fetch = stubDeckFetch();
+  const env = makeEnv();
+
+  primeLibrary(cache, env, [ownedGame({ appid: 1, playtime_forever: 600 })]);
+  primeBestOfPool(cache, [deal({ itadId: "itad-hof", appid: 200, cut: 75 })]);
+  env.TAG_CACHE.store.set(v2Key(1), JSON.stringify(goodSpyEntry()));
+  env.TAG_CACHE.store.set(
+    v2Key(200),
+    JSON.stringify(goodSpyEntry({ tags: { Puzzle: 50 }, reviews: { positive: 95000, negative: 5000 }, owners: 500000 })),
+  );
+  env.TAG_CACHE.store.set(deckKey(200), JSON.stringify({ deck: 3, os: 3, frame: 0 }));
+
+  const ctx = makeCtx();
+  const res = await worker.fetch(new Request("https://x/api/best-of"), env, ctx);
+  const body = await res.json();
+
+  assert.deepEqual(Object.keys(body).sort(), ["fetched", "hof", "pendingCount", "ready", "total"]);
+  assert.equal(body.hof.length, 1);
+  assert.deepEqual(Object.keys(body.hof[0]).sort(), [
+      "appid",
+      "atHistoricalLow",
+      "batteryFriendly",
+      "cut",
+      "deck",
+      "expiry",
+      "flag",
+      "historicalLow",
+      "hofScore",
+      "itadId",
+      "owners",
+      "price",
+      "priceCents",
+      "quality",
+      "regular",
+      "reviewCount",
+      "reviewPercent",
+      "similarity",
+      "tagNames",
+      "title",
+    ]);
+  assertNoExperienceLeak(body, assert);
 });

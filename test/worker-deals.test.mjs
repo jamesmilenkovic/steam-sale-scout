@@ -17,6 +17,7 @@ import worker from "../src/worker.js";
 import { __setSpyMinIntervalMsForTests, __resetSpyQueueForTests } from "../src/spyQueue.js";
 import { BESTOF_FETCH_CAP, BESTOF_SORT, DEALS_FETCH_CAP } from "../src/deals.js";
 import { makeMockD1 } from "./helpers/mockD1.mjs";
+import { assertNoExperienceLeak } from "./helpers/laneShape.mjs";
 import { ensureDismissalsSchema, addDismissal } from "../src/dismissals.js";
 
 const originalFetch = globalThis.fetch;
@@ -736,4 +737,55 @@ test("/api/deals response carries the restored cache-control: public, max-age=21
 
   assert.equal(res.status, 200);
   assert.equal(res.headers.get("cache-control"), "public, max-age=21600");
+});
+
+// ---------------------------------------------------------------------------
+// QA TC-5 — SPEC.md gate (f), the zero-diff regression, asserted rather than
+// inferred. Increment 10 adds eight columns to fpm_catalog; gate (f) says no
+// lane response changes at all until increment 11 consumes them. The only way
+// to make that a test rather than a claim is an EXHAUSTIVE key set: any
+// assertion that only checks the fields it knows about passes happily while a
+// ninth field rides along beside them.
+//
+// If this test fails after a deliberate lane change, update the list here in
+// the same commit — that is the point. It is a tripwire, not a straitjacket.
+// ---------------------------------------------------------------------------
+
+test("gate (f): a /api/deals entry's key set is EXACTLY the pre-increment-10 set, and no experience column leaks anywhere in the body", async () => {
+  const dealTagged = rawDeal("itad-shape", "Tagged Game", 70, 4.99);
+  globalThis.fetch = makeItadFetch({
+    dealsPagesByOffset: { 0: { list: [dealTagged], hasMore: false } },
+    appIdsById: { "itad-shape": ["app/555"] },
+  });
+  globalThis.caches = { default: makeMockCache() };
+
+  const env = makeEnv();
+  env.TAG_CACHE.store.set(v2Key(555), JSON.stringify(goodSpyEntry({ tags: { Puzzle: 40, "2D": 20 } })));
+  env.TAG_CACHE.store.set(deckKey(555), JSON.stringify({ deck: 0, os: 0, frame: 0 }));
+
+  const ctx = makeCtx();
+  const res = await worker.fetch(new Request("https://x/api/deals"), env, ctx);
+  await ctx.flush();
+  const body = await res.json();
+
+  assert.deepEqual(Object.keys(body).sort(), ["deals", "minCut"]);
+  assert.equal(body.deals.length, 1);
+  assert.deepEqual(Object.keys(body.deals[0]).sort(), [
+      "appid",
+      "atHistoricalLow",
+      "batteryFriendly",
+      "cut",
+      "deck",
+      "expiry",
+      "flag",
+      "historicalLow",
+      "itadId",
+      "price",
+      "priceCents",
+      "regular",
+      "tagNames",
+      "tags",
+      "title",
+    ]);
+  assertNoExperienceLeak(body, assert);
 });

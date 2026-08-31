@@ -51,12 +51,21 @@ import {
   recordPriceResult,
 } from "../src/catalog.js";
 import { ensureDismissalsSchema, addDismissal } from "../src/dismissals.js";
+import { makeOfflineFetchGuard } from "./helpers/offlineFetchGuard.mjs";
+import { assertNoExperienceLeak } from "./helpers/laneShape.mjs";
 
-const originalFetch = globalThis.fetch;
 const originalCaches = globalThis.caches;
 
+/** QA TC-6. The per-test guard, installed by beforeEach and asserted empty by
+ * afterEach, so a test that forgets to stub `fetch` fails loudly instead of
+ * silently reaching the real SteamSpy / Steam. */
+let offlineGuard = makeOfflineFetchGuard("worker-fpm");
+
 function restoreGlobals() {
-  globalThis.fetch = originalFetch;
+  // QA TC-6: the RESTING value between tests is a fresh guard, not the real
+  // `fetch`. A ctx.waitUntil promise that lands after its test finished
+  // therefore cannot reach the network either. Nothing here wants real fetch.
+  globalThis.fetch = makeOfflineFetchGuard("worker-fpm (between tests)");
   if (originalCaches === undefined) {
     delete globalThis.caches;
   } else {
@@ -172,6 +181,25 @@ function stubGetItemsFetch() {
   };
 }
 
+/** QA TC-6. The offline stand-in for the two upstreams /api/fpm reaches out
+ * to during enrichment when a row has no primed KV entry: Steam's GetItems
+ * (Deck compat, src/deckCompat.js) and SteamSpy appdetails (tags,
+ * src/spyQueue.js). Answers both emptily. Used by tests whose subject is
+ * something else entirely and which, before the guard, were letting those two
+ * calls go to the real internet. */
+function stubDeckAndSpyFetch() {
+  return async (url) => {
+    const u = new URL(url);
+    if (u.hostname === "api.steampowered.com" && u.pathname.includes("GetItems")) {
+      return jsonResponse({ response: { store_items: [] } });
+    }
+    if (u.hostname === "steamspy.com" && u.searchParams.get("request") === "appdetails") {
+      return jsonResponse({ appid: Number(u.searchParams.get("appid")), tags: [] });
+    }
+    throw new Error(`Unexpected fetch URL in test: ${url}`);
+  };
+}
+
 function deal(overrides = {}) {
   return {
     itadId: "itad-x",
@@ -236,6 +264,8 @@ function spyAppdetailsBranch(url, fixture = SPY_CELESTE) {
 }
 
 test.beforeEach(() => {
+  offlineGuard = makeOfflineFetchGuard("worker-fpm");
+  globalThis.fetch = offlineGuard;
   __setSpyMinIntervalMsForTests(0);
   __resetSpyQueueForTests();
   __setHltbMinIntervalMsForTests(0);
@@ -255,6 +285,11 @@ test.beforeEach(() => {
 
 test.afterEach(() => {
   restoreGlobals();
+  assert.deepEqual(
+    offlineGuard.calls,
+    [],
+    "QA TC-6: this test called fetch without stubbing it — before the guard existed that was a real TLS connection",
+  );
   __setSpyMinIntervalMsForTests(1000);
   __setHltbMinIntervalMsForTests(1000);
   __resetCatalogPacingForTests();
@@ -398,6 +433,7 @@ test("happy path: a matched D1 row is scored/annotated with zero HLTB or eligibi
 test("a dismissed appid is excluded from /api/fpm even though it's a fully matched, qualifying row", async () => {
   const cache = makeMockCache();
   globalThis.caches = { default: cache };
+  globalThis.fetch = stubDeckAndSpyFetch(); // QA TC-6: was 2 real TLS calls
   const env = makeEnv();
 
   await primeMatchedRow(env, { appid: 200, name: "Keep This Game", mainHours: 6.5 });
@@ -420,6 +456,7 @@ test("a dismissed appid is excluded from /api/fpm even though it's a fully match
 test("with no dismissals table yet (fresh D1), /api/fpm is unaffected — dismissal join fails soft to 'nothing excluded'", async () => {
   const cache = makeMockCache();
   globalThis.caches = { default: cache };
+  globalThis.fetch = stubDeckAndSpyFetch(); // QA TC-6: was a real GetItems call
   const env = makeEnv();
 
   await primeMatchedRow(env, { appid: 200, name: "Portal 2", mainHours: 6.5 });
@@ -1377,4 +1414,64 @@ test("sync's deal-pool union actually slices to FPM_POOL_CAP (top 300 of the ran
   for (let i = FPM_POOL_CAP; i < poolSize; i++) {
     assert.ok(!flaggedAppids.has(6000 + i), `appid ${6000 + i} (beyond top ${FPM_POOL_CAP}) should NOT be flagged`);
   }
+});
+
+// ---------------------------------------------------------------------------
+// QA TC-5 — SPEC.md gate (f), the zero-diff regression, asserted rather than
+// inferred. Increment 10 adds eight columns to fpm_catalog; gate (f) says no
+// lane response changes at all until increment 11 consumes them. The only way
+// to make that a test rather than a claim is an EXHAUSTIVE key set: any
+// assertion that only checks the fields it knows about passes happily while a
+// ninth field rides along beside them.
+//
+// If this test fails after a deliberate lane change, update the list here in
+// the same commit — that is the point. It is a tripwire, not a straitjacket.
+// ---------------------------------------------------------------------------
+
+test("gate (f): a /api/fpm entry's key set is EXACTLY the pre-increment-10 set, and no experience column leaks anywhere in the body", async () => {
+  const cache = makeMockCache();
+  globalThis.caches = { default: cache };
+  globalThis.fetch = stubDeckAndSpyFetch();
+  const env = makeEnv();
+
+  // The richest row the lane can produce: matched, classified, tagged,
+  // deck-cached, unowned. Anything the response builder can attach is
+  // attached here, so the key set below is the full one, not a subset.
+  await primeMatchedRow(env, { appid: 200, name: "Portal 2", positive: 96000, negative: 4000, mainHours: 6.5 });
+  primeLibrary(cache, env, [ownedGame({ appid: 1 })]);
+  primeFpmPool(cache, []);
+  env.TAG_CACHE.store.set(v2Key(200), JSON.stringify({ tags: { Puzzle: 50 } }));
+  env.TAG_CACHE.store.set(deckKey(200), JSON.stringify({ deck: 3, os: 3, frame: 0 }));
+
+  const ctx = makeCtx();
+  const res = await worker.fetch(new Request("https://x/api/fpm"), env, ctx);
+  const body = await res.json();
+
+  assert.deepEqual(Object.keys(body).sort(), ["available", "count", "fpm", "matched", "noPriceCount", "pending", "priceBlindCount", "ready", "total", "unmatchedCount"]);
+  assert.equal(body.fpm.length, 1);
+  assert.deepEqual(Object.keys(body.fpm[0]).sort(), [
+      "appid",
+      "atHistoricalLow",
+      "batteryFriendly",
+      "cut",
+      "deck",
+      "fpm",
+      "funPerHour",
+      "historicalLow",
+      "mainHours",
+      "matchMethod",
+      "owned",
+      "owners",
+      "price",
+      "priceCents",
+      "priceCheckedAt",
+      "quality",
+      "regular",
+      "reviewCount",
+      "reviewPercent",
+      "tagNames",
+      "title",
+      "why",
+    ]);
+  assertNoExperienceLeak(body, assert);
 });

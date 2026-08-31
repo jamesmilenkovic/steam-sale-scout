@@ -1,0 +1,2702 @@
+{
+ "10": {
+  "appid": 10,
+  "experience_score": 14,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 20,
+  "reason": "Pure competitive ladder, brutal skill wall, no ending whatsoever.",
+  "confidence": "high"
+ },
+ "70": {
+  "appid": 70,
+  "experience_score": 92,
+  "has_ending": true,
+  "hours_to_value": 12,
+  "hours_to_good": 0.5,
+  "reason": "Landmark authored campaign, no padding, ends strong.",
+  "confidence": "high"
+ },
+ "220": {
+  "appid": 220,
+  "experience_score": 91,
+  "has_ending": true,
+  "hours_to_value": 13,
+  "hours_to_good": 0,
+  "reason": "Landmark authored shooter, near-zero padding, ends decisively.",
+  "confidence": "high"
+ },
+ "240": {
+  "appid": 240,
+  "experience_score": 15,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 15,
+  "reason": "Competitive multiplayer only, endless ladder, steep aim skill wall.",
+  "confidence": "high"
+ },
+ "400": {
+  "appid": 400,
+  "experience_score": 98,
+  "has_ending": true,
+  "hours_to_value": 3,
+  "hours_to_good": 0,
+  "reason": "Three hours, zero filler, perfect ending; the ideal busy-adult game.",
+  "confidence": "high"
+ },
+ "420": {
+  "appid": 420,
+  "experience_score": 94,
+  "has_ending": true,
+  "hours_to_value": 5,
+  "hours_to_good": 0.2,
+  "reason": "Five near-perfect authored hours, strong climax, no wasted minute",
+  "confidence": "high"
+ },
+ "440": {
+  "appid": 440,
+  "experience_score": 15,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 3,
+  "reason": "Endless class shooter, no campaign, bot-infested lobbies",
+  "confidence": "high"
+ },
+ "500": {
+  "appid": 500,
+  "experience_score": 45,
+  "has_ending": true,
+  "hours_to_value": 7,
+  "hours_to_good": 0.5,
+  "reason": "Four short campaigns end, but designed for endless replay.",
+  "confidence": "high"
+ },
+ "550": {
+  "appid": 550,
+  "experience_score": 70,
+  "has_ending": true,
+  "hours_to_value": 10,
+  "hours_to_good": 0,
+  "reason": "Five tight finite campaigns, instant fun, no unlock grind",
+  "confidence": "high"
+ },
+ "620": {
+  "appid": 620,
+  "experience_score": 97,
+  "has_ending": true,
+  "hours_to_value": 9,
+  "hours_to_good": 0,
+  "reason": "Perfect authored puzzle arc, no padding, ends strong, co-op campaign is bonus.",
+  "confidence": "high"
+ },
+ "730": {
+  "appid": 730,
+  "experience_score": 12,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 30,
+  "reason": "Endless competitive ladder, brutal skill wall, no authored content at all",
+  "confidence": "high"
+ },
+ "1840": {
+  "appid": 1840,
+  "experience_score": 15,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 20,
+  "reason": "Animation tool, not a game; steep learning curve, no authored content",
+  "confidence": "high"
+ },
+ "3590": {
+  "appid": 3590,
+  "experience_score": 88,
+  "has_ending": true,
+  "hours_to_value": 10,
+  "hours_to_good": 0,
+  "reason": "Tight authored campaign, instantly fun, no padding, clean finish.",
+  "confidence": "high"
+ },
+ "4000": {
+  "appid": 4000,
+  "experience_score": 15,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 2,
+  "reason": "Pure toybox, no authored content, no ending whatsoever",
+  "confidence": "high"
+ },
+ "6060": {
+  "appid": 6060,
+  "experience_score": 40,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 0,
+  "reason": "Mostly skirmish and multiplayer; campaign thin, replay loop is endless",
+  "confidence": "high"
+ },
+ "8870": {
+  "appid": 8870,
+  "experience_score": 89,
+  "has_ending": true,
+  "hours_to_value": 12,
+  "hours_to_good": 0.5,
+  "reason": "Beautiful authored world, memorable ending, short enough to finish.",
+  "confidence": "high"
+ },
+ "8930": {
+  "appid": 8930,
+  "experience_score": 32,
+  "has_ending": true,
+  "hours_to_value": 40,
+  "hours_to_good": 10,
+  "reason": "Sandbox 4X, victory is arbitrary stopping point; long learning curve.",
+  "confidence": "high"
+ },
+ "10180": {
+  "appid": 10180,
+  "experience_score": 72,
+  "has_ending": true,
+  "hours_to_value": 6,
+  "hours_to_good": 0,
+  "reason": "Tight 6-hour set-piece campaign plus Spec Ops; multiplayer is endless extra",
+  "confidence": "high"
+ },
+ "10190": {
+  "appid": 10190,
+  "experience_score": 55,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 1,
+  "reason": "Multiplayer-only listing of MW2; endless ladder, no campaign included",
+  "confidence": "medium"
+ },
+ "12120": {
+  "appid": 12120,
+  "experience_score": 50,
+  "has_ending": true,
+  "hours_to_value": 30,
+  "hours_to_good": 1,
+  "reason": "Landmark open world, but dated missions and lots of filler.",
+  "confidence": "high"
+ },
+ "12210": {
+  "appid": 12210,
+  "experience_score": 42,
+  "has_ending": true,
+  "hours_to_value": 31,
+  "hours_to_good": 3,
+  "reason": "Strong story but heavy driving filler, clunky controls, dated pacing.",
+  "confidence": "high"
+ },
+ "16900": {
+  "appid": 16900,
+  "experience_score": 14,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 10,
+  "reason": "Hardcore tactical shooter sandbox, no campaign, steep learning wall.",
+  "confidence": "medium"
+ },
+ "20900": {
+  "appid": 20900,
+  "experience_score": 55,
+  "has_ending": true,
+  "hours_to_value": 35,
+  "hours_to_good": 6,
+  "reason": "Great story, but dated combat and long fetch-quest stretches.",
+  "confidence": "high"
+ },
+ "20920": {
+  "appid": 20920,
+  "experience_score": 72,
+  "has_ending": true,
+  "hours_to_value": 25,
+  "hours_to_good": 3,
+  "reason": "Dense authored branching story, ends firmly; clunky combat start.",
+  "confidence": "high"
+ },
+ "35140": {
+  "appid": 35140,
+  "experience_score": 89,
+  "has_ending": true,
+  "hours_to_value": 12,
+  "hours_to_good": 0,
+  "reason": "Tight Metroidvania-style arc, no padding, immediately satisfying combat.",
+  "confidence": "high"
+ },
+ "35450": {
+  "appid": 35450,
+  "experience_score": 14,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 10,
+  "reason": "Hardcore multiplayer war shooter; punishing learning curve, no authored campaign",
+  "confidence": "high"
+ },
+ "39210": {
+  "appid": 39210,
+  "experience_score": 25,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 40,
+  "reason": "Great story buried in endless MMO with subscription and grind",
+  "confidence": "high"
+ },
+ "48000": {
+  "appid": 48000,
+  "experience_score": 90,
+  "has_ending": true,
+  "hours_to_value": 4,
+  "hours_to_good": 0.2,
+  "reason": "Four hours, every minute authored, memorable ending.",
+  "confidence": "high"
+ },
+ "48700": {
+  "appid": 48700,
+  "experience_score": 40,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 8,
+  "reason": "Sandbox campaign never truly concludes, clunky start, deep but shapeless",
+  "confidence": "high"
+ },
+ "49520": {
+  "appid": 49520,
+  "experience_score": 45,
+  "has_ending": true,
+  "hours_to_value": 30,
+  "hours_to_good": 3,
+  "reason": "Ends properly, great villain, but bloated fetch quests and loot grind.",
+  "confidence": "high"
+ },
+ "50130": {
+  "appid": 50130,
+  "experience_score": 76,
+  "has_ending": true,
+  "hours_to_value": 12,
+  "hours_to_good": 1,
+  "reason": "Finite mob story, strong writing, ends firmly; some empty driving filler",
+  "confidence": "high"
+ },
+ "72850": {
+  "appid": 72850,
+  "experience_score": 48,
+  "has_ending": true,
+  "hours_to_value": 35,
+  "hours_to_good": 2,
+  "reason": "Main quest ends, but huge filler content and dated combat pad it.",
+  "confidence": "high"
+ },
+ "105600": {
+  "appid": 105600,
+  "experience_score": 58,
+  "has_ending": true,
+  "hours_to_value": 40,
+  "hours_to_good": 3,
+  "reason": "Real final boss, but long grind-heavy sandbox before it",
+  "confidence": "high"
+ },
+ "108600": {
+  "appid": 108600,
+  "experience_score": 22,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 15,
+  "reason": "You die, that is the point; endless sandbox, harsh learning curve",
+  "confidence": "high"
+ },
+ "113200": {
+  "appid": 113200,
+  "experience_score": 50,
+  "has_ending": true,
+  "hours_to_value": 15,
+  "hours_to_good": 2,
+  "reason": "Endings exist but buried under hundreds of unlock hours.",
+  "confidence": "high"
+ },
+ "115300": {
+  "appid": 115300,
+  "experience_score": 66,
+  "has_ending": true,
+  "hours_to_value": 5,
+  "hours_to_good": 0,
+  "reason": "Short punchy campaign closes the trilogy; weaker than MW2, rest is multiplayer",
+  "confidence": "high"
+ },
+ "200260": {
+  "appid": 200260,
+  "experience_score": 87,
+  "has_ending": true,
+  "hours_to_value": 16,
+  "hours_to_good": 0,
+  "reason": "Denser than Asylum, still finite and paced; minor side sprawl.",
+  "confidence": "high"
+ },
+ "201810": {
+  "appid": 201810,
+  "experience_score": 85,
+  "has_ending": true,
+  "hours_to_value": 12,
+  "hours_to_good": 0.5,
+  "reason": "Strong finite campaign, good pacing, real conclusion.",
+  "confidence": "high"
+ },
+ "203160": {
+  "appid": 203160,
+  "experience_score": 76,
+  "has_ending": true,
+  "hours_to_value": 11,
+  "hours_to_good": 0,
+  "reason": "Tight authored action-adventure, good pacing, finishes in a weekend.",
+  "confidence": "high"
+ },
+ "204100": {
+  "appid": 204100,
+  "experience_score": 80,
+  "has_ending": true,
+  "hours_to_value": 10,
+  "hours_to_good": 0.5,
+  "reason": "Polished cinematic shooter, ends well, some cutscene bloat.",
+  "confidence": "high"
+ },
+ "204360": {
+  "appid": 204360,
+  "experience_score": 70,
+  "has_ending": true,
+  "hours_to_value": 7,
+  "hours_to_good": 0.2,
+  "reason": "Short, funny, finishes; combat repeats and grinding unlocks nags.",
+  "confidence": "high"
+ },
+ "204450": {
+  "appid": 204450,
+  "experience_score": 88,
+  "has_ending": true,
+  "hours_to_value": 5,
+  "hours_to_good": 0.2,
+  "reason": "Punchy narrated western shooter, five hours, all killer",
+  "confidence": "high"
+ },
+ "206440": {
+  "appid": 206440,
+  "experience_score": 83,
+  "has_ending": true,
+  "hours_to_value": 4,
+  "hours_to_good": 0.2,
+  "reason": "Four-hour emotional story, finished in one night, barely a game.",
+  "confidence": "high"
+ },
+ "207610": {
+  "appid": 207610,
+  "experience_score": 86,
+  "has_ending": true,
+  "hours_to_value": 11,
+  "hours_to_good": 0.2,
+  "reason": "Complete authored season; strong ending, minimal mechanics to learn.",
+  "confidence": "high"
+ },
+ "212070": {
+  "appid": 212070,
+  "experience_score": 10,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 8,
+  "reason": "Free-to-play space MMO with grind and paid ship progression",
+  "confidence": "medium"
+ },
+ "212680": {
+  "appid": 212680,
+  "experience_score": 72,
+  "has_ending": true,
+  "hours_to_value": 12,
+  "hours_to_good": 3,
+  "reason": "Runs end at a real final boss; early losses feel opaque.",
+  "confidence": "high"
+ },
+ "214490": {
+  "appid": 214490,
+  "experience_score": 72,
+  "has_ending": true,
+  "hours_to_value": 18,
+  "hours_to_good": 1,
+  "reason": "Excellent authored horror, ends, but noticeably padded final third.",
+  "confidence": "high"
+ },
+ "214950": {
+  "appid": 214950,
+  "experience_score": 38,
+  "has_ending": true,
+  "hours_to_value": 45,
+  "hours_to_good": 10,
+  "reason": "Campaigns end, but slow start and heavy sandbox repetition.",
+  "confidence": "high"
+ },
+ "218620": {
+  "appid": 218620,
+  "experience_score": 28,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 8,
+  "reason": "Heist repetition, skill tree and loot grind, no real ending",
+  "confidence": "high"
+ },
+ "219150": {
+  "appid": 219150,
+  "experience_score": 92,
+  "has_ending": true,
+  "hours_to_value": 5,
+  "hours_to_good": 0.3,
+  "reason": "Fast brutal loop, great soundtrack, ends before wearing out",
+  "confidence": "high"
+ },
+ "219640": {
+  "appid": 219640,
+  "experience_score": 18,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 8,
+  "reason": "Multiplayer melee arena; steep swing-timing skill ladder, no ending.",
+  "confidence": "high"
+ },
+ "219740": {
+  "appid": 219740,
+  "experience_score": 45,
+  "has_ending": false,
+  "hours_to_value": 25,
+  "hours_to_good": 8,
+  "reason": "Harsh survival sandbox, no real ending, long trial-and-error before fun.",
+  "confidence": "high"
+ },
+ "219990": {
+  "appid": 219990,
+  "experience_score": 42,
+  "has_ending": true,
+  "hours_to_value": 30,
+  "hours_to_good": 6,
+  "reason": "Solid loot ARPG, but built around endless build grinding.",
+  "confidence": "high"
+ },
+ "221100": {
+  "appid": 221100,
+  "experience_score": 8,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 25,
+  "reason": "Endless PvP survival, death deletes everything, hostile to newcomers",
+  "confidence": "high"
+ },
+ "221380": {
+  "appid": 221380,
+  "experience_score": 50,
+  "has_ending": true,
+  "hours_to_value": 25,
+  "hours_to_good": 6,
+  "reason": "Finite campaigns, but skill ladder steep and multiplayer endless.",
+  "confidence": "high"
+ },
+ "223750": {
+  "appid": 223750,
+  "experience_score": 12,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 30,
+  "reason": "Study-heavy flight sim, modular missions, no ending, huge time investment",
+  "confidence": "high"
+ },
+ "227300": {
+  "appid": 227300,
+  "experience_score": 30,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 1,
+  "reason": "Endless hauling economy, relaxing but no authored conclusion",
+  "confidence": "high"
+ },
+ "230410": {
+  "appid": 230410,
+  "experience_score": 13,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 40,
+  "reason": "Live-service looter, tangled systems, decades of drip-fed content",
+  "confidence": "high"
+ },
+ "236850": {
+  "appid": 236850,
+  "experience_score": 30,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 30,
+  "reason": "Grand strategy sandbox, brutal learning wall, campaigns just stop at date",
+  "confidence": "high"
+ },
+ "238320": {
+  "appid": 238320,
+  "experience_score": 84,
+  "has_ending": true,
+  "hours_to_value": 5,
+  "hours_to_good": 0.2,
+  "reason": "Five hours of focused horror, clear ending, no filler.",
+  "confidence": "high"
+ },
+ "238460": {
+  "appid": 238460,
+  "experience_score": 74,
+  "has_ending": true,
+  "hours_to_value": 9,
+  "hours_to_good": 0.3,
+  "reason": "Funny, finite platformer; ends cleanly, best with a friend.",
+  "confidence": "high"
+ },
+ "238960": {
+  "appid": 238960,
+  "experience_score": 12,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 30,
+  "reason": "Endless endgame grind, punishing systems knowledge required first.",
+  "confidence": "high"
+ },
+ "239030": {
+  "appid": 239030,
+  "experience_score": 90,
+  "has_ending": true,
+  "hours_to_value": 6,
+  "hours_to_good": 0.3,
+  "reason": "Tight, original, multiple endings, done in a weekend.",
+  "confidence": "high"
+ },
+ "242050": {
+  "appid": 242050,
+  "experience_score": 64,
+  "has_ending": true,
+  "hours_to_value": 30,
+  "hours_to_good": 1,
+  "reason": "Sailing is great and it ends, but heavily padded.",
+  "confidence": "high"
+ },
+ "242860": {
+  "appid": 242860,
+  "experience_score": 16,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 5,
+  "reason": "Endless WWI multiplayer trench matches, punishing early hours",
+  "confidence": "medium"
+ },
+ "244210": {
+  "appid": 244210,
+  "experience_score": 22,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 10,
+  "reason": "Driving simulator skill ladder, no ending, needs wheel and practice",
+  "confidence": "high"
+ },
+ "245170": {
+  "appid": 245170,
+  "experience_score": 48,
+  "has_ending": true,
+  "hours_to_value": 6,
+  "hours_to_good": 6,
+  "reason": "Gorgeous story mode, but real value sits behind fighting-game grind",
+  "confidence": "high"
+ },
+ "246620": {
+  "appid": 246620,
+  "experience_score": 58,
+  "has_ending": true,
+  "hours_to_value": 6,
+  "hours_to_good": 0.5,
+  "reason": "Clever finite scenarios, but repetitive and light on authored content",
+  "confidence": "high"
+ },
+ "250820": {
+  "appid": 250820,
+  "experience_score": 5,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 0,
+  "reason": "VR runtime software; not a game at all.",
+  "confidence": "high"
+ },
+ "250900": {
+  "appid": 250900,
+  "experience_score": 40,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 5,
+  "reason": "Hundreds of unlocks and endings chained; effectively a bottomless grind.",
+  "confidence": "high"
+ },
+ "251570": {
+  "appid": 251570,
+  "experience_score": 18,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 10,
+  "reason": "Endless horde nights, no authored story or conclusion",
+  "confidence": "high"
+ },
+ "252490": {
+  "appid": 252490,
+  "experience_score": 10,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 20,
+  "reason": "Endless raid-and-wipe server treadmill, hostile to newcomers",
+  "confidence": "high"
+ },
+ "252950": {
+  "appid": 252950,
+  "experience_score": 25,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 5,
+  "reason": "Endless competitive ladder, great feel, steep aerial skill curve",
+  "confidence": "high"
+ },
+ "254700": {
+  "appid": 254700,
+  "experience_score": 86,
+  "has_ending": true,
+  "hours_to_value": 16,
+  "hours_to_good": 0,
+  "reason": "Relentlessly paced authored action; almost no filler, strong ending.",
+  "confidence": "high"
+ },
+ "261550": {
+  "appid": 261550,
+  "experience_score": 30,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 12,
+  "reason": "Sandbox campaign fizzles out, no real authored conclusion",
+  "confidence": "high"
+ },
+ "261570": {
+  "appid": 261570,
+  "experience_score": 92,
+  "has_ending": true,
+  "hours_to_value": 9,
+  "hours_to_good": 0.5,
+  "reason": "Beautiful finite metroidvania, strong ending, almost no filler.",
+  "confidence": "high"
+ },
+ "262060": {
+  "appid": 262060,
+  "experience_score": 62,
+  "has_ending": true,
+  "hours_to_value": 30,
+  "hours_to_good": 5,
+  "reason": "Great mood, but grindy roster rebuilding pads the campaign.",
+  "confidence": "high"
+ },
+ "264710": {
+  "appid": 264710,
+  "experience_score": 80,
+  "has_ending": true,
+  "hours_to_value": 28,
+  "hours_to_good": 1,
+  "reason": "Real ending, strong authored dread and discovery; some crafting busywork.",
+  "confidence": "high"
+ },
+ "265930": {
+  "appid": 265930,
+  "experience_score": 35,
+  "has_ending": false,
+  "hours_to_value": 2,
+  "hours_to_good": 0.1,
+  "reason": "Physics joke sandbox, funny briefly, no real ending or depth",
+  "confidence": "high"
+ },
+ "268500": {
+  "appid": 268500,
+  "experience_score": 62,
+  "has_ending": true,
+  "hours_to_value": 33,
+  "hours_to_good": 4,
+  "reason": "Excellent tactics with a real campaign end; long and punishing early.",
+  "confidence": "high"
+ },
+ "268650": {
+  "appid": 268650,
+  "experience_score": 20,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 30,
+  "reason": "Deep vehicle designer, brutal learning wall, campaign never really ends",
+  "confidence": "medium"
+ },
+ "268910": {
+  "appid": 268910,
+  "experience_score": 82,
+  "has_ending": true,
+  "hours_to_value": 11,
+  "hours_to_good": 2,
+  "reason": "Gorgeous, short, finite boss rush; difficulty spikes cost some hours.",
+  "confidence": "high"
+ },
+ "271590": {
+  "appid": 271590,
+  "experience_score": 58,
+  "has_ending": true,
+  "hours_to_value": 32,
+  "hours_to_good": 1,
+  "reason": "Strong finite story campaign, but bloated open world and Online pull.",
+  "confidence": "high"
+ },
+ "275850": {
+  "appid": 275850,
+  "experience_score": 44,
+  "has_ending": true,
+  "hours_to_value": 30,
+  "hours_to_good": 3,
+  "reason": "Centre-of-galaxy ending exists, but repetitive procedural filler",
+  "confidence": "high"
+ },
+ "281990": {
+  "appid": 281990,
+  "experience_score": 22,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 25,
+  "reason": "Sandbox grand strategy, no authored end, enormous systems learning cost.",
+  "confidence": "high"
+ },
+ "282070": {
+  "appid": 282070,
+  "experience_score": 78,
+  "has_ending": true,
+  "hours_to_value": 11,
+  "hours_to_good": 1,
+  "reason": "Short, authored, unforgettable; a war story that actually finishes.",
+  "confidence": "high"
+ },
+ "285900": {
+  "appid": 285900,
+  "experience_score": 22,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 0.2,
+  "reason": "Physics party brawler; one joke, no campaign, no ending.",
+  "confidence": "high"
+ },
+ "286160": {
+  "appid": 286160,
+  "experience_score": 20,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 3,
+  "reason": "A toolbox, not an experience; needs friends and setup work.",
+  "confidence": "high"
+ },
+ "289070": {
+  "appid": 289070,
+  "experience_score": 30,
+  "has_ending": true,
+  "hours_to_value": 25,
+  "hours_to_good": 15,
+  "reason": "Nominal victory screen, but designed as endless replay; heavy rules learning.",
+  "confidence": "high"
+ },
+ "291550": {
+  "appid": 291550,
+  "experience_score": 16,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 5,
+  "reason": "Free-to-play fighter, endless ranked ladder, cosmetic treadmill",
+  "confidence": "high"
+ },
+ "292030": {
+  "appid": 292030,
+  "experience_score": 55,
+  "has_ending": true,
+  "hours_to_value": 50,
+  "hours_to_good": 5,
+  "reason": "Excellent writing, but enormous runtime and slow opening hours",
+  "confidence": "high"
+ },
+ "294100": {
+  "appid": 294100,
+  "experience_score": 42,
+  "has_ending": true,
+  "hours_to_value": 50,
+  "hours_to_good": 8,
+  "reason": "Escape ship ends a run, but sandbox invites endless restarts",
+  "confidence": "high"
+ },
+ "299360": {
+  "appid": 299360,
+  "experience_score": 10,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 3,
+  "reason": "Team-based building shooter, endless, small player base",
+  "confidence": "medium"
+ },
+ "304430": {
+  "appid": 304430,
+  "experience_score": 93,
+  "has_ending": true,
+  "hours_to_value": 4,
+  "hours_to_good": 0.1,
+  "reason": "Anchor: flawless authored short, zero padding, unforgettable ending",
+  "confidence": "high"
+ },
+ "306130": {
+  "appid": 306130,
+  "experience_score": 15,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 10,
+  "reason": "Endless MMO, expansion drip-feed, subscription treadmill design",
+  "confidence": "high"
+ },
+ "307780": {
+  "appid": 307780,
+  "experience_score": 45,
+  "has_ending": true,
+  "hours_to_value": 6,
+  "hours_to_good": 2,
+  "reason": "Real cinematic story mode ends, rest is endless ladder",
+  "confidence": "high"
+ },
+ "311690": {
+  "appid": 311690,
+  "experience_score": 60,
+  "has_ending": true,
+  "hours_to_value": 25,
+  "hours_to_good": 5,
+  "reason": "Great shooting, but grindy unlocks and long run to true end.",
+  "confidence": "high"
+ },
+ "312530": {
+  "appid": 312530,
+  "experience_score": 30,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 0.2,
+  "reason": "Brilliant couch party game, but endless rounds, no arc",
+  "confidence": "high"
+ },
+ "319510": {
+  "appid": 319510,
+  "experience_score": 78,
+  "has_ending": true,
+  "hours_to_value": 3,
+  "hours_to_good": 0.3,
+  "reason": "Tight two-hour horror loop, real ending, zero padding, instantly tense",
+  "confidence": "high"
+ },
+ "319630": {
+  "appid": 319630,
+  "experience_score": 86,
+  "has_ending": true,
+  "hours_to_value": 3,
+  "hours_to_good": 0.2,
+  "reason": "Free episode ends on hook; full story needs purchase.",
+  "confidence": "high"
+ },
+ "322330": {
+  "appid": 322330,
+  "experience_score": 30,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 12,
+  "reason": "Endless survival loop, harsh death punishment, wiki required early",
+  "confidence": "high"
+ },
+ "323190": {
+  "appid": 323190,
+  "experience_score": 82,
+  "has_ending": true,
+  "hours_to_value": 11,
+  "hours_to_good": 1,
+  "reason": "Authored scenarios with hard endings; no filler, strong themes.",
+  "confidence": "high"
+ },
+ "335240": {
+  "appid": 335240,
+  "experience_score": 16,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 1,
+  "reason": "Endless free multiplayer platformer with grind cosmetics and cheese races.",
+  "confidence": "medium"
+ },
+ "346110": {
+  "appid": 346110,
+  "experience_score": 10,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 20,
+  "reason": "Grind-first survival treadmill, server wipes erase all progress",
+  "confidence": "high"
+ },
+ "356190": {
+  "appid": 356190,
+  "experience_score": 48,
+  "has_ending": true,
+  "hours_to_value": 25,
+  "hours_to_good": 2,
+  "reason": "Great Nemesis system, but padded fortress grind before the true ending.",
+  "confidence": "high"
+ },
+ "359550": {
+  "appid": 359550,
+  "experience_score": 12,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 30,
+  "reason": "Live-service competitive shooter; brutal learning curve, never ends.",
+  "confidence": "high"
+ },
+ "362890": {
+  "appid": 362890,
+  "experience_score": 86,
+  "has_ending": true,
+  "hours_to_value": 16,
+  "hours_to_good": 0.5,
+  "reason": "Excellent remake, complete campaign, Xen section drags slightly.",
+  "confidence": "high"
+ },
+ "365590": {
+  "appid": 365590,
+  "experience_score": 22,
+  "has_ending": true,
+  "hours_to_value": 30,
+  "hours_to_good": 8,
+  "reason": "Looter treadmill; story ends but endgame grind is the point.",
+  "confidence": "high"
+ },
+ "365670": {
+  "appid": 365670,
+  "experience_score": 10,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 40,
+  "reason": "Professional 3D software; steep learning, no authored experience.",
+  "confidence": "high"
+ },
+ "367520": {
+  "appid": 367520,
+  "experience_score": 84,
+  "has_ending": true,
+  "hours_to_value": 27,
+  "hours_to_good": 2,
+  "reason": "Superb craft throughout, but long and late-game backtracking adds hours.",
+  "confidence": "high"
+ },
+ "374320": {
+  "appid": 374320,
+  "experience_score": 78,
+  "has_ending": true,
+  "hours_to_value": 32,
+  "hours_to_good": 4,
+  "reason": "Tight authored world, real ending, difficulty gate costs early hours",
+  "confidence": "high"
+ },
+ "376210": {
+  "appid": 376210,
+  "experience_score": 8,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 15,
+  "reason": "Endless dinosaur survival sandbox; no ending, long grind, harsh multiplayer",
+  "confidence": "high"
+ },
+ "379430": {
+  "appid": 379430,
+  "experience_score": 58,
+  "has_ending": true,
+  "hours_to_value": 40,
+  "hours_to_good": 6,
+  "reason": "Authored medieval story, ends properly, rough opening and jank",
+  "confidence": "high"
+ },
+ "379720": {
+  "appid": 379720,
+  "experience_score": 86,
+  "has_ending": true,
+  "hours_to_value": 12,
+  "hours_to_good": 0,
+  "reason": "Fun immediately, tight campaign, clean ending, minimal filler.",
+  "confidence": "high"
+ },
+ "380600": {
+  "appid": 380600,
+  "experience_score": 12,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 5,
+  "reason": "Endless free-to-play fishing grind with monetised progression",
+  "confidence": "medium"
+ },
+ "381210": {
+  "appid": 381210,
+  "experience_score": 12,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 10,
+  "reason": "Endless asymmetric matches, huge perk grind, no story conclusion",
+  "confidence": "high"
+ },
+ "383870": {
+  "appid": 383870,
+  "experience_score": 88,
+  "has_ending": true,
+  "hours_to_value": 4,
+  "hours_to_good": 0.2,
+  "reason": "Four superb hours, great writing, zero padding, clean ending.",
+  "confidence": "high"
+ },
+ "383980": {
+  "appid": 383980,
+  "experience_score": 34,
+  "has_ending": true,
+  "hours_to_value": 3,
+  "hours_to_good": 8,
+  "reason": "Small story mode, real value is deep competitive ladder",
+  "confidence": "high"
+ },
+ "386180": {
+  "appid": 386180,
+  "experience_score": 13,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 8,
+  "reason": "Free-to-play vehicle PvP with grind-and-trade economy, no conclusion.",
+  "confidence": "medium"
+ },
+ "389730": {
+  "appid": 389730,
+  "experience_score": 30,
+  "has_ending": true,
+  "hours_to_value": 6,
+  "hours_to_good": 15,
+  "reason": "Story mode thin, real game is endless competitive skill ladder",
+  "confidence": "high"
+ },
+ "391220": {
+  "appid": 391220,
+  "experience_score": 72,
+  "has_ending": true,
+  "hours_to_value": 15,
+  "hours_to_good": 1,
+  "reason": "Polished adventure, ends cleanly, some collectible busywork.",
+  "confidence": "high"
+ },
+ "391540": {
+  "appid": 391540,
+  "experience_score": 92,
+  "has_ending": true,
+  "hours_to_value": 7,
+  "hours_to_good": 0,
+  "reason": "Short, complete, inventive; every hour earns its place.",
+  "confidence": "high"
+ },
+ "393420": {
+  "appid": 393420,
+  "experience_score": 9,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 15,
+  "reason": "Dated endless survival PvP, heavy grind, small dwindling playerbase.",
+  "confidence": "medium"
+ },
+ "394360": {
+  "appid": 394360,
+  "experience_score": 28,
+  "has_ending": true,
+  "hours_to_value": 50,
+  "hours_to_good": 30,
+  "reason": "War ends, but punishing systems and wiki study before fun",
+  "confidence": "high"
+ },
+ "400750": {
+  "appid": 400750,
+  "experience_score": 52,
+  "has_ending": true,
+  "hours_to_value": 25,
+  "hours_to_good": 6,
+  "reason": "Authored WWII tactics campaigns, but demanding controls and long missions.",
+  "confidence": "medium"
+ },
+ "412020": {
+  "appid": 412020,
+  "experience_score": 81,
+  "has_ending": true,
+  "hours_to_value": 17,
+  "hours_to_good": 1,
+  "reason": "Strong atmosphere and real ending; open zones add mild bloat.",
+  "confidence": "high"
+ },
+ "412220": {
+  "appid": 412220,
+  "experience_score": 24,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 2,
+  "reason": "Free co-op platformer with endless community maps, no conclusion.",
+  "confidence": "medium"
+ },
+ "413150": {
+  "appid": 413150,
+  "experience_score": 60,
+  "has_ending": true,
+  "hours_to_value": 50,
+  "hours_to_good": 2,
+  "reason": "Soft ending after year three, huge time cost, calibration anchor",
+  "confidence": "high"
+ },
+ "418030": {
+  "appid": 418030,
+  "experience_score": 15,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 5,
+  "reason": "Survival base builder sandbox, endless loop, dated systems",
+  "confidence": "medium"
+ },
+ "418460": {
+  "appid": 418460,
+  "experience_score": 20,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 10,
+  "reason": "Endless tactical multiplayer, punishing for newcomers, no campaign",
+  "confidence": "high"
+ },
+ "420530": {
+  "appid": 420530,
+  "experience_score": 94,
+  "has_ending": true,
+  "hours_to_value": 5,
+  "hours_to_good": 0.2,
+  "reason": "Short, inventive, deeply authored, one true unforgettable ending",
+  "confidence": "high"
+ },
+ "424030": {
+  "appid": 424030,
+  "experience_score": 14,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 6,
+  "reason": "Civil War line-battle sim, endless, punishing without an organised group",
+  "confidence": "medium"
+ },
+ "424840": {
+  "appid": 424840,
+  "experience_score": 91,
+  "has_ending": true,
+  "hours_to_value": 4,
+  "hours_to_good": 0.2,
+  "reason": "Tight atmospheric platformer, no padding, finishes in an evening",
+  "confidence": "high"
+ },
+ "427520": {
+  "appid": 427520,
+  "experience_score": 45,
+  "has_ending": true,
+  "hours_to_value": 60,
+  "hours_to_good": 6,
+  "reason": "Rocket launch ends it, but designed to eat hundreds of hours",
+  "confidence": "high"
+ },
+ "431240": {
+  "appid": 431240,
+  "experience_score": 30,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 0.5,
+  "reason": "Endless party mini golf; fun with friends, no authored conclusion.",
+  "confidence": "high"
+ },
+ "431960": {
+  "appid": 431960,
+  "experience_score": 20,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 0,
+  "reason": "Wallpaper utility, not a game; no authored experience or ending.",
+  "confidence": "high"
+ },
+ "435150": {
+  "appid": 435150,
+  "experience_score": 44,
+  "has_ending": true,
+  "hours_to_value": 85,
+  "hours_to_good": 8,
+  "reason": "Superb but enormous; systems opaque early, huge time cost.",
+  "confidence": "high"
+ },
+ "438100": {
+  "appid": 438100,
+  "experience_score": 8,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 3,
+  "reason": "Social chatroom, no author, no ending, quality depends on strangers",
+  "confidence": "high"
+ },
+ "438740": {
+  "appid": 438740,
+  "experience_score": 12,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 3,
+  "reason": "Endless asymmetric multiplayer, servers dying, no authored conclusion",
+  "confidence": "medium"
+ },
+ "440900": {
+  "appid": 440900,
+  "experience_score": 12,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 15,
+  "reason": "Endless survival crafting treadmill; long grind before payoff.",
+  "confidence": "high"
+ },
+ "444090": {
+  "appid": 444090,
+  "experience_score": 18,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 10,
+  "reason": "Endless hero shooter, no ending, heavy meta learning curve",
+  "confidence": "high"
+ },
+ "444200": {
+  "appid": 444200,
+  "experience_score": 10,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 5,
+  "reason": "Free-to-play tank grind, tech trees, endless matchmaking",
+  "confidence": "high"
+ },
+ "447040": {
+  "appid": 447040,
+  "experience_score": 60,
+  "has_ending": true,
+  "hours_to_value": 22,
+  "hours_to_good": 1,
+  "reason": "Playful hacking sandbox, clear ending, some Ubisoft map padding.",
+  "confidence": "high"
+ },
+ "447820": {
+  "appid": 447820,
+  "experience_score": 18,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 4,
+  "reason": "WWII multiplayer shooter, co-op bot modes, no authored campaign.",
+  "confidence": "medium"
+ },
+ "457140": {
+  "appid": 457140,
+  "experience_score": 40,
+  "has_ending": true,
+  "hours_to_value": 60,
+  "hours_to_good": 10,
+  "reason": "Superb systems, real ending, but punishing failure loops and restarts",
+  "confidence": "high"
+ },
+ "460950": {
+  "appid": 460950,
+  "experience_score": 91,
+  "has_ending": true,
+  "hours_to_value": 5,
+  "hours_to_good": 0.2,
+  "reason": "Five razor-sharp hours, great story and style, no padding.",
+  "confidence": "high"
+ },
+ "466240": {
+  "appid": 466240,
+  "experience_score": 14,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 2,
+  "reason": "Endless social deduction rounds, needs full lobby, no conclusion",
+  "confidence": "medium"
+ },
+ "470220": {
+  "appid": 470220,
+  "experience_score": 22,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 0.2,
+  "reason": "Endless card matches, no authored arc, pure repeat play",
+  "confidence": "high"
+ },
+ "471710": {
+  "appid": 471710,
+  "experience_score": 10,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 2,
+  "reason": "Endless social VR platform, user content, no authored experience",
+  "confidence": "medium"
+ },
+ "489520": {
+  "appid": 489520,
+  "experience_score": 15,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 5,
+  "reason": "Free-to-play PvP card battler with grind and ladder, endless.",
+  "confidence": "medium"
+ },
+ "498240": {
+  "appid": 498240,
+  "experience_score": 72,
+  "has_ending": true,
+  "hours_to_value": 10,
+  "hours_to_good": 0,
+  "reason": "Finite authored Batman story, ends cleanly, some padding and QTE filler",
+  "confidence": "high"
+ },
+ "504370": {
+  "appid": 504370,
+  "experience_score": 15,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 10,
+  "reason": "Competitive MOBA-arena; pure skill ladder, servers now dead.",
+  "confidence": "medium"
+ },
+ "513710": {
+  "appid": 513710,
+  "experience_score": 10,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 15,
+  "reason": "Endless multiplayer survival, brutal metabolism systems, raids erase progress.",
+  "confidence": "medium"
+ },
+ "524220": {
+  "appid": 524220,
+  "experience_score": 84,
+  "has_ending": true,
+  "hours_to_value": 22,
+  "hours_to_good": 2,
+  "reason": "Required replays are authored, not padding; unforgettable ending.",
+  "confidence": "high"
+ },
+ "526870": {
+  "appid": 526870,
+  "experience_score": 55,
+  "has_ending": true,
+  "hours_to_value": 60,
+  "hours_to_good": 2,
+  "reason": "Beautiful factory sandbox with a real ending, but huge time cost",
+  "confidence": "high"
+ },
+ "534380": {
+  "appid": 534380,
+  "experience_score": 52,
+  "has_ending": true,
+  "hours_to_value": 22,
+  "hours_to_good": 3,
+  "reason": "Great parkour, ends, but padded map and weak writing.",
+  "confidence": "high"
+ },
+ "544810": {
+  "appid": 544810,
+  "experience_score": 16,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 4,
+  "reason": "Free-to-play competitive card ladder; endless meta grind, no conclusion",
+  "confidence": "medium"
+ },
+ "544920": {
+  "appid": 544920,
+  "experience_score": 8,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 3,
+  "reason": "Battle royale, endless, and servers are effectively dead",
+  "confidence": "medium"
+ },
+ "546560": {
+  "appid": 546560,
+  "experience_score": 92,
+  "has_ending": true,
+  "hours_to_value": 12,
+  "hours_to_good": 0.5,
+  "reason": "Peak authored design, no padding, strong ending; VR headset required.",
+  "confidence": "high"
+ },
+ "548430": {
+  "appid": 548430,
+  "experience_score": 22,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 3,
+  "reason": "Live-service mission treadmill with seasons; no authored conclusion.",
+  "confidence": "high"
+ },
+ "552100": {
+  "appid": 552100,
+  "experience_score": 26,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 1,
+  "reason": "Instant physics destruction toy, no authored campaign, fun fades fast.",
+  "confidence": "medium"
+ },
+ "552500": {
+  "appid": 552500,
+  "experience_score": 22,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 3,
+  "reason": "Loot treadmill co-op; missions repeat forever with no conclusion.",
+  "confidence": "high"
+ },
+ "552990": {
+  "appid": 552990,
+  "experience_score": 14,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 3,
+  "reason": "Free-to-play naval grind, endless matches, heavy monetized ship progression ladder.",
+  "confidence": "high"
+ },
+ "553850": {
+  "appid": 553850,
+  "experience_score": 22,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 3,
+  "reason": "Live-service war with rotating orders, no conclusion, warbond grind",
+  "confidence": "high"
+ },
+ "555160": {
+  "appid": 555160,
+  "experience_score": 20,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 2,
+  "reason": "VR competitive shooter, endless matches, needs gear and skill",
+  "confidence": "medium"
+ },
+ "568220": {
+  "appid": 568220,
+  "experience_score": 58,
+  "has_ending": true,
+  "hours_to_value": 45,
+  "hours_to_good": 12,
+  "reason": "Superb finite story, but brutal repeated restarts before it clicks",
+  "confidence": "high"
+ },
+ "573090": {
+  "appid": 573090,
+  "experience_score": 22,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 12,
+  "reason": "Deep engineering sandbox, steep build curve, missions repeat forever.",
+  "confidence": "medium"
+ },
+ "578310": {
+  "appid": 578310,
+  "experience_score": 8,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 2,
+  "reason": "Free 2D multiplayer shooter, endless matches, no authored content",
+  "confidence": "low"
+ },
+ "582010": {
+  "appid": 582010,
+  "experience_score": 42,
+  "has_ending": true,
+  "hours_to_value": 45,
+  "hours_to_good": 15,
+  "reason": "Story ends, then endless grind; combat takes ages to click",
+  "confidence": "high"
+ },
+ "594650": {
+  "appid": 594650,
+  "experience_score": 12,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 20,
+  "reason": "Extraction PvP, permadeath, endless; superb atmosphere cannot save it",
+  "confidence": "high"
+ },
+ "601150": {
+  "appid": 601150,
+  "experience_score": 88,
+  "has_ending": true,
+  "hours_to_value": 12,
+  "hours_to_good": 1,
+  "reason": "Dense combat, zero filler, complete story in a weekend.",
+  "confidence": "high"
+ },
+ "602960": {
+  "appid": 602960,
+  "experience_score": 22,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 15,
+  "reason": "Endless co-op sub sim; brutal learning curve, needs a crew.",
+  "confidence": "high"
+ },
+ "620980": {
+  "appid": 620980,
+  "experience_score": 40,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 0.2,
+  "reason": "Fun instantly, but a skill ladder with no ending; VR only.",
+  "confidence": "high"
+ },
+ "629520": {
+  "appid": 629520,
+  "experience_score": 8,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 0,
+  "reason": "Soundboard utility software, not a playable experience.",
+  "confidence": "high"
+ },
+ "629760": {
+  "appid": 629760,
+  "experience_score": 8,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 20,
+  "reason": "PvP melee only; brutal skill ladder, no campaign at all.",
+  "confidence": "high"
+ },
+ "632360": {
+  "appid": 632360,
+  "experience_score": 32,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 4,
+  "reason": "Loop-forever run-based shooter; nominal boss is a restart, not closure.",
+  "confidence": "high"
+ },
+ "632470": {
+  "appid": 632470,
+  "experience_score": 90,
+  "has_ending": true,
+  "hours_to_value": 24,
+  "hours_to_good": 1,
+  "reason": "Every hour is written content; ends decisively, no padding.",
+  "confidence": "high"
+ },
+ "635260": {
+  "appid": 635260,
+  "experience_score": 18,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 8,
+  "reason": "Endless drift sandbox, grind for cars, drifting takes practice",
+  "confidence": "medium"
+ },
+ "636480": {
+  "appid": 636480,
+  "experience_score": 30,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 0.3,
+  "reason": "Fun sandbox shooter but endless skirmishes, no campaign",
+  "confidence": "medium"
+ },
+ "637650": {
+  "appid": 637650,
+  "experience_score": 48,
+  "has_ending": true,
+  "hours_to_value": 40,
+  "hours_to_good": 5,
+  "reason": "Real ending but padded open world and uneven pacing cost many hours",
+  "confidence": "high"
+ },
+ "638230": {
+  "appid": 638230,
+  "experience_score": 92,
+  "has_ending": true,
+  "hours_to_value": 2,
+  "hours_to_good": 0.1,
+  "reason": "Two flawless authored hours, strong ending, nothing wasted",
+  "confidence": "high"
+ },
+ "640820": {
+  "appid": 640820,
+  "experience_score": 38,
+  "has_ending": true,
+  "hours_to_value": 90,
+  "hours_to_good": 10,
+  "reason": "Ends, but huge length, timed kingdom management and rough balance punish newcomers",
+  "confidence": "high"
+ },
+ "646570": {
+  "appid": 646570,
+  "experience_score": 55,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 1,
+  "reason": "Excellent design but ascension ladder is endless; no story conclusion.",
+  "confidence": "high"
+ },
+ "655500": {
+  "appid": 655500,
+  "experience_score": 16,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 20,
+  "reason": "Hardcore motocross sim; punishing physics, endless practice, no campaign.",
+  "confidence": "medium"
+ },
+ "657200": {
+  "appid": 657200,
+  "experience_score": 18,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 0.5,
+  "reason": "Joke controls, endless sandbox messing, no authored content",
+  "confidence": "medium"
+ },
+ "667530": {
+  "appid": 667530,
+  "experience_score": 15,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 1,
+  "reason": "Ragdoll physics fighter, funny for an evening, no ending",
+  "confidence": "medium"
+ },
+ "667970": {
+  "appid": 667970,
+  "experience_score": 40,
+  "has_ending": false,
+  "hours_to_value": 25,
+  "hours_to_good": 8,
+  "reason": "Superb VR jet sim, but campaigns are sandbox missions, no real end",
+  "confidence": "medium"
+ },
+ "669330": {
+  "appid": 669330,
+  "experience_score": 30,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 4,
+  "reason": "Sharp auto-battler, but endless PvP ladder with rank chasing",
+  "confidence": "medium"
+ },
+ "674940": {
+  "appid": 674940,
+  "experience_score": 20,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 0.1,
+  "reason": "Local versus brawler; endless rounds, no authored content.",
+  "confidence": "high"
+ },
+ "683320": {
+  "appid": 683320,
+  "experience_score": 84,
+  "has_ending": true,
+  "hours_to_value": 4,
+  "hours_to_good": 0.2,
+  "reason": "Beautiful, brief, complete; light on challenge but no wasted minute.",
+  "confidence": "high"
+ },
+ "686810": {
+  "appid": 686810,
+  "experience_score": 12,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 15,
+  "reason": "Endless multiplayer war sim, punishing learning curve, no conclusion.",
+  "confidence": "high"
+ },
+ "698780": {
+  "appid": 698780,
+  "experience_score": 91,
+  "has_ending": true,
+  "hours_to_value": 4,
+  "hours_to_good": 0.5,
+  "reason": "Four hours, complete authored twist, free, unforgettable.",
+  "confidence": "high"
+ },
+ "703080": {
+  "appid": 703080,
+  "experience_score": 38,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 6,
+  "reason": "Open-ended zoo sandbox; fiddly building, no conclusion.",
+  "confidence": "high"
+ },
+ "736220": {
+  "appid": 736220,
+  "experience_score": 15,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 10,
+  "reason": "Milsim WWII shooter, slow rounds, coordination required, endless matches.",
+  "confidence": "medium"
+ },
+ "736590": {
+  "appid": 736590,
+  "experience_score": 12,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 4,
+  "reason": "Free multiplayer milsim sandbox, no campaign, thin population",
+  "confidence": "medium"
+ },
+ "750920": {
+  "appid": 750920,
+  "experience_score": 62,
+  "has_ending": true,
+  "hours_to_value": 18,
+  "hours_to_good": 1,
+  "reason": "Handsome finite adventure; good tombs, weak middle and collectibles.",
+  "confidence": "high"
+ },
+ "753640": {
+  "appid": 753640,
+  "experience_score": 95,
+  "has_ending": true,
+  "hours_to_value": 17,
+  "hours_to_good": 1,
+  "reason": "Handcrafted mystery, perfect ending, every hour earns its place.",
+  "confidence": "high"
+ },
+ "782330": {
+  "appid": 782330,
+  "experience_score": 78,
+  "has_ending": true,
+  "hours_to_value": 14,
+  "hours_to_good": 2,
+  "reason": "Excellent combat, complete campaign, but demanding systems and platforming padding.",
+  "confidence": "high"
+ },
+ "812140": {
+  "appid": 812140,
+  "experience_score": 38,
+  "has_ending": true,
+  "hours_to_value": 45,
+  "hours_to_good": 3,
+  "reason": "Ends, but huge padded map and grind bloat every good hour.",
+  "confidence": "high"
+ },
+ "813780": {
+  "appid": 813780,
+  "experience_score": 62,
+  "has_ending": true,
+  "hours_to_value": 25,
+  "hours_to_good": 2,
+  "reason": "Finite historical campaigns, excellent pacing, multiplayer ladder optional",
+  "confidence": "high"
+ },
+ "814380": {
+  "appid": 814380,
+  "experience_score": 82,
+  "has_ending": true,
+  "hours_to_value": 30,
+  "hours_to_good": 6,
+  "reason": "Superb authored combat, tight runtime, clear ending; steep early wall",
+  "confidence": "high"
+ },
+ "823130": {
+  "appid": 823130,
+  "experience_score": 16,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 0.5,
+  "reason": "Endless joke battle royale, funny once, no authored arc",
+  "confidence": "medium"
+ },
+ "824270": {
+  "appid": 824270,
+  "experience_score": 8,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 0,
+  "reason": "Aim trainer software, pure skill ladder, no content and no ending",
+  "confidence": "high"
+ },
+ "843380": {
+  "appid": 843380,
+  "experience_score": 18,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 1,
+  "reason": "Battle royale treadmill, cute skin, no ending at all",
+  "confidence": "high"
+ },
+ "884660": {
+  "appid": 884660,
+  "experience_score": 14,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 2,
+  "reason": "Free battle royale grind, no ending, heavy monetisation",
+  "confidence": "medium"
+ },
+ "892970": {
+  "appid": 892970,
+  "experience_score": 38,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 3,
+  "reason": "Boss list is not an ending; still early access, grindy",
+  "confidence": "high"
+ },
+ "895400": {
+  "appid": 895400,
+  "experience_score": 10,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 12,
+  "reason": "Endless PvP looting survival, thin content, harsh time investment.",
+  "confidence": "medium"
+ },
+ "899770": {
+  "appid": 899770,
+  "experience_score": 18,
+  "has_ending": true,
+  "hours_to_value": 50,
+  "hours_to_good": 10,
+  "reason": "Campaign is prelude to endless seasonal loot grind.",
+  "confidence": "high"
+ },
+ "900883": {
+  "appid": 900883,
+  "experience_score": 42,
+  "has_ending": true,
+  "hours_to_value": 40,
+  "hours_to_good": 3,
+  "reason": "Ends, but sprawling filler quests and level scaling stretch it long",
+  "confidence": "high"
+ },
+ "901583": {
+  "appid": 901583,
+  "experience_score": 58,
+  "has_ending": true,
+  "hours_to_value": 28,
+  "hours_to_good": 2,
+  "reason": "Strong authored crime story, padded by filler missions and dated driving",
+  "confidence": "high"
+ },
+ "914620": {
+  "appid": 914620,
+  "experience_score": 15,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 6,
+  "reason": "Abandoned early access survival craft, no ending, slow start",
+  "confidence": "medium"
+ },
+ "915320": {
+  "appid": 915320,
+  "experience_score": 7,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 1,
+  "reason": "Free arena shooter with unlock grind, endless matches",
+  "confidence": "low"
+ },
+ "952060": {
+  "appid": 952060,
+  "experience_score": 72,
+  "has_ending": true,
+  "hours_to_value": 6,
+  "hours_to_good": 0.3,
+  "reason": "Polished short remake, ends, but noticeably cut down",
+  "confidence": "high"
+ },
+ "960090": {
+  "appid": 960090,
+  "experience_score": 40,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 1,
+  "reason": "Instantly fun, but infinite maps and endless upgrade grind",
+  "confidence": "high"
+ },
+ "967050": {
+  "appid": 967050,
+  "experience_score": 40,
+  "has_ending": true,
+  "hours_to_value": 3,
+  "hours_to_good": 0.5,
+  "reason": "Short co-op horror rounds, cheap scares, thin authored content",
+  "confidence": "medium"
+ },
+ "976730": {
+  "appid": 976730,
+  "experience_score": 80,
+  "has_ending": true,
+  "hours_to_value": 30,
+  "hours_to_good": 0,
+  "reason": "Six finite campaigns, strong set pieces, playable co-op, no grind wall",
+  "confidence": "high"
+ },
+ "977950": {
+  "appid": 977950,
+  "experience_score": 68,
+  "has_ending": true,
+  "hours_to_value": 4,
+  "hours_to_good": 0.5,
+  "reason": "Rhythm campaign ends, but brutal difficulty walls stop many",
+  "confidence": "medium"
+ },
+ "992300": {
+  "appid": 992300,
+  "experience_score": 40,
+  "has_ending": true,
+  "hours_to_value": 15,
+  "hours_to_good": 3,
+  "reason": "Finite action RPG, rough polish and repeated areas dull the payoff",
+  "confidence": "medium"
+ },
+ "994280": {
+  "appid": 994280,
+  "experience_score": 66,
+  "has_ending": true,
+  "hours_to_value": 30,
+  "hours_to_good": 2,
+  "reason": "Authored linear wuxia story with real ending; long but rarely padded",
+  "confidence": "medium"
+ },
+ "1017180": {
+  "appid": 1017180,
+  "experience_score": 30,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 2,
+  "reason": "Endless procedural road survival, no destination, janky by design",
+  "confidence": "medium"
+ },
+ "1022450": {
+  "appid": 1022450,
+  "experience_score": 15,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 4,
+  "reason": "Free multiplayer RTS matches on repeat, no campaign, thin content.",
+  "confidence": "medium"
+ },
+ "1029550": {
+  "appid": 1029550,
+  "experience_score": 8,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 3,
+  "reason": "Free-to-play drift racer with car grind and no conclusion",
+  "confidence": "medium"
+ },
+ "1046930": {
+  "appid": 1046930,
+  "experience_score": 18,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 5,
+  "reason": "Competitive auto-battler ladder; endless matches, no authored conclusion.",
+  "confidence": "high"
+ },
+ "1049800": {
+  "appid": 1049800,
+  "experience_score": 8,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 2,
+  "reason": "Free voxel shooter, endless matches, no authored content",
+  "confidence": "low"
+ },
+ "1066890": {
+  "appid": 1066890,
+  "experience_score": 32,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 5,
+  "reason": "Excellent driving model, but endless career and needs a wheel",
+  "confidence": "medium"
+ },
+ "1086940": {
+  "appid": 1086940,
+  "experience_score": 40,
+  "has_ending": true,
+  "hours_to_value": 70,
+  "hours_to_good": 3,
+  "reason": "Excellent authored RPG, but enormous time cost and act three sag",
+  "confidence": "high"
+ },
+ "1089980": {
+  "appid": 1089980,
+  "experience_score": 90,
+  "has_ending": true,
+  "hours_to_value": 4,
+  "hours_to_good": 0.1,
+  "reason": "Short, funny, many endings, no filler, finishes in one sitting",
+  "confidence": "high"
+ },
+ "1092790": {
+  "appid": 1092790,
+  "experience_score": 94,
+  "has_ending": true,
+  "hours_to_value": 13,
+  "hours_to_good": 0.5,
+  "reason": "Tightly authored, constantly reinvents itself, unforgettable finish.",
+  "confidence": "high"
+ },
+ "1118200": {
+  "appid": 1118200,
+  "experience_score": 25,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 0.2,
+  "reason": "Sandbox toy with no goals, no structure, no ending.",
+  "confidence": "high"
+ },
+ "1119730": {
+  "appid": 1119730,
+  "experience_score": 22,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 3,
+  "reason": "Open-ended farming sandbox, no authored conclusion, chore loop repeats forever",
+  "confidence": "medium"
+ },
+ "1139900": {
+  "appid": 1139900,
+  "experience_score": 88,
+  "has_ending": true,
+  "hours_to_value": 8,
+  "hours_to_good": 1,
+  "reason": "Tight seven-hour cyberpunk campaign, no padding, clean finish.",
+  "confidence": "high"
+ },
+ "1142710": {
+  "appid": 1142710,
+  "experience_score": 25,
+  "has_ending": true,
+  "hours_to_value": 60,
+  "hours_to_good": 20,
+  "reason": "Campaigns technically end but demand huge time and system learning.",
+  "confidence": "high"
+ },
+ "1144400": {
+  "appid": 1144400,
+  "experience_score": 72,
+  "has_ending": true,
+  "hours_to_value": 30,
+  "hours_to_good": 1,
+  "reason": "Polished authored visual novel, real routes and endings, but long reading.",
+  "confidence": "medium"
+ },
+ "1145350": {
+  "appid": 1145350,
+  "experience_score": 80,
+  "has_ending": true,
+  "hours_to_value": 30,
+  "hours_to_good": 1,
+  "reason": "Superb roguelite with real narrative ending, but long and repetitive.",
+  "confidence": "high"
+ },
+ "1145360": {
+  "appid": 1145360,
+  "experience_score": 85,
+  "has_ending": true,
+  "hours_to_value": 23,
+  "hours_to_good": 1,
+  "reason": "Roguelite with a real authored ending; story pays off repetition.",
+  "confidence": "high"
+ },
+ "1172380": {
+  "appid": 1172380,
+  "experience_score": 80,
+  "has_ending": true,
+  "hours_to_value": 16,
+  "hours_to_good": 2,
+  "reason": "Focused Star Wars adventure, some backtracking, clean finish.",
+  "confidence": "high"
+ },
+ "1172620": {
+  "appid": 1172620,
+  "experience_score": 18,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 10,
+  "reason": "Endless shared-world live service; sailing grind, no conclusion.",
+  "confidence": "high"
+ },
+ "1174180": {
+  "appid": 1174180,
+  "experience_score": 45,
+  "has_ending": true,
+  "hours_to_value": 50,
+  "hours_to_good": 8,
+  "reason": "Superb ending, heavy padding and slow travel, calibration anchor",
+  "confidence": "high"
+ },
+ "1178830": {
+  "appid": 1178830,
+  "experience_score": 72,
+  "has_ending": true,
+  "hours_to_value": 2,
+  "hours_to_good": 0.1,
+  "reason": "Two dazzling hours of action, ends fast, story thin",
+  "confidence": "high"
+ },
+ "1184370": {
+  "appid": 1184370,
+  "experience_score": 45,
+  "has_ending": true,
+  "hours_to_value": 100,
+  "hours_to_good": 8,
+  "reason": "Great authored CRPG with endings, but enormous length and rules overhead",
+  "confidence": "high"
+ },
+ "1241100": {
+  "appid": 1241100,
+  "experience_score": 10,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 1,
+  "reason": "Free multiplayer shooter, endless matches, low quality, no authored content",
+  "confidence": "medium"
+ },
+ "1245620": {
+  "appid": 1245620,
+  "experience_score": 72,
+  "has_ending": true,
+  "hours_to_value": 55,
+  "hours_to_good": 4,
+  "reason": "Superb authored world with a real ending, but very long",
+  "confidence": "high"
+ },
+ "1250410": {
+  "appid": 1250410,
+  "experience_score": 16,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 10,
+  "reason": "Endless sandbox sim; heavy setup, no authored arc.",
+  "confidence": "high"
+ },
+ "1259970": {
+  "appid": 1259970,
+  "experience_score": 18,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 2,
+  "reason": "Season update football game, endless seasons and online play, no ending",
+  "confidence": "high"
+ },
+ "1260320": {
+  "appid": 1260320,
+  "experience_score": 20,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 0.5,
+  "reason": "Endless party brawler, fun in groups, no authored content",
+  "confidence": "medium"
+ },
+ "1274570": {
+  "appid": 1274570,
+  "experience_score": 22,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 1,
+  "reason": "Repeatable co-op horror maps, needs friends, no ending",
+  "confidence": "medium"
+ },
+ "1282100": {
+  "appid": 1282100,
+  "experience_score": 52,
+  "has_ending": true,
+  "hours_to_value": 20,
+  "hours_to_good": 3,
+  "reason": "Finite souls-shooter campaign, but grindy loot and rerun structure.",
+  "confidence": "medium"
+ },
+ "1288310": {
+  "appid": 1288310,
+  "experience_score": 81,
+  "has_ending": true,
+  "hours_to_value": 4,
+  "hours_to_good": 0.3,
+  "reason": "Compact mystery horror, tight story, ends cleanly, no padding",
+  "confidence": "medium"
+ },
+ "1289310": {
+  "appid": 1289310,
+  "experience_score": 93,
+  "has_ending": true,
+  "hours_to_value": 1,
+  "hours_to_good": 0.1,
+  "reason": "One hour, free, perfect pacing, complete and memorable.",
+  "confidence": "high"
+ },
+ "1296830": {
+  "appid": 1296830,
+  "experience_score": 62,
+  "has_ending": true,
+  "hours_to_value": 20,
+  "hours_to_good": 1,
+  "reason": "Roguelite with real endings, fun fast, but repetitive runs to finish",
+  "confidence": "medium"
+ },
+ "1313140": {
+  "appid": 1313140,
+  "experience_score": 75,
+  "has_ending": true,
+  "hours_to_value": 15,
+  "hours_to_good": 1,
+  "reason": "Charming, tight, ends properly; base chores add mild busywork.",
+  "confidence": "high"
+ },
+ "1313860": {
+  "appid": 1313860,
+  "experience_score": 18,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 2,
+  "reason": "Annual sports title, endless Ultimate Team grind, no authored conclusion",
+  "confidence": "high"
+ },
+ "1325200": {
+  "appid": 1325200,
+  "experience_score": 52,
+  "has_ending": true,
+  "hours_to_value": 50,
+  "hours_to_good": 10,
+  "reason": "Excellent combat, finite campaign, but heavy loot grind and slow start",
+  "confidence": "high"
+ },
+ "1332010": {
+  "appid": 1332010,
+  "experience_score": 90,
+  "has_ending": true,
+  "hours_to_value": 6,
+  "hours_to_good": 0.2,
+  "reason": "Six tight hours, gorgeous, no padding, strong ending.",
+  "confidence": "high"
+ },
+ "1333350": {
+  "appid": 1333350,
+  "experience_score": 6,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 2,
+  "reason": "Idle gacha dress-up with daily login treadmill, no ending",
+  "confidence": "medium"
+ },
+ "1335200": {
+  "appid": 1335200,
+  "experience_score": 10,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 3,
+  "reason": "Free-to-play gacha treadmill with daily quests, no conclusion",
+  "confidence": "medium"
+ },
+ "1384160": {
+  "appid": 1384160,
+  "experience_score": 22,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 25,
+  "reason": "Competitive fighter; brief story mode, infinite skill ladder otherwise.",
+  "confidence": "high"
+ },
+ "1446780": {
+  "appid": 1446780,
+  "experience_score": 35,
+  "has_ending": true,
+  "hours_to_value": 40,
+  "hours_to_good": 10,
+  "reason": "Story ends but real game is endless grind for gear.",
+  "confidence": "high"
+ },
+ "1451940": {
+  "appid": 1451940,
+  "experience_score": 83,
+  "has_ending": true,
+  "hours_to_value": 6,
+  "hours_to_good": 0.5,
+  "reason": "Sharp short satire, many endings, dense authored writing",
+  "confidence": "medium"
+ },
+ "1483870": {
+  "appid": 1483870,
+  "experience_score": 22,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 1,
+  "reason": "Party drawing game, instantly fun, endless rounds, needs friends.",
+  "confidence": "medium"
+ },
+ "1520370": {
+  "appid": 1520370,
+  "experience_score": 35,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 3,
+  "reason": "Charming car sandbox, but early access grind with no finish",
+  "confidence": "medium"
+ },
+ "1533390": {
+  "appid": 1533390,
+  "experience_score": 18,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 1,
+  "reason": "Endless VR tag playground; joyful movement but no authored content.",
+  "confidence": "medium"
+ },
+ "1557740": {
+  "appid": 1557740,
+  "experience_score": 32,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 0.2,
+  "reason": "Excellent card-brawl rounds, but purely versus, no ending",
+  "confidence": "medium"
+ },
+ "1583320": {
+  "appid": 1583320,
+  "experience_score": 13,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 6,
+  "reason": "Player-controlled soccer, endless matches, needs organised teammates.",
+  "confidence": "medium"
+ },
+ "1599340": {
+  "appid": 1599340,
+  "experience_score": 10,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 25,
+  "reason": "MMO gear treadmill, daily chores, story buried behind grind",
+  "confidence": "high"
+ },
+ "1604030": {
+  "appid": 1604030,
+  "experience_score": 20,
+  "has_ending": true,
+  "hours_to_value": 60,
+  "hours_to_good": 8,
+  "reason": "Survival grind and base upkeep dominate; server treadmill design.",
+  "confidence": "medium"
+ },
+ "1623730": {
+  "appid": 1623730,
+  "experience_score": 33,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 2,
+  "reason": "Fun capture loop, but early access with no real conclusion",
+  "confidence": "high"
+ },
+ "1677740": {
+  "appid": 1677740,
+  "experience_score": 12,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 0.2,
+  "reason": "Endless mobile-style battle royale with cosmetics grind.",
+  "confidence": "medium"
+ },
+ "1686940": {
+  "appid": 1686940,
+  "experience_score": 18,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 0,
+  "reason": "Endless local party brawler, no campaign, needs friends present",
+  "confidence": "medium"
+ },
+ "1687950": {
+  "appid": 1687950,
+  "experience_score": 52,
+  "has_ending": true,
+  "hours_to_value": 100,
+  "hours_to_good": 3,
+  "reason": "Superb but enormous; 100 hours is a real cost for adults.",
+  "confidence": "high"
+ },
+ "1721470": {
+  "appid": 1721470,
+  "experience_score": 66,
+  "has_ending": true,
+  "hours_to_value": 3,
+  "hours_to_good": 0,
+  "reason": "Very short, sharp horror chapter; thin but finishes fast.",
+  "confidence": "medium"
+ },
+ "1782210": {
+  "appid": 1782210,
+  "experience_score": 14,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 0.2,
+  "reason": "Free multiplayer battle royale meme; no campaign, no ending.",
+  "confidence": "medium"
+ },
+ "1789480": {
+  "appid": 1789480,
+  "experience_score": 9,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 10,
+  "reason": "Extraction shooter with permadeath loot grind, endless, dying playerbase.",
+  "confidence": "medium"
+ },
+ "1794680": {
+  "appid": 1794680,
+  "experience_score": 42,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 0,
+  "reason": "Instantly fun, but endless unlock ladder with no authored finish.",
+  "confidence": "high"
+ },
+ "1817070": {
+  "appid": 1817070,
+  "experience_score": 78,
+  "has_ending": true,
+  "hours_to_value": 18,
+  "hours_to_good": 0,
+  "reason": "Fun immediately, strong story, some map-marker filler.",
+  "confidence": "high"
+ },
+ "1817190": {
+  "appid": 1817190,
+  "experience_score": 86,
+  "has_ending": true,
+  "hours_to_value": 9,
+  "hours_to_good": 0,
+  "reason": "Short focused superhero story, fun immediately, ends before repetition sets in",
+  "confidence": "high"
+ },
+ "1850740": {
+  "appid": 1850740,
+  "experience_score": 22,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 3,
+  "reason": "Repeatable co-op ghost hunts, no story end, needs a group",
+  "confidence": "medium"
+ },
+ "1868140": {
+  "appid": 1868140,
+  "experience_score": 80,
+  "has_ending": true,
+  "hours_to_value": 25,
+  "hours_to_good": 0.5,
+  "reason": "Charming loop with real story ending; slight late-game grind.",
+  "confidence": "high"
+ },
+ "1903340": {
+  "appid": 1903340,
+  "experience_score": 86,
+  "has_ending": true,
+  "hours_to_value": 30,
+  "hours_to_good": 1,
+  "reason": "Long but consistently authored, gorgeous, and it truly concludes.",
+  "confidence": "high"
+ },
+ "1922560": {
+  "appid": 1922560,
+  "experience_score": 22,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 1,
+  "reason": "Hero shooter treadmill with sticker grind; charming, but no real ending",
+  "confidence": "high"
+ },
+ "1942280": {
+  "appid": 1942280,
+  "experience_score": 58,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 0.5,
+  "reason": "Instantly fun arena roguelite, but no authored ending; loops forever.",
+  "confidence": "high"
+ },
+ "1948980": {
+  "appid": 1948980,
+  "experience_score": 48,
+  "has_ending": true,
+  "hours_to_value": 30,
+  "hours_to_good": 5,
+  "reason": "Wuxia sandbox RPG with real endings, sprawling and rough translation.",
+  "confidence": "medium"
+ },
+ "1987080": {
+  "appid": 1987080,
+  "experience_score": 38,
+  "has_ending": true,
+  "hours_to_value": 5,
+  "hours_to_good": 1,
+  "reason": "Co-op backrooms puzzles end, but rough and friend-dependent",
+  "confidence": "medium"
+ },
+ "2021910": {
+  "appid": 2021910,
+  "experience_score": 20,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 0.3,
+  "reason": "Funny gimmick, endless PvP matches, novelty fades quickly",
+  "confidence": "medium"
+ },
+ "2027330": {
+  "appid": 2027330,
+  "experience_score": 14,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 0,
+  "reason": "Gore physics sandbox toy, no goals, no ending",
+  "confidence": "medium"
+ },
+ "2080690": {
+  "appid": 2080690,
+  "experience_score": 15,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 6,
+  "reason": "Waterworld survival crafting, early access, grindy base loop, unfinished.",
+  "confidence": "medium"
+ },
+ "2183900": {
+  "appid": 2183900,
+  "experience_score": 76,
+  "has_ending": true,
+  "hours_to_value": 10,
+  "hours_to_good": 1,
+  "reason": "Tight authored campaign, brutal spectacle, ends before it repeats.",
+  "confidence": "high"
+ },
+ "2300320": {
+  "appid": 2300320,
+  "experience_score": 24,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 4,
+  "reason": "Endless farm economy loop, deliberately slow, no authored ending.",
+  "confidence": "high"
+ },
+ "2322560": {
+  "appid": 2322560,
+  "experience_score": 72,
+  "has_ending": true,
+  "hours_to_value": 6,
+  "hours_to_good": 0.3,
+  "reason": "Finite FMV romance, branches, but thin replay outside novelty",
+  "confidence": "medium"
+ },
+ "2358720": {
+  "appid": 2358720,
+  "experience_score": 72,
+  "has_ending": true,
+  "hours_to_value": 35,
+  "hours_to_good": 2,
+  "reason": "Gorgeous authored action, clear ending, some padded mid-game chapters",
+  "confidence": "high"
+ },
+ "2379780": {
+  "appid": 2379780,
+  "experience_score": 78,
+  "has_ending": true,
+  "hours_to_value": 10,
+  "hours_to_good": 0.5,
+  "reason": "Instantly fun, real credits run, but tempts endless replay.",
+  "confidence": "high"
+ },
+ "2406770": {
+  "appid": 2406770,
+  "experience_score": 12,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 2,
+  "reason": "Early access PvP shooter; striking visuals, thin repeatable rounds.",
+  "confidence": "medium"
+ },
+ "2527500": {
+  "appid": 2527500,
+  "experience_score": 88,
+  "has_ending": true,
+  "hours_to_value": 5,
+  "hours_to_good": 0.5,
+  "reason": "Short authored horror, strong twist, ends cleanly",
+  "confidence": "medium"
+ },
+ "2551020": {
+  "appid": 2551020,
+  "experience_score": 22,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 0.5,
+  "reason": "Endless free heist rounds, no campaign, friends required",
+  "confidence": "medium"
+ },
+ "2567870": {
+  "appid": 2567870,
+  "experience_score": 62,
+  "has_ending": true,
+  "hours_to_value": 5,
+  "hours_to_good": 1,
+  "reason": "Short co-op climb with a real ending; rage-platformer friction, needs a partner",
+  "confidence": "medium"
+ },
+ "2780980": {
+  "appid": 2780980,
+  "experience_score": 16,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 1,
+  "reason": "Social deduction rounds, endless, worthless without a full lobby",
+  "confidence": "medium"
+ },
+ "2828860": {
+  "appid": 2828860,
+  "experience_score": 15,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 10,
+  "reason": "Early access extraction shooter, no ending, rough and grindy",
+  "confidence": "medium"
+ },
+ "2835570": {
+  "appid": 2835570,
+  "experience_score": 78,
+  "has_ending": true,
+  "hours_to_value": 1,
+  "hours_to_good": 0.1,
+  "reason": "Half-hour tense gimmick, complete, but very thin overall",
+  "confidence": "high"
+ },
+ "3097560": {
+  "appid": 3097560,
+  "experience_score": 24,
+  "has_ending": false,
+  "hours_to_value": null,
+  "hours_to_good": 0.3,
+  "reason": "Endless party bluffing rounds, needs friends, no authored conclusion",
+  "confidence": "medium"
+ },
+ "3117820": {
+  "appid": 3117820,
+  "experience_score": 80,
+  "has_ending": true,
+  "hours_to_value": 12,
+  "hours_to_good": 1,
+  "reason": "Tight authored card-life story, dark branches, real endings, no padding.",
+  "confidence": "medium"
+ }
+}

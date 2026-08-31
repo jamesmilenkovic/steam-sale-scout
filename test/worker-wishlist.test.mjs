@@ -18,6 +18,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import worker from "../src/worker.js";
 import { __setSpyMinIntervalMsForTests, __resetSpyQueueForTests } from "../src/spyQueue.js";
+import { assertNoExperienceLeak } from "./helpers/laneShape.mjs";
 
 const originalFetch = globalThis.fetch;
 const originalCaches = globalThis.caches;
@@ -722,4 +723,58 @@ test("?refresh=1 bypasses the per-appid title cache too (re-hits GetItems and pi
   const body2 = await res2.json();
   assert.equal(getItemsCalls, 2, "refresh=1 must bypass the title cache too");
   assert.equal(body2.wishlist[0].title, "New Title");
+});
+
+// ---------------------------------------------------------------------------
+// QA TC-5 — SPEC.md gate (f), the zero-diff regression, asserted rather than
+// inferred. Increment 10 adds eight columns to fpm_catalog; gate (f) says no
+// lane response changes at all until increment 11 consumes them. The only way
+// to make that a test rather than a claim is an EXHAUSTIVE key set: any
+// assertion that only checks the fields it knows about passes happily while a
+// ninth field rides along beside them.
+//
+// If this test fails after a deliberate lane change, update the list here in
+// the same commit — that is the point. It is a tripwire, not a straitjacket.
+// ---------------------------------------------------------------------------
+
+test("gate (f): a /api/wishlist entry's key set is EXACTLY the pre-increment-10 set, and no experience column leaks anywhere in the body", async () => {
+  const env = makeEnv();
+  globalThis.caches = { default: makeMockCache() };
+
+  env.TAG_CACHE.store.set(deckKey(100), JSON.stringify({ deck: 3, os: 2, frame: 0 }));
+  env.TAG_CACHE.store.set(v2Key(100), JSON.stringify(goodSpyEntry({ tags: { Roguelike: 10, Indie: 5 } })));
+
+  globalThis.fetch = makeWishlistFetch({
+    wishlistResponse: { response: { items: [{ appid: 100, priority: 3, date_added: 1700000000 }] } },
+    itadIdByAppid: { 100: "itad-100" },
+    pricesByItadId: { "itad-100": { price: 9.99, priceCents: 999, regular: 19.99, cut: 50, expiry: null } },
+    titlesByAppid: { 100: "Qualifying Wishlist Game" },
+  });
+
+  const ctx = makeCtx();
+  const res = await worker.fetch(new Request("https://x/api/wishlist"), env, ctx);
+  await ctx.flush();
+  const body = await res.json();
+
+  assert.deepEqual(Object.keys(body).sort(), ["available", "count", "wishlist"]);
+  assert.equal(body.wishlist.length, 1);
+  assert.deepEqual(Object.keys(body.wishlist[0]).sort(), [
+      "appid",
+      "atHistoricalLow",
+      "batteryFriendly",
+      "cut",
+      "dateAdded",
+      "deck",
+      "expiry",
+      "historicalLow",
+      "itadId",
+      "price",
+      "priceCents",
+      "priority",
+      "regular",
+      "tagNames",
+      "title",
+      "why",
+    ]);
+  assertNoExperienceLeak(body, assert);
 });

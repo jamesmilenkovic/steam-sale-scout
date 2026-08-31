@@ -1,0 +1,110 @@
+[
+ {
+  "batch": 1,
+  "size": 25,
+  "ms": 28725,
+  "returned": 25,
+  "kept": 25,
+  "model": "claude-haiku-4-5-20251001",
+  "usd": 0.205318
+ },
+ {
+  "batch": 2,
+  "size": 25,
+  "ms": 27996,
+  "returned": 25,
+  "kept": 25,
+  "model": "claude-haiku-4-5-20251001",
+  "usd": 0.174819
+ },
+ {
+  "batch": 3,
+  "size": 25,
+  "ms": 30194,
+  "returned": 26,
+  "kept": 25,
+  "model": "claude-haiku-4-5-20251001",
+  "usd": 0.178435
+ },
+ {
+  "batch": 4,
+  "size": 25,
+  "ms": 30110,
+  "returned": 25,
+  "kept": 25,
+  "model": "claude-haiku-4-5-20251001",
+  "usd": 0.177903
+ },
+ {
+  "batch": 5,
+  "size": 25,
+  "ms": 29134,
+  "returned": 25,
+  "kept": 25,
+  "model": "claude-haiku-4-5-20251001",
+  "usd": 0.17808500000000002
+ },
+ {
+  "batch": 6,
+  "size": 25,
+  "ms": 29884,
+  "returned": 25,
+  "kept": 25,
+  "model": "claude-haiku-4-5-20251001",
+  "usd": 0.17812299999999998
+ },
+ {
+  "batch": 7,
+  "size": 25,
+  "ms": 28709,
+  "returned": 25,
+  "kept": 25,
+  "model": "claude-haiku-4-5-20251001",
+  "usd": 0.177589
+ },
+ {
+  "batch": 8,
+  "size": 25,
+  "ms": 28119,
+  "returned": 25,
+  "kept": 25,
+  "model": "claude-haiku-4-5-20251001",
+  "usd": 0.17574499999999998
+ },
+ {
+  "batch": 9,
+  "size": 25,
+  "ms": 29055,
+  "returned": 25,
+  "kept": 25,
+  "model": "claude-haiku-4-5-20251001",
+  "usd": 0.176895
+ },
+ {
+  "batch": 10,
+  "size": 25,
+  "ms": 29688,
+  "returned": 25,
+  "kept": 25,
+  "model": "claude-haiku-4-5-20251001",
+  "usd": 0.179371
+ },
+ {
+  "batch": 11,
+  "size": 25,
+  "ms": 44676,
+  "returned": 25,
+  "kept": 25,
+  "model": "claude-haiku-4-5-20251001",
+  "usd": 0.199149
+ },
+ {
+  "batch": 12,
+  "size": 25,
+  "ms": 29010,
+  "returned": 25,
+  "kept": 25,
+  "model": "claude-haiku-4-5-20251001",
+  "usd": 0.17460500000000004
+ }
+]

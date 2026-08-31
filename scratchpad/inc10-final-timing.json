@@ -1,0 +1,119 @@
+[
+ {
+  "batch": 1,
+  "ms": 30295,
+  "returned": 25,
+  "kept": 25,
+  "model": "claude-opus-5",
+  "numTurns": 1
+ },
+ {
+  "batch": 2,
+  "ms": 27941,
+  "returned": 25,
+  "kept": 25,
+  "model": "claude-opus-5",
+  "numTurns": 1
+ },
+ {
+  "batch": 3,
+  "ms": 28574,
+  "returned": 25,
+  "kept": 24,
+  "model": "claude-opus-5",
+  "numTurns": 1
+ },
+ {
+  "batch": 4,
+  "ms": 28948,
+  "returned": 25,
+  "kept": 25,
+  "model": "claude-opus-5",
+  "numTurns": 1
+ },
+ {
+  "batch": 5,
+  "ms": 29722,
+  "returned": 25,
+  "kept": 25,
+  "model": "claude-opus-5",
+  "numTurns": 1
+ },
+ {
+  "batch": 6,
+  "ms": 29523,
+  "returned": 25,
+  "kept": 25,
+  "model": "claude-opus-5",
+  "numTurns": 1
+ },
+ {
+  "batch": 7,
+  "ms": 29192,
+  "returned": 25,
+  "kept": 25,
+  "model": "claude-opus-5",
+  "numTurns": 1
+ },
+ {
+  "batch": 8,
+  "ms": 28839,
+  "returned": 25,
+  "kept": 25,
+  "model": "claude-opus-5",
+  "numTurns": 1
+ },
+ {
+  "batch": 9,
+  "ms": 46848,
+  "error": "Unexpected non-whitespace character after JSON at position 4840 (line 27 column 1)"
+ },
+ {
+  "batch": 10,
+  "ms": 29756,
+  "returned": 25,
+  "kept": 25,
+  "model": "claude-opus-5",
+  "numTurns": 1
+ },
+ {
+  "batch": 11,
+  "ms": 29018,
+  "returned": 25,
+  "kept": 25,
+  "model": "claude-opus-5",
+  "numTurns": 1
+ },
+ {
+  "batch": 12,
+  "ms": 31699,
+  "returned": 25,
+  "kept": 25,
+  "model": "claude-opus-5",
+  "numTurns": 1
+ },
+ {
+  "batch": 1,
+  "ms": 28409,
+  "returned": 25,
+  "kept": 24,
+  "model": "claude-opus-5",
+  "numTurns": 1
+ },
+ {
+  "batch": 2,
+  "ms": 7810,
+  "returned": 1,
+  "kept": 1,
+  "model": "claude-opus-5",
+  "numTurns": 1
+ },
+ {
+  "batch": 1,
+  "ms": 9085,
+  "returned": 1,
+  "kept": 1,
+  "model": "claude-opus-5",
+  "numTurns": 1
+ }
+]

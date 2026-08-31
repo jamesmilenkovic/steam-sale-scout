@@ -328,7 +328,12 @@ test("ensureCatalogSchema is idempotent (safe to call repeatedly)", async () => 
   await ensureCatalogSchema(env);
   await ensureCatalogSchema(env);
   const stats = await getCatalogStats(env);
-  assert.deepEqual(stats, { total: 0, matched: 0, unmatched: 0, pending: 0, classified: 0, nonGame: 0, pricePending: 0, tagged: 0, tagsEmpty: 0, tagsPending: 0, tagsKvSeeded: 0 });
+  assert.deepEqual(stats, {
+    total: 0, matched: 0, unmatched: 0, pending: 0, classified: 0, nonGame: 0, pricePending: 0,
+    tagged: 0, tagsEmpty: 0, tagsPending: 0, tagsKvSeeded: 0,
+    // Increment 10's four-way experience funnel.
+    experienceScored: 0, experienceUnscored: 0, experiencePending: 0, experienceNotApplicable: 0,
+  });
 });
 
 test("ensureCatalogSchema on a pre-7.8 install (table exists without app_type/type_checked_at) adds the columns without losing existing data", async () => {
@@ -662,7 +667,14 @@ test("getCatalogStats: total/matched/unmatched/pending are computed correctly ac
   // appid 3, 4: never checked
 
   const stats = await getCatalogStats(env);
-  assert.deepEqual(stats, { total: 4, matched: 1, unmatched: 1, pending: 3, classified: 0, nonGame: 0, pricePending: 0, tagged: 0, tagsEmpty: 0, tagsPending: 4, tagsKvSeeded: 0 });
+  assert.deepEqual(stats, {
+    total: 4, matched: 1, unmatched: 1, pending: 3, classified: 0, nonGame: 0, pricePending: 0,
+    tagged: 0, tagsEmpty: 0, tagsPending: 4, tagsKvSeeded: 0,
+    // Increment 10: nothing is classified in this fixture, so all four rows
+    // sit in the notApplicable leg (the fill only ever attempts app_type =
+    // 'game'), and the partition still sums to total.
+    experienceScored: 0, experienceUnscored: 0, experiencePending: 0, experienceNotApplicable: 4,
+  });
 });
 
 test("getCatalogStats: classified/nonGame count app_type rows independently of the HLTB matched/unmatched/pending fields", async () => {
