@@ -385,6 +385,29 @@ const CREATE_TABLE_SQL = `CREATE TABLE IF NOT EXISTS fpm_catalog (
 // NOTE the deliberate asymmetry with `experience_fpm`, which is NOT a column.
 // Store the expensive judgement, derive the free arithmetic – see
 // experienceFpm for the whole argument.
+//
+// Increment 11 adds two more, and this pair is the OTHER side of that same
+// asymmetry, so the reasoning is worth stating rather than assumed.
+//
+// `rank_exclude_reason` ('prologue' today, NULL for everything rankable) is
+// a CLASSIFICATION, not arithmetic – so it is stored, exactly as `app_type`
+// was in increment 7.8. The rule it encodes (`\bprologue\b` on the title)
+// could trivially be a regex in the ranking path instead, and SPEC.md §6
+// rejects that for one reason above all: a stored column can be OPENED and
+// read, so all ~108 caught rows and every near-miss are auditable in one
+// table, whereas a regex in the hot path can only be reviewed by reading
+// code. It is deliberately a free-text reason rather than a boolean so a
+// second exclusion class never needs a schema change.
+//
+// `rank_exclude_checked_at` (epoch ms) is what makes the fill SELF-HEALING
+// and idempotent at the same time: ensureRankExclusions selects only rows
+// where it IS NULL, so the first call pays a one-time ~18k-row pass, every
+// call after is a no-op, and a row a future crawl adds is picked up on the
+// next request without anyone remembering to re-run anything. Same
+// "checked, no result" convention as `type_checked_at` and
+// `experience_checked_at`: a row that is checked and found rankable is
+// stamped with a timestamp and a NULL reason, which is a different state
+// from "never looked at".
 const ALTER_TABLE_STATEMENTS = [
   "ALTER TABLE fpm_catalog ADD COLUMN app_type TEXT",
   "ALTER TABLE fpm_catalog ADD COLUMN type_checked_at INTEGER",
@@ -407,6 +430,8 @@ const ALTER_TABLE_STATEMENTS = [
   "ALTER TABLE fpm_catalog ADD COLUMN experience_model TEXT",
   "ALTER TABLE fpm_catalog ADD COLUMN game_score INTEGER",
   "ALTER TABLE fpm_catalog ADD COLUMN experience_rubric TEXT",
+  "ALTER TABLE fpm_catalog ADD COLUMN rank_exclude_reason TEXT",
+  "ALTER TABLE fpm_catalog ADD COLUMN rank_exclude_checked_at INTEGER",
 ];
 
 /** Create the catalog table if it doesn't exist yet, and add any columns a
@@ -740,6 +765,43 @@ export async function selectMatchedCatalogRows(env) {
     `SELECT appid, name, owners, positive, negative, wilson, main_hours, match_method,
             price, price_cents, regular, cut, price_checked_at
      FROM fpm_catalog WHERE main_hours IS NOT NULL AND app_type = 'game'`,
+  ).all();
+  return result.results || [];
+}
+
+/** Every row /api/rank ranks over, BEFORE any of the funnel's subtractions –
+ * SPEC.md §8. Deliberately unfiltered in SQL beyond nothing at all, and that
+ * is the whole point: the funnel has to name and count every subtraction and
+ * sum exactly to the catalogue total, which is impossible if SQL has already
+ * silently dropped rows on the way out. Every gate (app_type, checked-no-
+ * score, rank_exclude_reason, dismissed, low-confidence) is applied in JS in
+ * handleRank, one visible step at a time, each one counted.
+ *
+ * CONTRAST WITH selectMatchedCatalogRows, which is the OPPOSITE choice and
+ * stays that way: the legacy /api/fpm lane gates on `main_hours IS NOT NULL
+ * AND app_type = 'game'` in SQL because it has no funnel to report and
+ * retires at increment 12. Two lanes, two reads, neither one touching the
+ * other – that is what keeps /api/fpm byte-identical (SPEC.md §10).
+ *
+ * NOT selected: `experience_reason` is, because increment 12's answer page
+ * needs the why-line and this is the read that would otherwise have to run
+ * twice. `main_hours`/`match_method` are NOT – ruling 5 retired HLTB hours
+ * from every new metric, so carrying them here would just invite a consumer.
+ *
+ * COST NOTE for increment 13 (SPEC.md gate 8): this is a full-catalogue read
+ * on every /api/rank request, ~18.3k rows, exactly as handleFpm's read
+ * already is. Caching the user-independent part is increment 13's job
+ * (src/catalog.js:493), deliberately not fixed here – the row count is
+ * recorded as gate input, not optimised away. */
+export async function selectRankCatalogRows(env) {
+  const result = await env.FPM_DB.prepare(
+    `SELECT appid, name, owners, positive, negative, wilson, app_type,
+            price, price_cents, regular, cut, price_checked_at,
+            tags, source_owned,
+            experience_score, game_score, has_ending, hours_to_value, hours_to_good,
+            experience_reason, experience_confidence, experience_checked_at,
+            rank_exclude_reason, rank_exclude_checked_at
+     FROM fpm_catalog`,
   ).all();
   return result.results || [];
 }
@@ -2896,8 +2958,34 @@ export const EXPERIENCE_FPM_HOURS_FLOOR = 2;
  * derive the free arithmetic.
  *
  *     experience_fpm = has_ending == 1
- *                        ? game_score / sqrt(max(hours_to_value, 2))
+ *                        ? sqrt(game_score * experience_score) / sqrt(max(hours_to_value, 2))
  *                        : NULL
+ *
+ * INCREMENT 11 SUPERSEDED THE NUMERATOR – SPEC.md §5.3, implementing the
+ * PRD's ruling 4 of 2026-09-01, and it is the one change here. It used to be
+ * `game_score` alone. It is now the geometric mean of `game_score` (how good
+ * the game is) and `experience_score` (how much COMPLETE experience it gives
+ * per hour). The reason is a measured leak, not a preference: `game_score`
+ * alone cannot see grind or endlessness, so arcade titles rode the short-
+ * hours end of the rank on pure craft. GAROU: Mark of the Wolves is
+ * game_score 90 but experience_score 60 – a 30-point gap that only
+ * `experience_score` can express – and under the old numerator it ranked 5th.
+ * Multiplying the two sinks it to 401st, drops DoDonPachi 6th to 156th, and
+ * takes arcade titles in the top 200 from 30 to 16, while leaving genuinely
+ * short authored games where they were (Journey 65.1 -> 66.1, Portal
+ * 56.0 -> 56.3, Melatonin 62.2 -> 62.9 – all unmoved at the top).
+ *
+ * GEOMETRIC MEAN, not an average, and not a product: sqrt(a * b) keeps the
+ * result on the SAME 0..100 scale as the old numerator, which is why the
+ * increment-10.5 review artifacts stay readable side by side with the new
+ * ones, and it is punishing about disagreement in the way an arithmetic mean
+ * is not – a 90 paired with a 60 comes out 73, not 75, and a 90 paired with a
+ * 0 comes out 0 rather than 45.
+ *
+ * THIS SUPERSESSION HAS ZERO API DIFF, and that is why it is allowed to
+ * happen inside an increment with a zero-diff boundary: 10.5's version was
+ * only ever rendered into review markdown, never returned by any route.
+ * Increment 11's /api/rank is the FIRST consumer, at `?sort=fpm`.
  *
  * THE THREE GUARDS ARE LOAD-BEARING, and each kills a distinct, already
  * observed failure. Slice 0's pass 1 was a "fun per minute" metric, it ranked
@@ -2924,20 +3012,35 @@ export const EXPERIENCE_FPM_HOURS_FLOOR = 2;
  * deliberate and strict. A normalized camelCase object passed here returns
  * null rather than a wrong number, which is the safe direction to fail.
  *
- * NOTHING CONSUMES THIS YET. Increment 10.5 stores a number and prints one
- * review list; where FPM surfaces, sorts and ranks is increment 11 (spec §8).
+ * ITS ONE CONSUMER is increment 11's /api/rank at `?sort=fpm` (SPEC.md §5),
+ * where it is the SECONDARY sort and never the headline – ruling 3, not
+ * re-opened: any per-hour metric structurally ranks a 2-hour 92 above a
+ * 3-hour 95, which puts Portal 178th, so `experience_score` stays the
+ * default sort and FPM is one query parameter away.
  *
- * @param {{game_score?: number|null, hours_to_value?: number|null, has_ending?: number|null}} row
+ * @param {{game_score?: number|null, experience_score?: number|null, hours_to_value?: number|null, has_ending?: number|null}} row
  * @returns {number|null} fun per minute, or null when it is not defined for
- *   this row – endless, unknown ending, or either input missing.
+ *   this row – endless, unknown ending, or any input missing.
  */
 export function experienceFpm(row) {
   if (row?.has_ending !== 1) return null; // endless, or unknown: not rankable
   const gameScore = row?.game_score;
+  const experienceScore = row?.experience_score;
   const hoursToValue = row?.hours_to_value;
   if (typeof gameScore !== "number" || !Number.isFinite(gameScore)) return null;
+  // Increment 11: experience_score joins game_score in the numerator, so a
+  // row holding one but not the other now returns null rather than a number
+  // built from half the judgement. That is the same "missing input yields
+  // null, never a wrong number" discipline the other two guards already had,
+  // extended to the new input.
+  if (typeof experienceScore !== "number" || !Number.isFinite(experienceScore)) return null;
   if (typeof hoursToValue !== "number" || !Number.isFinite(hoursToValue)) return null;
-  return gameScore / Math.sqrt(Math.max(hoursToValue, EXPERIENCE_FPM_HOURS_FLOOR));
+  // Negative inputs cannot come out of the write boundary (normalizeExperienceFields
+  // clamps 0..100), but sqrt of a negative is NaN, and NaN sorts unpredictably —
+  // so refuse rather than propagate it.
+  const numerator = gameScore * experienceScore;
+  if (numerator < 0) return null;
+  return Math.sqrt(numerator) / Math.sqrt(Math.max(hoursToValue, EXPERIENCE_FPM_HOURS_FLOOR));
 }
 
 /**

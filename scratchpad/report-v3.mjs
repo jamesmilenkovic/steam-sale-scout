@@ -5,12 +5,21 @@ const SP = new URL(".", import.meta.url).pathname;
 const REF = "/Users/jamesmilenkovic/Library/Mobile Documents/com~apple~CloudDocs/AI/projects/personal-projects/steam-sale-scout/slice-0-reference/";
 const sample = JSON.parse(fs.readFileSync(REF + "sample-300-games.json", "utf8"));
 const fixture = JSON.parse(fs.readFileSync(REF + "scored-v2-300-games.json", "utf8"));
-const v3 = JSON.parse(fs.readFileSync(SP + "v3-scored-300.json", "utf8"));
+const v3 = JSON.parse(fs.readFileSync(SP + "inc10.5-v3-scored-300.json", "utf8"));
 const byId = Object.fromEntries(sample.map((g) => [g.appid, g]));
 
 const rows = Object.values(v3).map((r) => ({
   ...r, name: byId[r.appid]?.name ?? "?", reviews: byId[r.appid]?.reviews,
-  fpm: experienceFpm({ has_ending: r.has_ending ? 1 : 0, game_score: r.game_score, hours_to_value: r.hours_to_value }),
+  // SEC-5 (increment 11 round-2 review): increment 11's §5.3 put experience_score
+  // into experienceFpm's numerator, so a call that omits it now returns null for
+  // EVERY row. This one-shot inc-10.5 report is kept as the record of that gate,
+  // so the field is passed through rather than the script left silently dead.
+  fpm: experienceFpm({
+    has_ending: r.has_ending ? 1 : 0,
+    game_score: r.game_score,
+    experience_score: r.experience_score,
+    hours_to_value: r.hours_to_value,
+  }),
 }));
 
 // ---- gate d1: non-disturbance of experience_score ----

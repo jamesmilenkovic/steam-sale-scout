@@ -56,8 +56,10 @@ import {
 } from "./hltb.js";
 import {
   ensureCatalogSchema,
+  experienceFpm,
   getCatalogStats,
   selectMatchedCatalogRows,
+  selectRankCatalogRows,
   startFpmSync,
   isFpmSyncRunning,
   getLastSyncStats,
@@ -66,6 +68,16 @@ import {
   requestFpmAutoContinueStop,
 } from "./catalog.js";
 import { ensureSettingsSchema, getAllSettings, putSettings } from "./settings.js";
+import {
+  SUPPRESS_LOW_CONFIDENCE_KEY,
+  blendRankScore,
+  ensureRankExclusions,
+  isLowConfidenceSuppressed,
+  normaliseSimilarities,
+  profileWithoutGame,
+  resolveRankWeights,
+  summedProfileFromContributions,
+} from "./rank.js";
 import {
   ensureDismissalsSchema,
   listDismissals,
@@ -2072,6 +2084,546 @@ async function handleFpmSyncStatus(request, env, ctx) {
 }
 
 // ---------------------------------------------------------------------------
+// /api/rank (Increment 11) — THE HEADLINE LANE. One ranked list over the
+// whole catalogue answering "what do I play next", owned and unowned side by
+// side. src/rank.js owns the arithmetic and the prologue classifier; this
+// section owns the sourcing, the funnel and the fail-soft HTTP wiring.
+//
+// SOURCED FROM fpm_catalog, NOT FROM THE DEALS FEED, and that one sentence is
+// the whole unlock. Every existing lane ranks over a discount-gated pool that
+// EXCLUDES owned games by construction (src/deals.js's excludeOwned), so
+// nothing in this app could ever answer "should I play something I already
+// own". Reading the catalogue directly puts James's 552 scored owned games in
+// the pool without a single ownership special case — SPEC.md §1, and James's
+// ruling of 2026-09-02 that owned games have two jobs: they can be the next
+// game to PLAY, and they feed the similarity engine.
+//
+// WHY THE SIX OLD LANES ARE UNTOUCHED. /api/recs and /api/deals keep their
+// deals-feed sourcing (open question 1, RULED 2026-09-03: "leave it alone, as
+// we could filter out easily on the frontend I think"). Both retire at
+// increment 12, so rewriting their sourcing is work thrown away three weeks
+// later on top of two zero-diff surfaces that would be lost. Nothing in this
+// section is reachable from any of them.
+//
+// NO UI THIS INCREMENT. public/index.html is not touched; the deliverable is
+// this JSON route plus generated markdown in the review folder. The answer
+// page is increment 12 (SPEC.md §1, §9).
+// ---------------------------------------------------------------------------
+
+/** Fail-soft shape for this lane, matching handleFpm's {available:false}
+ * convention exactly rather than inventing a second one — a missing FPM_DB
+ * binding or a D1 hiccup must degrade to an honest response, never a 500
+ * (SPEC.md §13.5). */
+function rankUnavailableResponse(notice = "Ranking unavailable") {
+  return new Response(JSON.stringify({ available: false, notice }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+/** `?sort=` — `experience` (default) or `fpm`. RULING 3, NOT RE-OPENED: the
+ * headline stays `experience_score` and fun-per-minute is a SECONDARY sort
+ * one query parameter away. Any per-hour metric structurally ranks a 2-hour
+ * 92 above a 3-hour 95, which puts Portal 178th; that is arithmetic, not a
+ * tuning fault, and no formula escapes it. Anything unrecognised falls back
+ * to the headline rather than 500ing, same as parseFpmFormula. */
+function parseRankSort(raw) {
+  return raw === "fpm" ? "fpm" : "experience";
+}
+
+/**
+ * The owned library, FAIL-SOFT — deliberately unlike loadLibraryForRecs,
+ * which throws so that recs refuses to run rather than risk recommending an
+ * owned game it could not exclude. This lane has the opposite risk profile:
+ * it does not exclude owned games, it RANKS them, so a Steam outage costs a
+ * taste profile (every row scores S = 0 and the list becomes pure experience
+ * value) rather than costing correctness. Degrading is the right answer here;
+ * refusing would not be.
+ */
+async function loadLibraryForRank(env, ctx, refresh) {
+  if (!env.STEAM_API_KEY || !env.STEAM_ID) return [];
+  const cache = caches.default;
+  const cacheKey = libraryCacheKey(env);
+
+  if (!refresh) {
+    try {
+      const cached = await cache.match(cacheKey);
+      if (cached) return (await cached.clone().json()).games || [];
+    } catch {
+      // Fall through to the upstream fetch.
+    }
+  }
+
+  try {
+    const trimmed = await fetchOwnedGames(env);
+    const response = new Response(JSON.stringify({ games: trimmed }), {
+      status: 200,
+      headers: {
+        "content-type": "application/json",
+        "cache-control": `public, max-age=${CACHE_TTL_SECONDS}`,
+      },
+    });
+    ctx.waitUntil(cache.put(cacheKey, response.clone()));
+    return trimmed;
+  } catch {
+    return [];
+  }
+}
+
+/** Parse one catalogue row's stored inc-9 tag blob. A row whose JSON is
+ * corrupt or is not a tag object degrades to "no tags" (S = 0, SPEC.md §4.4)
+ * rather than throwing — one bad row must never take the lane down. */
+function parseCatalogTags(raw) {
+  if (typeof raw !== "string" || raw.length === 0) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Assemble the SteamSpy trio for the owned games that build the taste
+ * profile, preferring the KV cache and falling back to the catalogue's own
+ * stored tags.
+ *
+ * WHY BOTH SOURCES, stated because the fallback is a real (if small)
+ * behaviour difference and should not be discovered later. KV holds the full
+ * trio — tags, `median_forever` and reviews — and is what /api/recs already
+ * builds its profile from, so preferring it means this lane's taste vector is
+ * the SAME vector the existing recommendation engine produces, which is the
+ * point (SPEC.md §4.3: profile.js untouched, the library remains the sole
+ * input). The catalogue's inc-9 `tags` column covers all 18,306 rows but has
+ * no median, and without a median src/profile.js's playtimeNorm falls back to
+ * its own documented log2(1+hours) term. So the fallback keeps a cold-KV
+ * install working with a slightly differently-weighted profile, instead of
+ * silently producing no profile at all. Neither path touches src/profile.js.
+ */
+async function buildRankSpyData(env, ownedAppids, catalogTagsByAppid, catalogRowByAppid) {
+  const spyDataByAppid = new Map();
+  await Promise.all(
+    ownedAppids.map(async (appid) => {
+      let entry;
+      try {
+        entry = await getCachedSpy(env, appid);
+      } catch {
+        entry = { cached: false, data: undefined };
+      }
+      if (entry.cached && entry.data?.tags) {
+        spyDataByAppid.set(appid, entry.data);
+        return;
+      }
+      const tags = catalogTagsByAppid.get(appid);
+      if (!tags) {
+        spyDataByAppid.set(appid, undefined); // not fetched / no usable tags
+        return;
+      }
+      const row = catalogRowByAppid.get(appid);
+      spyDataByAppid.set(appid, {
+        tags,
+        median: null, // triggers profile.js's log2 fallback — see above
+        reviews: { positive: row?.positive || 0, negative: row?.negative || 0 },
+      });
+    }),
+  );
+  return spyDataByAppid;
+}
+
+async function handleRank(request, env, ctx) {
+  if (!env.FPM_DB) return rankUnavailableResponse("FPM_DB not configured");
+
+  const url = new URL(request.url);
+  const refresh = url.searchParams.get("refresh") === "1";
+  const ownedMode = parseOwnedMode(url.searchParams.get("owned"));
+  const sort = parseRankSort(url.searchParams.get("sort"));
+  // Gate 3 (SPEC.md §12b.2): the normaliser is a PROPERTY OF THE PRESET —
+  // percentile for `default` and `sale`, min-max for `similarity` — so it is
+  // resolved with the weights rather than beside them, and cannot drift away
+  // from the preset it belongs to. `?norm=` still overrides either lens.
+  const weights = resolveRankWeights(url.searchParams);
+  const normaliser = weights.normaliser;
+  const windowMonthsParam = Number(url.searchParams.get("windowMonths"));
+  const windowMonths = windowMonthsParam > 0 ? windowMonthsParam : 12;
+
+  // The prologue fill runs here, at the top of the rank handler, and
+  // deliberately NOT inside the sync pipeline — that is what keeps
+  // /api/fpm/sync and /sync/status byte-identical (SPEC.md §10). First call
+  // pays a one-time ~18.3k-row pass; every call after is a no-op.
+  let catalogRows;
+  let exclusionFill;
+  try {
+    await ensureCatalogSchema(env);
+    exclusionFill = await ensureRankExclusions(env);
+    catalogRows = await selectRankCatalogRows(env);
+  } catch {
+    return rankUnavailableResponse();
+  }
+
+  // Suppression is DEFAULT ON and turned off by a stored settings key. The
+  // key is read through the existing increment-8 lane, so an untouched store
+  // yields the default and GET /api/settings stays byte-identical until
+  // something writes it (SPEC.md §7, §10).
+  let suppressLowConfidence = true;
+  try {
+    await ensureSettingsSchema(env);
+    const settings = await getAllSettings(env);
+    if (settings[SUPPRESS_LOW_CONFIDENCE_KEY] === false) suppressLowConfidence = false;
+  } catch {
+    // Fail-soft to the safe default: suppress. A settings hiccup must not put
+    // a bluffed score on the front page.
+  }
+
+  const dismissedAppIds = await getDismissedAppIds(env);
+  const libraryGames = await loadLibraryForRank(env, ctx, refresh);
+  const libraryByAppid = new Map(libraryGames.map((game) => [game.appid, game]));
+
+  // WHY THE EMPTY LIBRARY IS REPORTED RATHER THAN ABSORBED (round-2 review,
+  // SEC-1). loadLibraryForRank is fail-soft by design and returns [] for
+  // three very different situations: no Steam credentials configured, a cache
+  // error, or a Steam outage. With no library every cosine is 0, and under
+  // `similarity` min-max over an all-equal pool returns all zeros – so the
+  // similarity lens silently collapses into pure `wE * E` while still
+  // reporting `available: true` and a normal-looking funnel. That is SPEC.md
+  // §1's reason 2 ("owned games feed the recommendation engine for SIMILAR
+  // games") failing without saying so.
+  //
+  // Credentials PRESENT + empty library is the outage case and earns a
+  // notice. Credentials ABSENT is a configuration state, not a fault, and is
+  // already visible in `profileAvailable` / `profileGames`.
+  const steamConfigured = Boolean(env.STEAM_API_KEY && env.STEAM_ID);
+  const libraryLoadFailed = steamConfigured && libraryGames.length === 0;
+
+  const catalogTagsByAppid = new Map();
+  const catalogRowByAppid = new Map();
+  for (const row of catalogRows) {
+    catalogRowByAppid.set(row.appid, row);
+    const tags = parseCatalogTags(row.tags);
+    if (tags) catalogTagsByAppid.set(row.appid, tags);
+  }
+
+  // ---- The funnel (SPEC.md §8) -------------------------------------------
+  // Every subtraction is named, counted, and applied in ONE pass in a fixed
+  // order, so the counts partition the catalogue and sum back to its total
+  // exactly. Ordering matters: a row is charged to the FIRST reason that
+  // excludes it and to no other, which is what makes the arithmetic honest
+  // rather than merely plausible.
+  const funnel = {
+    catalogTotal: catalogRows.length,
+    nonGame: 0,
+    checkedNoScore: 0,
+    unscored: 0,
+    rankExcluded: 0,
+    dismissed: 0,
+    lowConfidenceSuppressed: 0,
+    ranked: 0,
+    owned: 0,
+    // CR-4 (round-2 review): `has_ending` is a TRI-STATE in D1 – 1 ends, 0
+    // endless, NULL not yet known – and the row builder below already treats
+    // NULL as a distinct third state increment 12 renders differently. The
+    // funnel now agrees: `endless` counts 0 only, `endingUnknown` counts NULL.
+    // Zero ranked rows are NULL today, so this splits 0 off a count that was
+    // numerically right and semantically wrong.
+    endless: 0,
+    endingUnknown: 0,
+    tagless: 0,
+    priced: 0,
+    pricedOwned: 0,
+    lowConfidenceOwnedSpared: 0,
+  };
+
+  const eligible = [];
+  for (const row of catalogRows) {
+    // OWNERSHIP, RESOLVED ONCE, AS A UNION — and the direction is deliberate.
+    // `source_owned` is D1's stamp from the sync pipeline; the live library
+    // join is what handleFpm uses. Taking either as sufficient means the
+    // owned exemption below can only ever spare MORE games, never fewer,
+    // which is the safe direction for a rule whose failure mode is hiding a
+    // game from James's own library (SPEC.md §1, §7). Measured today the two
+    // agree exactly: 553 rows, 553 library matches.
+    const owned = row.source_owned === 1 || libraryByAppid.has(row.appid);
+
+    // 1. Non-game or unclassified app_type. Increment 7.8's exclude-until-
+    //    classified decision, unchanged: an unclassified row fails the same
+    //    equality check as an explicitly non-game one.
+    if (row.app_type !== "game") {
+      funnel.nonGame++;
+      continue;
+    }
+    // 2. Checked, no score. No headline number means no rank — never a
+    //    silent drop, which is why it has its own funnel line.
+    if (row.experience_score == null) {
+      if (row.experience_checked_at != null) funnel.checkedNoScore++;
+      else funnel.unscored++;
+      continue;
+    }
+    // 3. Prologues, off the stored column rather than a regex in this hot
+    //    path — auditable in one table, per SPEC.md §6.
+    if (row.rank_exclude_reason != null) {
+      funnel.rankExcluded++;
+      continue;
+    }
+    // 4. Per-user dismissals. Kept as what they are — "not interested" —
+    //    and deliberately not conflated with the catalogue-level exclusion
+    //    above (Rev 2's two-layer rule).
+    if (dismissedAppIds.has(row.appid)) {
+      funnel.dismissed++;
+      continue;
+    }
+    // 5. Low-confidence suppression, WITH THE OWNED EXEMPTION. The predicate
+    //    carries `source_owned = 0` itself, so the exemption cannot be
+    //    forgotten at a call site, and it holds whether the settings key is
+    //    on or off — the key only governs whether UNOWNED low-confidence
+    //    rows are suppressed at all.
+    const suppressible = isLowConfidenceSuppressed({ ...row, source_owned: owned ? 1 : 0 });
+    if (suppressible && suppressLowConfidence) {
+      funnel.lowConfidenceSuppressed++;
+      continue;
+    }
+    // The proof James asked for, counted rather than asserted: owned rows that
+    // WOULD have been suppressed but for the exemption.
+    //
+    // Computed by asking the REAL predicate what it would have said had this
+    // row been unowned, rather than by restating its conditions inline. That
+    // matters: an inline restatement hardcoding the review floor drifted the
+    // moment §12b.1 moved the floor from 1,000 to 200, and reported 11 rows
+    // spared when only 1 actually was. A counter that can disagree with the
+    // filter it is counting is worse than no counter.
+    if (owned && suppressLowConfidence && isLowConfidenceSuppressed({ ...row, source_owned: 0 })) {
+      funnel.lowConfidenceOwnedSpared++;
+    }
+
+    eligible.push({ row, owned });
+  }
+
+  // ---- The taste profile --------------------------------------------------
+  // IDF CORPUS = THE ELIGIBLE POOL'S OWN TAG SETS. Document frequency has to
+  // be counted over the corpus being scored or the weights mean nothing: with
+  // ~18k documents a tag like "Indie" collapses toward idf 0 and stops
+  // contributing to similarity on either side, while a distinctive tag
+  // dominates it. This is a much larger corpus than /api/recs computes over
+  // (top-200 owned + the deals feed), which is a feature — the same tag gets
+  // a more stable weight the more documents it is counted across.
+  const corpusTagSets = [];
+  for (const { row } of eligible) {
+    const tags = catalogTagsByAppid.get(row.appid);
+    if (tags) corpusTagSets.push(tags);
+  }
+  const idfMap = computeIdf(corpusTagSets);
+
+  const profileAppids = selectTopOwnedGames(libraryGames, windowMonths, Date.now(), TOP_OWNED_GAMES).map(
+    (game) => game.appid,
+  );
+  const spyDataByAppid = await buildRankSpyData(env, profileAppids, catalogTagsByAppid, catalogRowByAppid);
+  const { profile, contributions } = buildProfile(libraryGames, spyDataByAppid, windowMonths, Date.now(), idfMap);
+
+  // Leave-one-out inputs, built ONCE for the whole request: the summed
+  // pre-IDF vector, and each contributing game's own share of it. Scoring an
+  // owned candidate then costs one O(tags) subtraction, not a profile
+  // rebuild. See src/rank.js for why this is exact without touching
+  // src/profile.js.
+  const summedProfile = summedProfileFromContributions(contributions);
+  const contributionByAppid = new Map(contributions.map((c) => [c.appid, c]));
+
+  // ---- Similarity ---------------------------------------------------------
+  // NEVER PERSISTED. Rev 2's binding two-layer rule: similarity is a function
+  // of THIS user's library, so it is computed per request and no similarity
+  // column exists or may exist. The stored inc-9 tags are the global layer;
+  // the profile is the user layer; the cosine between them is derived, every
+  // time.
+  const scored = [];
+  const cosinesForNormalisation = [];
+  for (const entry of eligible) {
+    const tags = catalogTagsByAppid.get(entry.row.appid);
+    const rawVector = tags ? buildTagVector(tags) : {};
+    const hasTags = Object.keys(rawVector).length > 0;
+
+    let similarity = 0;
+    if (hasTags) {
+      const candidateVector = applyIdf(rawVector, idfMap);
+      // THE SELF-MATCH TRAP. An owned game's tags helped build this profile,
+      // so scoring it against the full profile is circular — under the
+      // `similarity` preset the top would fill with games James has already
+      // sunk 200 hours into. Only THAT ONE GAME's contribution comes out;
+      // every other owned game still contributes in full, to this candidate
+      // and to every other one. That is what keeps the library's role as the
+      // engine's source intact (SPEC.md §4.3).
+      const own = entry.owned ? contributionByAppid.get(entry.row.appid) : undefined;
+      const against = own ? profileWithoutGame(summedProfile, own.tagWeights, idfMap) : profile;
+      similarity = cosineSimilarity(against, candidateVector);
+    }
+
+    entry.similarity = similarity;
+    entry.hasTags = hasTags;
+    entry.tagNames = Object.keys(rawVector);
+    // TAGLESS ROWS ARE NORMALISED SEPARATELY — they are held out of the pool
+    // entirely and pinned to S = 0 below. Leaving them in would let the
+    // percentile normaliser hand "no tags at all" a rank above the genuinely
+    // dissimilar, and SPEC.md §4.4 is explicit that a missing co-pillar
+    // scores 0 rather than dropping the game.
+    if (hasTags) cosinesForNormalisation.push(similarity);
+    scored.push(entry);
+  }
+
+  const normalisedPool = normaliseSimilarities(cosinesForNormalisation, normaliser);
+  let poolCursor = 0;
+  for (const entry of scored) {
+    entry.similarityNorm = entry.hasTags ? normalisedPool[poolCursor++] : 0;
+    if (!entry.hasTags) funnel.tagless++;
+  }
+
+  // ---- Prices, and the blend ---------------------------------------------
+  // price/cut come straight off each row's own D1 columns (increment 8.5's
+  // backfill). `atHistoricalLow` has no column, so it still comes from the
+  // ITAD-backed pool handleFpm already loads, fail-soft to "no historical-low
+  // data this request" — which costs at most the 1.15 premium on rows that
+  // would have earned it, never a wrong number.
+  //
+  // NOTE THE DELIBERATE DIFFERENCE FROM handleFpm, which nulls price for
+  // owned rows ("an owned game's sale price is irrelevant"). Here it is
+  // relevant: the funnel has to report how many priced rows the sale toggle
+  // can move AND how many of those are owned (SPEC.md §8 — measured at 1),
+  // which is the evidence for §4.2's statement that owned games cannot win
+  // the `sale` lens. Nulling it would erase exactly that.
+  //
+  // GATED ON ITAD_API_KEY, unlike handleFpm which refuses the whole request
+  // without one. This lane's answer does not depend on ITAD: price and
+  // discount come from D1, and only the 1.15 historical-low premium is lost.
+  // "What do I play next" must keep working without a third-party key.
+  let dealPool = [];
+  if (env.ITAD_API_KEY) {
+    try {
+      dealPool = await loadFpmPool(env, ctx, refresh);
+    } catch {
+      dealPool = [];
+    }
+  }
+  const dealByAppid = new Map((dealPool || []).filter((d) => d.appid != null).map((d) => [d.appid, d]));
+
+  const ranked = scored.map((entry) => {
+    const row = entry.row;
+    const dealEntry = dealByAppid.get(row.appid);
+    const atHistoricalLow = dealEntry?.atHistoricalLow ?? false;
+    const blend = blendRankScore(
+      {
+        experienceScore: row.experience_score,
+        similarityNorm: entry.similarityNorm,
+        cut: row.cut,
+        atHistoricalLow,
+      },
+      weights,
+    );
+
+    const reviewCount = (row.positive || 0) + (row.negative || 0);
+    const libraryGame = libraryByAppid.get(row.appid);
+
+    funnel.ranked++;
+    if (entry.owned) funnel.owned++;
+    if (row.has_ending === 0) funnel.endless++;
+    else if (row.has_ending == null) funnel.endingUnknown++;
+    if (row.price != null) {
+      funnel.priced++;
+      if (entry.owned) funnel.pricedOwned++;
+    }
+
+    return {
+      appid: row.appid,
+      title: row.name,
+      owned: entry.owned,
+      hoursPlayed: libraryGame ? (libraryGame.playtime_forever || 0) / 60 : null,
+      experienceScore: row.experience_score,
+      gameScore: row.game_score ?? null,
+      // hasEnding stays the INTEGER 0/1/null D1 holds rather than a boolean,
+      // because null (unknown) is a THIRD state increment 12 has to render
+      // differently from "endless", and a boolean cannot carry it.
+      hasEnding: row.has_ending ?? null,
+      hoursToValue: row.hours_to_value ?? null,
+      hoursToGood: row.hours_to_good ?? null,
+      confidence: row.experience_confidence ?? null,
+      why: row.experience_reason ?? null,
+      // BOTH numbers, always. The raw cosine is what the normaliser was fed;
+      // similarityNorm is what the blend actually used. Returning only the
+      // second would let the normaliser hide what it did (SPEC.md §4.2).
+      similarity: entry.similarity,
+      similarityNorm: entry.similarityNorm,
+      // WHAT THE ENDLESS GAMES ARE OWED (SPEC.md §8): the field is present
+      // and explicitly null rather than absent, so increment 12 can render
+      // "endless — no ending, so no per-hour figure" instead of a blank cell.
+      // 4,822 endless rows stay in the headline ranking and sink on their
+      // merits; they are excluded only from this secondary sort, by
+      // construction.
+      experienceFpm: experienceFpm(row),
+      price: row.price ?? null,
+      priceCents: row.price_cents ?? null,
+      regular: row.regular ?? null,
+      cut: row.cut ?? null,
+      priceCheckedAt: row.price_checked_at ?? null,
+      atHistoricalLow,
+      reviewCount,
+      reviewPercent: reviewCount > 0 ? Math.round((row.positive / reviewCount) * 100) : null,
+      tagNames: entry.tagNames,
+      base: blend.base,
+      rankScore: blend.rankScore,
+    };
+  });
+
+  // `?sort=fpm` is the secondary lens, never the headline. Nulls sort LAST
+  // rather than being filtered out, so an endless game is still in the list
+  // and still visibly has no per-hour figure.
+  if (sort === "fpm") {
+    ranked.sort((a, b) => {
+      if (a.experienceFpm == null && b.experienceFpm == null) return b.rankScore - a.rankScore;
+      if (a.experienceFpm == null) return 1;
+      if (b.experienceFpm == null) return -1;
+      return b.experienceFpm - a.experienceFpm;
+    });
+  } else {
+    ranked.sort((a, b) => b.rankScore - a.rankScore);
+  }
+
+  // The owned tri-state is a POST-HOC VIEW FILTER applied after the funnel is
+  // computed, exactly as handleFpm's is — so the funnel always reports the
+  // real catalogue-wide numbers regardless of which view was requested, and
+  // `count` (what this view returned) is honestly distinct from
+  // `funnel.ranked` (what was ranked).
+  let view = ranked;
+  if (ownedMode === "hide") view = ranked.filter((r) => !r.owned);
+  else if (ownedMode === "only") view = ranked.filter((r) => r.owned);
+
+  return new Response(
+    JSON.stringify({
+      available: true,
+      preset: weights.preset,
+      weights: { we: weights.we, ws: weights.ws, wsale: weights.wsale },
+      normaliser,
+      sort,
+      ownedMode,
+      // CR-3 (round-2 review): `?windowMonths=` materially changes which owned
+      // games build the taste profile, so it is echoed like every other
+      // resolved input rather than being the one that is not.
+      windowMonths,
+      suppressLowConfidence,
+      exclusionFill,
+      // SEC-1: the taste profile's own health, beside the fill's. `profileGames`
+      // is how many owned games actually contributed tag weight – 0 means every
+      // similarity term is 0 and the similarity lens has collapsed to `wE * E`.
+      profileAvailable: contributions.length > 0,
+      profileGames: contributions.length,
+      // Always present, null when there is nothing to say, so the exhaustive
+      // key set increment 12 builds against cannot change shape between calls.
+      notice: libraryLoadFailed
+        ? "Steam library unavailable – the taste profile is empty, so similarity is 0 on every row and the similarity lens is showing experience value alone."
+        : null,
+      funnel,
+      count: view.length,
+      rank: view,
+    }),
+    { status: 200, headers: { "content-type": "application/json" } },
+  );
+}
+
+// ---------------------------------------------------------------------------
 // /api/settings (Increment 8) — persisted UI state (filter-bar values, the
 // recency window, FPM-tab-local controls), replacing the old localStorage
 // story so state survives a browser restart the same way the catalog does
@@ -2261,6 +2813,9 @@ export default {
     }
     if (url.pathname === "/api/fpm") {
       return handleFpm(request, env, ctx);
+    }
+    if (url.pathname === "/api/rank") {
+      return handleRank(request, env, ctx);
     }
     if (url.pathname === "/api/fpm/sync/status") {
       return handleFpmSyncStatus(request, env, ctx);

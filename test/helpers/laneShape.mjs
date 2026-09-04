@@ -24,6 +24,9 @@ const EXPERIENCE_KEY_PATTERNS = [
   /^hours_?to/i, // hours_to_value / hours_to_good / hoursToValue / hoursToGood
   /^game_?score$/i, // game_score / gameScore - increment 10.5, and NOT covered
   // by /^experience/ the way experience_rubric happens to be.
+  /^rank_?exclude/i, // rank_exclude_reason / rank_exclude_checked_at / rankExclude...
+  // - increment 11's two new columns. Nothing outside /api/rank may consume
+  // them either, and a nested leak should be NAMED rather than only diffed.
 ];
 
 /**

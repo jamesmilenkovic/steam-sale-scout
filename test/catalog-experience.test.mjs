@@ -1859,20 +1859,55 @@ test("funnel: after a RUBRIC bump the fill is not reported finished", async () =
   assert.equal(after.experienceScored + after.experienceUnscored + after.experiencePending + after.experienceNotApplicable, after.total);
 });
 
-test("experienceFpm reproduces SPEC-10.5.md §4's worked numbers exactly", () => {
-  const fpm = (gameScore, hours) => experienceFpm({ game_score: gameScore, hours_to_value: hours, has_ending: 1 });
-  assert.equal(fpm(90, 2).toFixed(1), "63.6"); // Journey
-  assert.equal(fpm(85, 1).toFixed(1), "60.1"); // Helltaker, 1h floored to 2h
-  assert.equal(fpm(97, 3).toFixed(1), "56.0"); // Portal
-  assert.equal(fpm(92, 4).toFixed(1), "46.0"); // INSIDE
-  assert.equal(fpm(96, 17).toFixed(1), "23.3"); // Outer Wilds
-  assert.equal(fpm(95, 27).toFixed(1), "18.3"); // Hollow Knight
-  assert.equal(fpm(93, 30).toFixed(1), "17.0"); // Sekiro
-  assert.equal(fpm(97, 100).toFixed(1), "9.7"); // Baldur's Gate 3
+test("experienceFpm reproduces SPEC.md §5's worked numbers exactly (increment 11's blended numerator)", () => {
+  // Increment 11 supersedes 10.5's `game_score` numerator with ruling 4's
+  // geometric mean, sqrt(game_score * experience_score). These are the five
+  // published catalogue rows in SPEC.md §5's table, which exist precisely so
+  // the claimed movement is REPRODUCED here rather than asserted in prose.
+  const fpm = (gameScore, experienceScore, hours) =>
+    experienceFpm({ game_score: gameScore, experience_score: experienceScore, hours_to_value: hours, has_ending: 1 });
 
-  // The whole point of the increment: Hollow Knight reads high on quality
-  // and about a third of Portal per hour, rather than five times it.
-  assert.ok(fpm(95, 27) < fpm(97, 3) / 2);
+  assert.equal(fpm(92, 95, 2).toFixed(1), "66.1"); // Journey — unmoved at the top
+  assert.equal(fpm(97, 98, 3).toFixed(1), "56.3"); // Portal — unmoved
+  assert.equal(fpm(88, 90, 2).toFixed(1), "62.9"); // Melatonin — unmoved
+  assert.equal(fpm(90, 74, 2).toFixed(1), "57.7"); // DoDonPachi Resurrection — sinks
+  // GAROU — sinks hardest. The true value is 51.9615, which SPEC.md §5's
+  // table publishes as 51.9 (truncated, where the other four rows in that
+  // table are rounded). Asserting the arithmetic rather than the typo:
+  // rounding it would read "52.0" and truncating it reads "51.9", and the
+  // formula is right either way. Flagged to the PO as a table nit, not a
+  // behaviour question.
+  assert.ok(Math.abs(fpm(90, 60, 2) - 51.9615) < 0.001);
+
+  // THE ARCADE LEAK, closed. GAROU and Journey are within two points of each
+  // other on game_score alone (90 vs 92) and the old numerator could not tell
+  // them apart at the same 2 hours. experience_score can: a 30-point gap.
+  assert.ok(fpm(90, 60, 2) < fpm(92, 95, 2) - 10, "GAROU must now sit well below Journey at identical hours");
+
+  // The scale is deliberately near-identical to 10.5's, so the inc-10
+  // artifacts stay readable next to the new ones. Journey moved 65.1 -> 66.1.
+  assert.ok(Math.abs(fpm(92, 95, 2) - 65.1) < 2);
+
+  // Unchanged from 10.5: Hollow Knight reads about a third of Portal per
+  // hour, rather than five times it.
+  assert.ok(fpm(95, 95, 27) < fpm(97, 98, 3) / 2);
+});
+
+test("experienceFpm: the geometric mean punishes disagreement, and stays on the 0..100 scale", () => {
+  const numerator = (gameScore, experienceScore) =>
+    experienceFpm({ game_score: gameScore, experience_score: experienceScore, hours_to_value: 2, has_ending: 1 }) *
+    Math.SQRT2;
+
+  // A 90 paired with a 60 comes out 73.5, not the arithmetic mean's 75.
+  assert.ok(Math.abs(numerator(90, 60) - Math.sqrt(5400)) < 1e-9);
+  assert.ok(numerator(90, 60) < 75);
+  // Two agreeing scores land exactly on themselves — same 0..100 scale as
+  // the old single-score numerator, which is what keeps the artifacts
+  // comparable.
+  assert.ok(Math.abs(numerator(90, 90) - 90) < 1e-9);
+  // A zero on either side is a zero. An endless-adjacent 0 experience score
+  // cannot be rescued by craft.
+  assert.equal(numerator(90, 0), 0);
 });
 
 test("experienceFpm: the has_ending gate makes the slice-0 pass-1 failure structurally impossible", () => {
@@ -1887,40 +1922,56 @@ test("experienceFpm: the has_ending gate makes the slice-0 pass-1 failure struct
   assert.equal(experienceFpm({ game_score: 95, hours_to_value: 5 }), null);
 });
 
-test("experienceFpm: a missing input on either side yields null, never a number", () => {
-  assert.equal(experienceFpm({ game_score: null, hours_to_value: 5, has_ending: 1 }), null);
-  assert.equal(experienceFpm({ game_score: 90, hours_to_value: null, has_ending: 1 }), null);
+test("experienceFpm: a missing input on ANY of the three sides yields null, never a number", () => {
+  assert.equal(experienceFpm({ game_score: null, experience_score: 90, hours_to_value: 5, has_ending: 1 }), null);
+  assert.equal(experienceFpm({ game_score: 90, experience_score: null, hours_to_value: 5, has_ending: 1 }), null);
+  assert.equal(experienceFpm({ game_score: 90, experience_score: 90, hours_to_value: null, has_ending: 1 }), null);
+  // Increment 11's new input gets the same guard as the original two: a row
+  // holding game_score but no experience_score must not produce a number
+  // built from half the judgement.
+  assert.equal(experienceFpm({ game_score: 90, hours_to_value: 5, has_ending: 1 }), null);
   assert.equal(experienceFpm({ has_ending: 1 }), null);
   assert.equal(experienceFpm({}), null);
   assert.equal(experienceFpm(null), null);
   assert.equal(experienceFpm(undefined), null);
   // Numeric STRINGS off a loose caller are refused rather than coerced, the
   // same discipline as the write boundary.
-  assert.equal(experienceFpm({ game_score: "90", hours_to_value: 5, has_ending: 1 }), null);
-  assert.equal(experienceFpm({ game_score: 90, hours_to_value: "5", has_ending: 1 }), null);
-  // A game_score of 0 is a real judgement and must still produce a number.
-  assert.equal(experienceFpm({ game_score: 0, hours_to_value: 5, has_ending: 1 }), 0);
+  assert.equal(experienceFpm({ game_score: "90", experience_score: 90, hours_to_value: 5, has_ending: 1 }), null);
+  assert.equal(experienceFpm({ game_score: 90, experience_score: "90", hours_to_value: 5, has_ending: 1 }), null);
+  assert.equal(experienceFpm({ game_score: 90, experience_score: 90, hours_to_value: "5", has_ending: 1 }), null);
+  // A score of 0 on either side is a real judgement and must still produce a
+  // number — 0, not null.
+  assert.equal(experienceFpm({ game_score: 0, experience_score: 90, hours_to_value: 5, has_ending: 1 }), 0);
+  assert.equal(experienceFpm({ game_score: 90, experience_score: 0, hours_to_value: 5, has_ending: 1 }), 0);
+  // A negative on either side would make sqrt return NaN, and NaN sorts
+  // unpredictably in the rank. Refuse rather than propagate.
+  assert.equal(experienceFpm({ game_score: -1, experience_score: 90, hours_to_value: 5, has_ending: 1 }), null);
 });
 
 test("experienceFpm: the 2-hour floor and the sqrt damping are both actually applied", () => {
   assert.equal(EXPERIENCE_FPM_HOURS_FLOOR, 2);
   // Below the floor, hours stop mattering: a 15-minute game gets no bonus
   // over a 2-hour one.
-  const quarterHour = experienceFpm({ game_score: 80, hours_to_value: 0.25, has_ending: 1 });
-  const twoHours = experienceFpm({ game_score: 80, hours_to_value: 2, has_ending: 1 });
+  const at = (hours) => experienceFpm({ game_score: 80, experience_score: 80, hours_to_value: hours, has_ending: 1 });
+  const quarterHour = at(0.25);
+  const twoHours = at(2);
   assert.equal(quarterHour, twoHours);
-  assert.equal(experienceFpm({ game_score: 80, hours_to_value: 0, has_ending: 1 }), twoHours);
+  assert.equal(at(0), twoHours);
 
   // sqrt, not a raw quotient: quadrupling the hours halves the score rather
   // than quartering it. A raw quotient IS the pass-1 failure restated.
-  const eight = experienceFpm({ game_score: 80, hours_to_value: 8, has_ending: 1 });
-  const thirtyTwo = experienceFpm({ game_score: 80, hours_to_value: 32, has_ending: 1 });
+  const eight = at(8);
+  const thirtyTwo = at(32);
   assert.ok(Math.abs(eight / thirtyTwo - 2) < 1e-9, "4x the hours must cost exactly 2x, not 4x");
 });
 
-test("zero-diff: nothing consumes game_score or experience_fpm yet", async () => {
-  // SPEC-10.5.md gate (f). experienceFpm is a pure function nothing in src/
-  // calls; where FPM surfaces and sorts is increment 11 (spec §8).
+test("zero-diff: game_score never leaks into the six legacy lanes' catalogue read, and experienceFpm has exactly one consumer", async () => {
+  // SPEC-10.5.md gate (f), carried forward to increment 11. The 10.5 form of
+  // this test asserted NOTHING in src/ called experienceFpm; SPEC.md §5.3
+  // deliberately changes that by making /api/rank's `?sort=fpm` its first and
+  // only consumer. What must still hold — and is what the six zero-diff lanes
+  // actually depend on — is that selectMatchedCatalogRows, the read those
+  // lanes share, still carries none of the experience columns.
   const env = makeEnv();
   await seedCatalog(env, [{ appid: 1, mainHours: 5 }]);
   globalThis.fetch = okHelper();
@@ -1933,8 +1984,12 @@ test("zero-diff: nothing consumes game_score or experience_fpm yet", async () =>
   const catalogSource = await readFile(new URL("../src/catalog.js", import.meta.url), "utf8");
   const workerSource = await readFile(new URL("../src/worker.js", import.meta.url), "utf8");
   const callSites = (src) => (src.match(/experienceFpm\(/g) || []).length;
-  assert.equal(callSites(workerSource), 0, "src/worker.js must not call experienceFpm until increment 11");
+  // One declaration in catalog.js, one call site in worker.js (handleRank's
+  // per-row build). If a SECOND call site ever appears in worker.js, a lane
+  // other than /api/rank has started consuming it and this fires.
   assert.equal(callSites(catalogSource), 1, "src/catalog.js only DECLARES it – the one match is the declaration");
+  assert.equal(callSites(workerSource), 1, "only /api/rank may consume experienceFpm – exactly one call site");
+  assert.match(workerSource, /experienceFpm: experienceFpm\(row\)/, "and that call site is the /api/rank row builder");
 });
 
 test("gate (a): ensureCatalogSchema adds the 10.5 columns to an increment-10 install without losing data", async () => {
