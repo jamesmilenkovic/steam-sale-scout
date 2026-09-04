@@ -8,7 +8,9 @@
     "dev": "wrangler dev",
     "bridge": "node tools/claude-bridge.mjs",
     "deploy": "echo 'Deploy deferred to Phase 3 — Steam Sale Scout is local-only through Phase 1 (see SPEC.md). Run: npm run dev' && exit 1",
-    "test": "node --test"
+    "test": "node --test",
+    "backup": "node tools/backup-catalog.mjs",
+    "restore": "node tools/restore-catalog.mjs"
   },
   "devDependencies": {
     "wrangler": "^4.107.0"
