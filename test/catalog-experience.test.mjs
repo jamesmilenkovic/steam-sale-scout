@@ -51,6 +51,7 @@ import {
   recordExperienceResult,
   requestExperienceBatch,
   isExperienceHelperAvailable,
+  EXPERIENCE_HELPER_URL_DEFAULT,
   backfillExperienceScores,
   requestFpmAutoContinueStop,
   runFpmSyncPipeline,
@@ -72,6 +73,31 @@ const originalFetch = globalThis.fetch;
 // Harness.
 // ---------------------------------------------------------------------------
 
+/**
+ * The port this file's harness points the helper at.
+ *
+ * INCREMENT 12 HERMETICITY FIX (SPEC.md §6). The harness used to point at
+ * 127.0.0.1:**8788**, which is the port `npm run bridge` binds. Every test in
+ * this file stubs `globalThis.fetch`, so today that coupling is harmless -
+ * but it is harmless BY DISCIPLINE, not by construction: one test that forgot
+ * the stub would silently reach a real `claude-bridge` if James happened to
+ * have one running, and would pass or fail depending on what else was open on
+ * his machine. Increment 12 is the increment where the app gets driven live,
+ * repeatedly, with whatever else is running, so the coupling is removed
+ * rather than watched.
+ *
+ * 9 is the discard port: nothing legitimate listens on it, so a forgotten
+ * stub now fails DETERMINISTICALLY with a connection refusal instead of
+ * depending on the environment. The guard test below pins that this port can
+ * never drift back onto one the live fill owns.
+ */
+const HARNESS_HELPER_PORT = 9;
+const HARNESS_HELPER_URL = `http://127.0.0.1:${HARNESS_HELPER_PORT}`;
+
+/** The ports a live fill and its `wrangler dev` own, mirroring the set in
+ * test/claude-bridge.test.mjs. The harness URL must never be one of these. */
+const LIVE_PORTS = new Set([8787, 8788, 8790, 8791]);
+
 function makeEnv(overrides = {}) {
   // EXPERIENCE_HELPER_TOKEN is the shared secret tools/claude-bridge.mjs
   // requires on POST /prompt (round-1 review SEC-1). It is wired through
@@ -79,7 +105,7 @@ function makeEnv(overrides = {}) {
   // its own test below, not the default for the other 50.
   return {
     FPM_DB: makeMockD1(),
-    EXPERIENCE_HELPER_URL: "http://127.0.0.1:8788",
+    EXPERIENCE_HELPER_URL: HARNESS_HELPER_URL,
     EXPERIENCE_HELPER_TOKEN: "test-bridge-token",
     ...overrides,
   };
@@ -1029,6 +1055,18 @@ test("isExperienceHelperAvailable: a non-2xx, a non-JSON body and a missing ok f
   assert.equal(await isExperienceHelperAvailable(env), false);
   globalThis.fetch = async () => new Response(JSON.stringify({ ok: true }), { status: 200 });
   assert.equal(await isExperienceHelperAvailable(env), true);
+});
+
+test("HERMETICITY: this file's harness never points at a port a live claude-bridge could hold", () => {
+  // The guard on the fix above. If someone restores 8788 here (or any other
+  // live-fill port) to "make it match production", this fails loudly rather
+  // than handing the suite back its dependence on what James has running.
+  assert.equal(LIVE_PORTS.has(HARNESS_HELPER_PORT), false, `harness port ${HARNESS_HELPER_PORT} is one the live fill owns`);
+  assert.equal(makeEnv().EXPERIENCE_HELPER_URL, HARNESS_HELPER_URL);
+  assert.equal(makeEnv().EXPERIENCE_HELPER_URL.includes("8788"), false);
+  // And the real default is still 8788 - the fix moves the TEST HARNESS off
+  // that port, not the product.
+  assert.equal(EXPERIENCE_HELPER_URL_DEFAULT, "http://127.0.0.1:8788");
 });
 
 test("the helper base URL is configurable off env and defaults to loopback", async () => {

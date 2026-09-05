@@ -1,554 +1,596 @@
-# Increment 11 – New scoring, and the wall comes down
+# Increment 12 – The answer page (UX overhaul)
 
-**Scoped:** 2026-09-02 · **Status:** APPROVED by James 2026-09-03 (owned-games amendments 2026-09-02; open question 1 ruled 2026-09-03)
-**Amended:** 2026-09-02, after James's ruling on what owned games are for. Changes are in
-§1, §4.2, §4.3, §7, §8, §10 and gate 5. Every other decision is unchanged.
-**Base:** `experience` @ `faff639` (increments 10 + 10.5, pushed)
-**PRD:** `PRDs/2-in-progress/2026-07-04-steam-sale-recommender.md` – **Rev 3, Phase 5, increment 11**,
-plus the **seven rulings of 2026-09-01** and the **Slice 0 outcome**. All three are binding and
-none of them is re-opened here.
+**Scoped:** 2026-09-04 · **Status:** APPROVED by James 2026-09-04 (see §10b)
+**Base:** `experience` @ `a4167bd` (increment 11, eye test passed 2026-09-04)
+**PRD:** `PRDs/2-in-progress/2026-07-04-steam-sale-recommender.md` – **Rev 3, Phase 5, increment 12**,
+plus the seven **increment 10 rulings**, the **increment 11 outcome** block, the new **increment
+12.5** entry, and Rev 2's **UX direction** section. All binding. None re-opened here.
 
 ---
 
 ## 1. Problem, and the one sentence
 
-The catalogue is finished and nothing consumes it. 18,219 games carry an `experience_score`,
-a `game_score`, honest hours and a reason line, and every existing lane still ranks by
-`wilson / sqrt(main_hours)` over a discount-gated pool that hides owned games. **This
-increment turns the finished catalogue into one ranked answer to "what do I play next",
-owned and unowned side by side, with two toggles that visibly move the order.**
+`/api/rank` answers the product's question correctly and nothing renders it. The front end is
+still six tabs over six retired lanes, ranking by a formula the project abandoned three
+increments ago, and the only way anyone has ever seen the real answer is a throwaway artifact
+page James was handed once.
 
-**User story.** As James with 18,219 catalogued games and four free hours, I want one ranked
-list built from experience value and my actual taste, with sale as a weight I can lean on,
-so that I stop reading leaderboards and start picking a game.
+**This increment builds the page. One screen that answers "what should I play next" before
+anyone touches anything on it.**
 
-**Owned games have two jobs, ruled by James 2026-09-02, verbatim:**
+**User story.** As someone opening this app for the first time – James on a Tuesday night, or a
+person who has never heard of it – I want the page to already be showing me a handful of games
+with a reason attached to each, so that I can pick one without learning what a preset is.
 
-> "Owned games are important for two reasons – they can still be recommended as the next game
-> to PLAY (not necessarily buy) and also they feed the recommendation engine for SIMILAR games
-> which was the other big aspect to this whole project"
+**The gate, and it governs every decision below:** *a stranger can land on the front page and get
+a usable answer without touching a single control.* A page that needs a control touched before
+it answers anything has failed, however good the controls are. Where this spec cuts something,
+that sentence is the reason.
 
-Both are load-bearing on this spec. **Reason 1** is served by the `default` preset (§4.2) and
-by the owned exemption in the suppression clause (§7). **Reason 2** is served by
-`src/profile.js`, untouched, and is explicitly protected by §4.3. Anything in the build that
-would hide an owned game from the ranking, or weaken the library's role as the taste input,
-is a defect against this section.
-
-**Where the line is, stated once and plainly: there is no UI in this increment.**
-`public/index.html` is not touched. The deliverable is a JSON route plus generated markdown
-in the review folder, exactly as increments 10 and 10.5 delivered theirs. The answer page is
-increment 12 and every temptation to pull it forward is refused below in §9.
+**What "stranger" means here, stated plainly so nobody assumes hosting.** A real person sitting
+at James's Mac mini, in front of `http://localhost:8787/`, with James in the room. There is no
+authentication in this project and `/api/rank` returns his library and his playtimes; increment
+11's security review made auth a precondition for **any** deploy, and that stands. Nothing in
+this increment is exposed beyond loopback. Hosting is the deploy epic; auth is its first item.
 
 ---
 
 ## 2. Prior art / what already exists
 
-**TLDR:** the new capability is "combine N normalised signals into one weighted score" – the
-textbook Weighted Sum Model. Every off-the-shelf option is either a search engine, a trained
-ranker needing labelled data we do not have, or a collaborative filter needing other users.
-**Build. It is roughly 30 lines of arithmetic.** The one thing worth taking from the field is
-the discipline of **normalising each signal before weighting it**, which is precisely what
-stops the raw-cosine collapse described in §4.
+**TLDR:** the browse list is a filterable table over 13,924 rows already in browser memory, and
+half a dozen mature libraries do that well – but every one of them arrives through a bundler or
+a CDN tag, and this project ships a single static HTML file to a Worker with no build step and a
+provably offline-clean test suite. **Build. Take the technique, not the dependency.** For the
+part the gate actually tests – five cards with a sentence each – there is nothing to adopt,
+because there is no library for "five cards".
 
-The product-level landscape (Valve's Interactive Recommender, Play Next, ITAD, GG.deals,
-SteamDB, SteamPeek, Deku Deals) is already surveyed in the PRD's Landscape table and Rev 3
-evidence item 10. Per the prior-art protocol's per-capability rule, that ground is cited, not
-re-walked. This section covers only the new capability.
+The product-level landscape (Valve's Interactive Recommender and Play Next, ITAD, GG.deals,
+SteamDB, SteamPeek, Deku Deals) is surveyed in the PRD's Landscape table and Rev 3 evidence item
+10. Per the prior-art protocol's per-capability rule, that ground is cited, not re-walked. This
+section covers the new capability only: **presenting a ranked answer, and browsing the pool
+behind it.**
+
+### 2a. The browse list – table/grid libraries
 
 | What | Type | State | What it does well | Why it isn't the answer |
 |---|---|---|---|---|
-| [Vespa ranking expressions](https://docs.vespa.ai/en/ranking-expressions-features.html) | Search/serving engine, Apache-2.0 | Actively developed | The closest match in existence: first-phase/second-phase ranking expressions blending arbitrary signals with tunable weights at query time | A JVM serving cluster. We rank 18k rows inside a Cloudflare Worker against SQLite. The infrastructure is orders of magnitude larger than the problem. |
-| [Elasticsearch `function_score`](https://www.elastic.co/guide/en/elasticsearch/reference/current/query-dsl-function-score-query.html) / OpenSearch | Query DSL | Mature | `field_value_factor` + `weight` + `score_mode` is exactly our blend, expressed declaratively | Same objection, plus a licence question. Nothing here needs an inverted index; there is no text query. |
-| [Typesense](https://typesense.org/docs/) / Meilisearch | Search engine, GPL/MIT | Mature | Lightweight, ranking rules and numeric sort tiebreakers | Ranking rules are lexicographic tiers, not a weighted blend. Would need the blend computed anyway, then indexed. Pure overhead. |
-| [TensorFlow Ranking](https://github.com/tensorflow/ranking) / LightGBM `rank:pairwise` | Learning-to-rank | Mature | Learns weights instead of guessing them | Needs labelled relevance judgements or a click log. We have one user and zero clicks. The weights are the product decision here, not something to fit. |
-| [LightFM](https://github.com/lyst/lightfm), [implicit](https://github.com/benfred/implicit), RecBole | Recommender libraries | Mature | Hybrid and collaborative recommendation | Needs many users' interaction histories. Explicitly ruled out in the PRD's core-engine section from the start, for exactly this reason. Unchanged. |
-| [scikit-criteria](https://github.com/quatrope/scikit-criteria) | Multi-criteria decision analysis, BSD | Maintained | Names our problem correctly – WSM/TOPSIS over normalised criteria, with the normalisation step first-class | Python, and the whole library reduces to `sum(w_i * norm(x_i))` for our single method. Take the method, not the dependency. |
+| [Tabulator](https://github.com/olifolkerd/tabulator) | JS table, MIT | Mature, actively maintained | Closest single-drop-in match: virtual DOM row rendering, per-column filters, multi-sort, no framework required | Needs the bundle on disk. Vendoring ~400 KB of minified JS into `public/` to replace ~150 lines of predicates and a `slice()` is a bad trade, and it becomes a thing to keep updated. |
+| [AG Grid Community](https://github.com/ag-grid/ag-grid) | Data grid, MIT core | Mature, commercial upstream | Best-in-class virtualisation and filtering at 100k+ rows | Built for a bundler and a framework wrapper. The community/enterprise split means half the documented features are not the ones we would get. Far larger than the problem. |
+| [TanStack Table](https://github.com/TanStack/table) | Headless table logic, MIT | Mature | Headless is the right shape – it gives sorting/filtering/pagination state and leaves rendering alone | Headless means we still write all the markup, which is the part we were going to write anyway. What is left is a state machine we do not need for one list. |
+| [Grid.js](https://github.com/grid-js/gridjs) | Table, MIT | Maintained | Small, framework-free, search and pagination out of the box | Its filtering model is search-plus-pagination, not a nine-predicate filter bar. We would fight it. |
+| [List.js](https://github.com/javve/list.js) | List filter/sort, MIT | Low activity | Tiny, no dependencies, exactly the "filter and sort an existing list" shape | Operates on rendered DOM, so it wants all 13,924 rows in the document first. That is the one thing we must not do. |
+| [Clusterize.js](https://github.com/NeXTs/Clusterize.js) | Virtual scroll, GPL/MIT | Low activity | Solves the only genuinely hard part – rendering a huge list without killing the DOM | We sidestep the hard part instead: render 100 rows with a "show more". Zero lines, zero dependency. |
 
-**Reusable pieces:** none as code. As method: normalise-then-weight (WSM), and the choice of
-normaliser (min-max vs percentile rank) as an explicit, measured decision rather than a
-default – see §4.2 and gate 3.
+### 2b. The picks – what the product shape borrows from
 
-**What nobody has done:** rank a whole Steam catalogue by *judged complete-experience value
-per hour* crossed with library-derived taste, with the owned games left in. The PRD's white
-space is intact.
+Not code, and there is nothing to adopt. Worth naming because the interaction pattern is
+solved elsewhere and the lessons are cheap:
 
-**Build vs adopt: build.** The arithmetic is trivial; the expensive parts (the LLM judgement,
-the tags) are already stored. Adopting anything above would add infrastructure larger than
-the app to avoid writing 30 lines.
+1. **Spotify Discover Weekly / Netflix "Top picks for you".** A small fixed set, presented as
+   the answer, with the machinery hidden. The lesson taken: no filter bar in the first screenful.
+2. **Steam's Discovery Queue.** One game at a time with a reason. Too slow for our case – James
+   wants to compare a handful, not click through 20.
+3. **Valve's Play Next shelf** (PRD Rev 3, evidence 10). Recommends unplayed games from your own
+   library and knows nothing about length, session fit or Deck. It is the closest existing thing
+   to our picks section and it is why owned-and-never-launched is treated as a first-class state
+   on the pick card.
+4. **[Backloggd](https://backloggd.com) / [HowLongToBeat](https://howlongtobeat.com) backlog
+   tools.** Both are catalogues you curate by hand. Neither ranks anything for you. They are the
+   reason increment 12.5 exists as a separate increment rather than as a feature here.
+
+**Reusable pieces:** none as code. As technique, three things, all free: **render a capped
+window** rather than virtualising; **filters as a chain of pure predicates** over one in-memory
+array, so each is independently unit-testable (this is exactly `public/filters.js`'s existing
+seam, and the new module copies it); **debounce the search input**, not the filter chain.
+
+**Why no measured probe was run, per the protocol's build-vs-adopt rule.** The candidates are
+not separated by capability – Tabulator would do the browse list well. They are separated by
+delivery: no bundler, no CDN (the suite is provably offline-clean and the app must run with the
+network down), and a single-file `public/index.html`. That constraint decides it before any
+benchmark would, and a probe that cannot change the answer is not worth the increment.
+
+**The trigger that reopens this:** column resize, column grouping, CSV export, or server-side
+pagination. Any one of those and Tabulator becomes the right call, with a build step added
+consciously.
+
+**What nobody has done:** present a Steam catalogue as *an answer* – five games with a reason
+line, mixing games you own with games you do not, ranked by judged complete-experience value per
+hour against your own playtime. Every product in the Landscape table presents a grid and asks
+you to filter it. The PRD's white space is intact and this increment is the part of it a person
+can see.
+
+**Build vs adopt: build.** Vanilla JS, no framework, no dependency – a conscious ruling under
+Rev 2's UX direction clause, not a default. See §6.
 
 ---
 
 ## 3. Scope – exactly what gets built
 
-1. **One new route, `GET /api/rank`.** The headline lane. Sourced from `fpm_catalog`, not
-   from the deals feed, so owned games are in the pool by construction.
-2. **The blend** (§4), with three named presets and raw weight overrides.
-3. **Similarity computed per request** from the stored inc-9 tags against the live taste
-   profile, with leave-one-out for owned games (§4.3). Never persisted – Rev 2's binding
-   two-layer rule.
-4. **The blended `experienceFpm`** as a secondary sort inside the same route (§5).
-5. **Prologue exclusion** as a stored, auditable column (§6).
-6. **Low-confidence suppression** as a default-on filter with an owned exemption and a
-   settings key (§7).
-7. **An honest funnel** on the response: 18,306 rows down to the ranked set, every
-   subtraction named and adding up (§8).
-8. **A dev script** that renders the three preset runs to markdown in the review folder.
+**The headline constraint, and it is the cleanest boundary this project has had: increment 12
+does not touch `src/`.** Every field the page needs is already on `/api/rank`, including `appid`.
+No new route, no new parameter, no schema change, no ranking change. The reviewer's zero-diff
+check is `git diff a4167bd -- src/` returning nothing.
 
-Nothing else. Six existing lanes stay byte-identical – §10.
+1. **`public/index.html`, rewritten.** The answer page: picks, lens strip, two quick chips,
+   browse list, filter bar, honest footer. The six tabs are gone from the UI.
+2. **`public/rankFilters.js`, new.** Pure ESM filter predicates over `/api/rank` rows, importable
+   by both the browser and `node --test`, mirroring `public/filters.js`'s existing seam.
+3. ~~`scripts/backup-catalog.mjs`~~ **Already shipped as `tools/backup-catalog.mjs` + `tools/restore-catalog.mjs` in `a4167bd`. Not work for this increment.** (Was: a one-shot backup of the local D1. Not a page
+   feature; it is insurance on the asset the page depends on, flagged in increment 11's result
+   file as *"worth fixing before increment 12"*.
+4. **The port-8788 test hermeticity fix**, in `test/` only.
 
----
-
-## 4. The ranking formula
-
-### 4.1 The blend
-
-```
-E    = experience_score / 100                       // 0..1, headline. Ruling 3.
-S    = normalise(cosine(profile, tagVector))        // 0..1, co-pillar. See 4.2.
-P    = (cut ?? 0) / 100                             // 0..1, sale strength. 0 when no price.
-
-base = wE * E + wS * S                              // wE + wS = 1
-rank = base * (1 + wSale * P * (atHistoricalLow ? 1.15 : 1))
-```
-
-`1.15` is the existing `HISTORICAL_LOW_BONUS` in `src/score.js`. No new constants.
-
-**Why additive for E and S, multiplicative for sale.** E and S are co-pillars, so a weight
-must behave like a weight – multiplying them means a near-zero similarity annihilates a 98
-experience score, which is the opposite of what "co-pillar" means and would put *Portal*
-nowhere. Sale is explicitly **a boost, never a gate** (Rev 3 decision table), and a
-multiplier is what "boost" means: at `wSale = 0` the sale term is exactly 1.0 and the
-ranking is unchanged, which is what makes the default preset provably sale-blind.
-
-### 4.2 The presets, and what each toggle is FOR
-
-| Preset | `wE` | `wS` | `wSale` | The lens |
-|---|--:|--:|--:|---|
-| `default` | 0.70 | 0.30 | 0.00 | **"What do I play next."** Experience value leads, taste breaks ties, sale is arithmetically absent. Owned and unowned compete purely on experience and taste. |
-| `sale` | 0.70 | 0.30 | 0.50 | **"What do I buy."** Same base order, then a 90%-off historical low earns up to +52%. |
-| `similarity` | 0.40 | 0.60 | 0.00 | "More like what I play." Taste leads; experience value becomes the floor that keeps shovelware out. |
-
-**`default` is the lens that serves James's reason 1, and it is the default for that reason.**
-With `wSale = 0` the sale multiplier is exactly 1.0 for every row, so an owned game and an
-unowned game are ranked by the same two numbers. Nothing about ownership touches the score.
-
-**`sale` is a buying lens and owned games cannot win it. Stated here rather than discovered at
-the gate.** Measured against live D1: **only 1 of the 552 scored owned games carries a
-discount.** So under `sale` an owned row gets a multiplier of 1.0 while a discounted unowned
-row gets up to 1.52, and owned games are arithmetically pushed down. That is correct – "what
-should I buy" is a question about things you do not own – but it means `sale` is never the
-answer to "what do I play tonight", and increment 12 must not make it the landing state.
-
-Also accepts `?we=`, `?ws=`, `?wsale=` as clamped overrides, mirroring `handleFpm`'s existing
-`?qexp=` / `?breadth=` pattern. Presets are the reviewed surface; overrides are for tuning at
-the gate without a redeploy.
-
-**The normaliser is the load-bearing choice and it gets measured, not assumed.**
-IDF-weighted cosine over 18k rows is expected to compress hard near zero. If it does, min-max
-normalisation leaves `S` compressed too, `wS` stops having force, and the ⛩ gate fails on
-"the order must visibly move". **Recommendation: percentile rank across the eligible pool**,
-which is uniform on 0..1 by construction and therefore guarantees `wS` real force. The raw
-cosine is returned on every row alongside it, so nothing is hidden. Gate 3 prints the
-distribution and the top 20 under both normalisers side by side, and James picks.
-
-### 4.3 Owned games – what they are for, and the self-match trap
-
-**Reason 2 first, because it is the thing most easily broken by accident.**
-**The owned library remains the sole input to the taste vector, and nothing in this increment
-changes that.** `src/profile.js` is untouched: `buildProfile` still sums every owned game's
-tag vector weighted by `gameWeight` (playtime normalised against the SteamSpy median, times
-the recency multiplier over the configured window), still IDF-weights it, still L2-normalises
-it. That is the recommendation engine, it is the "other big aspect" James named, and it is
-not on the change list.
-
-**Leave-one-out does not weaken that.** An owned game's tags helped build the profile, so
-scoring it against that profile is circular – under the `similarity` preset the top would
-fill with games James has already sunk 200 hours into. So for an owned candidate, subtract
-**that one game's** contribution from the summed profile vector, re-normalise, then score.
-`buildProfile` already returns per-game `contributions` with `tagWeights`, so this is an
-O(tags) subtraction per owned candidate, not a profile rebuild. Every other owned game still
-contributes in full – to that candidate's score and to every other candidate's. The library's
-role as the engine's source is intact; only the one-game self-match is removed.
-
-**Reason 1: owned games are ranked and annotated, never excluded.** `owned: true` and
-`hoursPlayed` on the row. `?owned=all|hide|only` reuses the existing `parseOwnedMode` helper;
-default `all`. No playtime penalty is invented on spec – whether a 200-hour owned game should
-sink is a presentation decision, and it belongs to increment 12 with the answer page in front
-of him.
-
-### 4.4 Games with no tags
-
-Ranked with `S = 0` rather than dropped – `experience_score` is the headline and a missing
-co-pillar is not a reason to hide a game. This is a deliberate difference from
-`scoreCandidates`, which drops tagless candidates. Counted in the funnel as `taglessCount`.
+Nothing else. Nine API surfaces stay byte-identical – §6.
 
 ---
 
-## 5. The old FPM, reconciled
+## 4. What the page shows
 
-**The `sqrt` unlock lands here, and here is exactly what it means.**
+### 4.1 Before any click – the landing state
 
-1. **`wilson / sqrt(main_hours)` is retired as the project's ranking metric.** Nothing new
-   consumes HLTB hours. Ruling 5 stands: `hours_to_value` is the honest number.
-2. **`/api/fpm` keeps it, byte-identical, and dies at increment 12** with the rest of the old
-   tabs. Rewriting a lane that is three weeks from deletion is waste. `FPM_FORMULA = "sqrt"`
-   stays where it is, now governing only the legacy lane it was written for. The lock is
-   lifted in the sense that it no longer binds the product's ranking.
-3. **The secondary "shortest to finish" sort lives inside `/api/rank`** as
-   `?sort=experience|fpm`, and it is ruling 4's blended formula, superseding increment 10.5's
-   `game_score / sqrt(...)`:
+Loading `http://localhost:8787/` with no query string and no interaction renders, top to bottom:
 
-```
-experienceFpm = hasEnding === 1
-  ? sqrt(game_score * experience_score) / sqrt(max(hours_to_value, 2))
-  : null
-```
+1. **One question as the heading.** Recommended copy: *"What should I play next?"*
+2. **One sentence of basis.** Recommended: *"Ranked from 13,924 games on Steam by how much
+   complete experience each one gives per hour you put in, matched to what you actually play."*
+   The number comes from `funnel.ranked`, not a constant.
+3. **Five picks.** Five, not three and not ten: three is too thin to contain both an owned and an
+   unowned candidate, ten is a list rather than an answer, and five fits above the fold on a
+   laptop with every reason line readable. Below them, one **"Show me 5 more"**.
+4. **The lens strip** (§4.2) – visible, not touched.
+5. **The two quick chips** (§4.3) – visible, both off.
+6. **"Browse all 13,924 games"** – one click below the picks, collapsed. This is the PRD's
+   "full filterable list one click below", and collapsing it is what keeps the filter bar out of
+   the first screenful.
+7. **The honest footer**, one line: *"Ranked 13,924 of 18,306 games. 4,209 hidden as
+   low-confidence, 111 prologues, 87 not games, 2 unscored."* Straight from `funnel`, expandable
+   to the full table. It costs one line and it is the cheapest trust the page can buy.
 
-10.5's version was only ever rendered into review markdown, never returned by an API, so this
-supersession has **zero API diff**. The scale is near-identical, so the inc-10 artifacts stay
-readable next to the new ones. Worked check against the published catalogue rows – the point
-is that this reproduces ruling 4's claimed movement rather than asserting it:
+**Each pick card carries, and nothing else:**
 
-| Game | quality | exp | hrs | 10.5 FPM | blended FPM | effect |
-|---|--:|--:|--:|--:|--:|---|
-| Journey | 92 | 95 | 2 | 65.1 | 66.1 | unmoved at the top |
-| Portal | 97 | 98 | 3 | 56.0 | 56.3 | unmoved |
-| Melatonin | 88 | 90 | 2 | 62.2 | 62.9 | unmoved (ruling 4: 20th to 19th) |
-| DoDonPachi Resurrection | 90 | 74 | 2 | 63.6 | 57.7 | sinks |
-| GAROU: Mark of the Wolves | 90 | 60 | 2 | 63.6 | 51.96 | sinks hardest (ruling 4: 5th to 401st) |
-
-**`experience_score` remains the default sort. Ruling 3, not re-opened.** FPM is one query
-parameter away and never the headline.
-
----
-
-## 6. Prologue exclusion – where the list lives
-
-**Two additive columns on `fpm_catalog`, same ALTER pattern as 7.8 / 8.5 / 9 / 10 / 10.5.**
-
-| Column | Type | Meaning |
+| Slot | Source | Rendered as |
 |---|---|---|
-| `rank_exclude_reason` | TEXT | `'prologue'` today, NULL for everything rankable. Extensible without a schema change. |
-| `rank_exclude_checked_at` | INTEGER | Epoch ms. Makes the fill self-healing for rows a future crawl adds. |
+| Title, linked to its Steam page | `title`, `appid` | `https://store.steampowered.com/app/<appid>/` |
+| Status | `owned`, `hoursPlayed`, `price`, `cut` | "In your library · never played" / "In your library · 3h played" / "$7.30 · 80% off" / "$29.99" / "No price on file" |
+| Length | `hoursToValue`, `hasEnding` | "About 9 hours" / "Endless – no ending, so no per-hour figure" (`hasEnding === 0`) / "Length not known" (`hasEnding === null`) |
+| Why | `why` | The LLM reason line, verbatim. This is the single most load-bearing string on the page. |
+| Experience value | `experienceScore` | "Experience value 92 / 100" |
+| Taste match | `similarityNorm` | A **word band** – Very strong / Strong / Moderate / Weak / None. Words, not a number, because `similarityNorm` is a percentile under two lenses and a min-max distance under the third, and "89%" would mean two different things depending on which button is lit. The number lives in the browse table where James is reading columns, not sentences. |
+| Tags | `tagNames`, first three | "Puzzle · First-Person · Sci-fi" |
+| Confidence | `confidence === 'low'` | A small "low-confidence score" mark. Honesty about a bluffed score is not optional on the front page. |
+| Actions | – | "View on Steam" (primary) · "Not interested" (dismiss, §4.6) |
 
-**Why a column and not a regex in the ranking path, and not a settings list:**
+**Why this satisfies the gate.** A stranger reads a question, a sentence saying what the ranking
+means, then five games each with a name, a reason, a length and whether it is already owned.
+"Why these" is answered by the sentence and the reason lines. "What do I do next" is answered by
+a link to the store page and a game they already own that they never launched.
 
-1. **Auditable.** James opens one table and sees all ~108 caught rows and every near-miss.
-   A regex in the hot path can only be reviewed by reading code.
-2. **Precedent.** This is `app_type` from increment 7.8 exactly – classify once, gate the
-   lane on the column. Consistency beats novelty.
-3. **Architecture.** Prologue-ness is a property of the game, not of a user. The Rev 2
-   binding two-layer rule puts it in the global layer. A settings-driven list would put
-   per-user data in charge of a catalogue fact, which is the one thing that rule forbids.
-   Dismissals stay what they are – per-user "not interested", already joined at rank time,
-   and not conflated with this.
+### 4.2 The lenses – and the landing state
 
-**Mechanism.** A pure exported classifier with **word-boundary matching** (`\bprologue\b`,
-case-insensitive), plus a small appid allowlist for false positives, driven by an idempotent
-`ensureRankExclusions(env)` called at the top of the rank handler. It selects rows with
-`rank_exclude_checked_at IS NULL`, classifies in JS, and write-throughs in batches. No
-network, no rate limit, no new route, no change to the sync pipeline or its status endpoint.
-First call pays a one-time ~18k-row pass; every call after is a no-op. **This is not a
-re-fill** – no LLM, no external API, seconds not hours.
+**The landing state is `default`, and `sale` can never be it.** Measured in increment 11: only 1
+of 552 owned games carries a discount, so under `sale` an owned game is arithmetically pushed
+down and the lens cannot answer "what do I play tonight". This is enforced, not merely intended –
+the landing preset is a named constant in the page module with a unit test asserting it is
+`default`.
 
-**Scope, hard: `prologue` only.** Demos, DLC and soundtracks are not leaking (ruling 6: 10
-demo-named rows and 1 soundtrack survive in 18,219), and the naive `%demo%` search that
-would kill *HYPER DEMON*, *Book of Demons* and *Democratic Socialism Simulator* is exactly
-what word boundaries exist to prevent. Those three are mandatory negative-control fixtures.
+Three buttons, labelled in product language rather than preset names:
 
-**Pre-build checkpoint.** The full match list and the negative controls are written to
-`~/code/review/steam-sale-scout/inc-11/01-prologue-exclusions.md` and **the build stops for
-James's ruling before a single row is written.** Legitimate titles carrying the word
-(*Prologue: Go Wayback!*) are found by his eye, not by a rule, and land in the allowlist.
+| Button | Preset | Sub-line shown when active |
+|---|---|---|
+| **Play next** (active on load) | `default` | – |
+| **Worth buying** | `sale` | "Games you don't own, weighted by how deep the discount is." |
+| **More like what I play** | `similarity` | "Closest to your taste, whether or not you own it." |
+
+Switching lens **re-fetches `/api/rank?preset=…`** and caches the response in memory for the
+session. **Hard rule: the browser never computes a rank.** The blend and the similarity
+normaliser are properties of the lens and live in `src/rank`; reimplementing them in JS would
+create a second source of truth for the product's headline number. Client-side *sorting* of the
+browse list on returned fields is presentation and is allowed; recomputing `rankScore` is not.
+The reviewer checks this by grepping `public/` for the blend arithmetic and finding none.
+
+### 4.3 The two quick chips – exclude owned, exclude played
+
+James's carried-forward ask (PRD, increment 11 outcome, item 2), and they are distinct.
+
+| Chip | Predicate | Default |
+|---|---|---|
+| **Hide games I own** | `owned === true` | off |
+| **Hide games I've played** | `(hoursPlayed ?? 0) > 0` | off |
+
+They sit under the lens strip and apply to **the picks**, because that is where they are useful.
+Worked example the gate checks: an owned game with 0 hours survives "hide played" and disappears
+under "hide owned"; an owned game with 3 hours disappears under both.
+
+**Neither is persisted, and both default off.** Reason: a persisted filter would let a previous
+session poison the landing state, and the gate is a sentence about landing on the page with
+nothing touched. This is the one place where "remember my settings" is the wrong behaviour, and
+it is deliberate.
+
+**"Finished" does not exist** and is not faked from playtime. That is increment 12.5.
+
+### 4.4 The browse list – one click below
+
+"Browse all N games" expands the full ranked list under the current lens. A table, **100 rows
+rendered** with a "Show 100 more" – the pool is 13,924 rows and putting them all in the DOM is
+the only genuinely slow thing the page could do. Filtering runs over the full in-memory array,
+not the rendered window, so a filter finds matches at rank 9,000.
+
+Columns: rank · title · experience · quality · hours · taste match (the number here) · FPM ·
+owned/hours · price/discount · why. Column sorts are client-side over returned fields, including
+`experienceFpm` for "shortest to finish" – nulls last, endless games shown as "endless" rather
+than blank, which is the obligation increment 11 §8 shipped the field to satisfy.
+
+### 4.5 The filter bar – and none of it is load-bearing for the gate
+
+It lives inside the collapsed browse section, so it costs the first screenful nothing. Every
+predicate below operates on a field already on the row. No new fetch, no new API parameter.
+
+1. **Search** – title substring, case-insensitive, debounced.
+2. **Ownership tri-state** – all / hide owned / only owned.
+3. **Hide games I've played** – `hoursPlayed > 0`.
+4. **On sale only** – `cut > 0`.
+5. **Minimum discount** – on `cut`.
+6. **Maximum price (AUD)** – on `price`.
+7. **Minimum taste match** – on `similarityNorm`.
+8. **Minimum experience score** – on `experienceScore`.
+9. **Tags** – include only, chips built from `tagNames` across the pool, ranked by frequency.
+   Exclude-tags is cut; nobody has asked for it and it doubles the control.
+10. **Top 100 of all time** – the PRD's named replacement for the Best of Steam tab. Precisely:
+    rows with `reviewPercent >= 95` and `reviewCount >= 10000`, ordered by `reviewCount`
+    descending, first 100 – the existing Best-of rule with the discount gate removed. Computed
+    over the *ranked* pool, so it can return slightly fewer than 100; the label says how many it
+    found rather than claiming 100.
+
+**Filter state persists** across reloads through the existing increment-8 settings lane, under
+one new key holding a JSON blob. `GET /api/settings` returns only what is stored, so an untouched
+store yields an unchanged response and there is no zero-diff breach. Persistence failure is
+silent and never blocks a render.
+
+**The filter bar never touches the picks.** Picks respond to the lens and the two chips, nothing
+else. This is what makes the gate un-poisonable by a stale saved filter, and it gives the page a
+clean division: picks are the answer, browse is the exploration.
+
+### 4.6 The no-library case – the first-run failure this page must not have
+
+`/api/rank` returns `profileAvailable`, `profileGames` and `notice` precisely so this can be
+honest. Three states, three behaviours:
+
+| State | Detected by | What the page does |
+|---|---|---|
+| Library present | `profileAvailable === true` | Normal. The footer notes how many owned games are behind the ranking. |
+| **No Steam credentials configured** | `profileAvailable === false`, `notice === null` | Picks **still render** – the best games on Steam by experience value alone – above a banner: *"No Steam account connected, so these picks are not matched to your taste. They are ranked by experience value alone."* The **More like what I play** button is disabled with that reason on it. |
+| **Credentials present, Steam fetch failed** | `notice !== null` | Renders `notice` verbatim, same treatment. |
+
+The failure mode increment 11's security review caught is a taste-blind ranking that looks
+normal. The page's job is to make that state impossible to mistake for the normal one, while
+still answering the question – a stranger with no credentials is a real first-run case and
+"configure your API key" is not an answer.
+
+### 4.7 Dismissals, wishlist, Deck
+
+**Dismissals – in.** A "Not interested" action on every pick and every browse row, POSTing to the
+existing `/api/dismissals`. The card is removed locally and the next pick slides in without a
+reload. `/api/rank` already excludes dismissed rows server-side, so a reload keeps it gone. The
+retiring Dismissed tab becomes a small **"Dismissed (N)"** link in the footer that lists them
+from `GET /api/dismissals` – which already stores titles – with a restore button per row. No API
+change.
+
+**Wishlist – folded in as a badge, and that closes PRD open question 2.** After the picks paint,
+a non-blocking `GET /api/wishlist` builds a Set of appids and badges matching rows "wishlisted".
+Failure is silent. The tab retires. **What is explicitly NOT done: no wishlist lane, no wishlist
+filter, and no wishlist boost in the ranking** – a boost is a ranking change and ranking is
+frozen this increment. If this threatens the gate at any point in the build it is the first thing
+cut.
+
+**Deck compat – out, and here is the reason.** `resolveDeckCompat` is a live batched `GetItems`
+fetch and is not on `/api/rank`. Surfacing a Deck badge or filter means a new upstream call in the
+page's load path, which is a new failure mode on the one screen whose gate is "it answers when you
+land on it". It buys the gate nothing. Increment 13 or later, when it can ride on a cached
+catalogue column rather than a page-load fetch.
 
 ---
 
-## 7. Low confidence, and the two checked-no-score rows
+## 5. 13,924 rows, 10 MB – what the page does, and what it does not do
 
-Ruling 2 makes suppression optional. **The call: suppress, default ON, one WHERE clause,
-with an owned exemption, and a settings key to turn it off.**
+**Pagination and `?limit=` do not land here. Increment 13 owns this.** The honest arithmetic:
+`/api/rank` costs ~0.9 s warm and ~30 s cold, and that cost is dominated by an 18,306-row D1 read
+plus a live Steam fetch, not by serialising the response. Wiring `limit` would shrink the payload
+and save perhaps a few hundred milliseconds of transfer and parse; it would not touch the 30 s.
+The real fix is caching the user-independent catalogue computation (`src/catalog.js:493`), which
+is already scoped as increment 13.
 
-```
-suppressed = experience_confidence = 'low'
-             AND (positive + negative) < 1000
-             AND source_owned = 0          -- owned games are never suppressed
-```
+**So the page does three things instead:**
 
-**Why suppress at all.** Under the `default` preset this is close to a no-op – low-confidence
-rows are overwhelmingly obscure and score low anyway. It becomes genuinely load-bearing under
-the `similarity` preset, where `wS` rises to 0.6 and an obscure game with a perfect tag match
-and a bluffed score is exactly the row that surfaces. Increment 12 puts this in front of
-strangers; a bluffed score on the front page is the one failure this product cannot absorb.
+1. **One fetch, held in memory.** All rows, filtered and sorted client-side. Filters are then
+   instant, which is worth more than a smaller first payload.
+2. **An honest loading state.** Not a spinner: *"Reading 18,306 games…"*, replaced by the picks
+   the moment the payload lands. First load after a `wrangler dev` restart says so.
+3. **Renders 100 rows, not 13,924.** §4.4.
 
-**Why owned games are exempt, and this is not a nicety.** Suppression exists for exactly one
-purpose: to stop a bluffed score reaching a stranger's front page as a *purchase*
-recommendation. **An owned game is never that case** – James already bought it, so the only
-question left is whether to play it, and a shaky one-line score is not a reason to hide a game
-sitting in his own library from a list whose entire job is "what do I play next".
+**Gate 6 measures warm first paint rather than assuming it.** Target under 3 seconds. If it
+misses, the **single pre-authorised `src/` change in this increment** is wiring `?limit=` for a
+fast picks call with the full list fetched behind it – and it comes back to James before the line
+is written, because it breaches §3's "does not touch `src/`" boundary.
 
-Measured against live D1: **552 owned games are scored, and 11 of them would be suppressed
-without this clause** – *Sol Cesto* (exp 66, 879 reviews), *Abalon: Roguelike Tactics CCG*
-(63), *Archons* (62), *Galactic Glitch* (58), *Necroking* (57) among them. Those are real play
-candidates. Hiding them contradicts James's reason 1 directly, so the exemption is a
-requirement, not a tuning choice. Gate 5 asserts it rather than trusting it.
-
-Settings key `suppressLowConfidence` (boolean, default true) is upserted through the existing
-increment-8 settings lane. `GET /api/settings` returns only what is stored, so an untouched
-store yields an unchanged response – no zero-diff breach. **The owned exemption is not behind
-the key:** it holds whether suppression is on or off.
-
-**The 2 checked-no-score rows are excluded from ranking** – no headline number means no rank –
-and appear in the funnel by name. Never a silent drop.
+**The drive script runs against a warm server** – James loads the page once before the stranger
+sits down. Stated here rather than discovered at the gate: cold start is increment 13's problem
+and this gate is not a test of it.
 
 ---
 
-## 8. Endless games – confirmed, and what is owed
+## 6. How the old tabs retire, and the zero-diff boundary
 
-**4,822 endless rows (26%) stay in the headline ranking and sink on their merits.**
-`experience_score` is defined for them and correctly brutal: EVE Online 4, Rocket League 25,
-CS:GO 14, AdVenture Capitalist 4. They are excluded only from the FPM secondary sort, by
-construction, where `hasEnding = 0` yields NULL.
+**The UI retires. The routes do not. These are two decisions and only the first happens here.**
 
-This confirms Slice 0 binding consequence 2 – *multiplayer is effectively out of the headline
-ranking* – **accepted by James 2026-08-28**. No change, no repair, no special lane.
+| Thing | This increment | When |
+|---|---|---|
+| The six tabs in `public/index.html` | **Deleted.** The file is rewritten. | Now |
+| `/api/fpm`, `/api/recs`, `/api/deals`, `/api/best-of`, `/api/wishlist`, `/api/library` | **Untouched, still serving, still tested.** | Increment 13 cleanup |
+| Their exhaustive key-set tests | **Untouched.** | With the routes |
+| `public/filters.js`, `public/weight.js` and their tests | **Untouched**, orphaned but passing | With the routes |
 
-**What the API owes them, and it is the whole obligation this increment carries:** every row
-returns `hasEnding` and `experienceFpm: null` explicitly, so increment 12 can render an
-honest badge ("endless – no ending, so no per-hour figure") rather than a blank cell. Shipping
-the field is this increment. Shipping the badge is increment 12.
+**Why the routes survive a round.** Deleting six handlers and their key-set tests in the same
+increment that rewrites the entire front end doubles the diff and removes the safety net at
+exactly the moment the new page is being built against the same data. It also means that if the
+new page is wrong about a field, the old page is still there to compare against. `/api/wishlist`
+is not even a retirement candidate this round – the badge in §4.7 consumes it.
 
-### The funnel – every subtraction named
+**Orphaned `public/filters.js` is a conscious decision, not an oversight.** Its predicates target
+the old sale-lane row shapes (deck mode, battery, quality floors) which do not exist on
+`/api/rank` rows. Rewriting it means rewriting its tests, which turns a UI increment into a test
+refactor. New module, old one left alone, both deleted together at 13.
 
-Printed on the response and in the review folder. Figures marked *confirm* are recomputed at
-build; they must add up exactly.
+**Framework: none. Ruled consciously under Rev 2's UX direction clause.** The page is a list of
+cards and a table over an array. A framework adds a build step to a project that has none, and
+§2 explains why a CDN tag is not available to us either.
 
-| Step | Rows |
-|---|--:|
-| `fpm_catalog` total | 18,306 |
-| less non-game / unclassified `app_type` | ~87 *confirm* |
-| less checked-no-score | 2 |
-| less `rank_exclude_reason` (prologues) | ~108 *confirm* |
-| less dismissed | *confirm* |
-| less low-confidence suppressed (**owned exempt – 11 rows spared**) | *confirm* |
-| **= ranked** | *confirm* |
-| of which owned | 552 *confirm* |
-| of which endless (ranked, `experienceFpm` null) | 4,822 *confirm* |
-| of which tagless (ranked, `S = 0`) | *confirm* |
-| of which priced (the sale toggle can move them) | 1,727 *confirm*, **of which owned: 1** |
+### The zero-diff boundary
 
----
+**Deliberately changed:** `public/index.html` (full rewrite), `public/rankFilters.js` (new) and
+its tests, one test-harness file for the port-8788 fix.
 
-## 9. Out of scope – hard
+`scripts/backup-catalog.mjs` was listed here in an earlier draft and **is not work for this
+increment**. The tool exists, it is `tools/backup-catalog.mjs` (plus `tools/restore-catalog.mjs`),
+and it shipped in `a4167bd` – the same commit gate 7's zero-diff check measures against. §10b.3
+already says so; this table did not, and gate 7 is scored off this table.
 
-- **All UI.** `public/index.html` is not touched. Increment 12.
-- **Retiring the old tabs or lanes.** `/api/fpm`, `/api/recs`, `/api/deals`, `/api/best-of`,
-  `/api/wishlist` all keep working exactly as they do. Increment 12.
-- **Changing sourcing in `/api/recs` and `/api/deals`.** See open question 1 – this is a
-  deliberate, flagged deviation from the PRD paragraph's letter, still awaiting James's call.
-- **HLTB edition-suffix normalisation. Explicitly deferred, and here is the reason.** The
-  PRD offered "here or at increment 9". Ruling 5 removed HLTB hours from every new metric, so
-  normalising *Divinity: Original Sin 2 – Definitive Edition* now improves exactly one number:
-  the FPM of a lane that dies at increment 12. It buys the headline ranking nothing. Reopen at
-  increment 13 only if a real consumer appears.
-- **Any re-fill of the 18,219 LLM-scored rows.** Nothing in this spec triggers one. If a
-  proposal during the build would, the recommendation is against it and it comes back to
-  James before a row is written.
-- **Any change to `src/profile.js` or the taste-vector machinery.** §4.3 – it is the
-  recommendation engine and it is out of bounds this round.
-- Price coverage for the ~16,600 priceless rows, and caching the whole-catalogue read
-  (`src/catalog.js:493`). Increment 13. This route reads the catalogue per request, same as
-  `handleFpm` already does; the row-read count is recorded as gate 8 input, not fixed here.
-- Wishlist folding, the "all-time greats on deep sale" alert, and dismissal changes.
-  Increment 12.
-- Retuning the `experience_score` rubric, or any change to `game_score`, `has_ending`,
-  `hours_to_value`, `hours_to_good`. Increment 10.5's §2 reasoning stands.
-- Table rename `fpm_catalog` -> `game_catalog`.
+**Must stay byte-identical vs `a4167bd`:**
 
----
-
-## 10. The zero-diff boundary
-
-**Deliberately changed:** `/api/rank` (new), `fpm_catalog` (+2 columns), `src/settings.js`
-consumers (+1 optional key), the derived FPM formula (no API surface).
-
-**Must stay byte-identical against `faff639`**, proven by golden-response tests in the same
-style increments 7.8 through 10.5 used:
-
-| Lane | Why it must not move |
+| Surface | Proof |
 |---|---|
-| `/api/fpm` | Legacy lane, retires at 12. Nothing here consumes the new columns. |
-| `/api/recs` | Sourcing unchanged – see open question 1. |
-| `/api/deals` | Untouched. |
-| `/api/best-of` | Untouched. |
-| `/api/wishlist` | Untouched. |
-| `/api/library` | Untouched. |
-| `/api/fpm/sync` + `/sync/status` | The exclusion fill runs outside the sync pipeline precisely so this stays still. |
-| `/api/settings`, `/api/dismissals` | Shape unchanged; a new key only appears once written. |
+| Everything in `src/` – all nine routes | `git diff a4167bd -- src/` is empty. One command, one second. |
+| `public/filters.js`, `public/weight.js` | Same diff check |
+| Every existing lane's key-set test, including `/api/rank`'s | Untouched files, suite green |
 
-**How it is tested — amended 2026-09-03 to describe what was actually built (round-2 review,
-TC-9).** No golden-response fixtures were recorded. The original wording promised responses
-"captured at `faff639` and compared byte-for-byte", and the repo does not keep that promise, so
-the promise is withdrawn rather than left standing.
+That is a stronger claim than increment 11 could make and it is checkable in a second, which is
+the point.
 
-What the zero-diff claim actually rests on, and why it is sufficient:
+**Suite:** stays at **757 passing or more, 0 skipped, provably offline-clean**, plus new coverage
+for `rankFilters.js` (each predicate, and the two owned/played predicates proven distinct on the
+0-hour case). The port fix must not reduce the count – if it removes the branching test, a
+deterministic one replaces it.
 
-1. **The handlers were not edited.** `git diff faff639 -- src/worker.js` has zero deletions
-   inside the six lane handlers and the shared catalogue read. A golden fixture proves a
-   response did not move; an empty deletion set proves the code that builds it did not move,
-   which is the stronger statement and the one a reviewer can check in a second.
-2. **Each of the six lanes already carries an exhaustive `Object.keys(entry).sort()` deepEqual**
-   against its pre-increment-10 key set. Any field added to a lane's SELECT and passed through
-   its response builder fails one of those first.
-3. **`test/helpers/laneShape.mjs` walks every lane body** and fails on any key matching the
-   increment-10, 10.5 or 11 column patterns at any depth, so a nested leak is named rather than
-   only diffed.
-
-`/api/rank` gets its own exhaustive key-set assertion, top level and per row, so its shape is
-pinned from day one for increment 12.
-
-**Suite constraint:** stays at 695+ passing, 0 skipped, provably offline-clean. Nothing in
-this spec needs a network call in a test. New coverage:
-
-1. The prologue classifier fixture – positives *Black Book: Prologue*, *Not For Broadcast:
-   Prologue*; negatives *HYPER DEMON*, *Book of Demons*, *Democratic Socialism Simulator*.
-2. Both normalisers, and the blend at all three presets.
-3. `wSale = 0` proving arithmetic identity with `base`.
-4. Leave-one-out on an owned candidate, **plus a test that every OTHER owned game still
-   contributes in full to that candidate's profile** – the guard on James's reason 2.
-5. **A `source_owned = 1`, `low`-confidence, sub-1,000-review row surviving suppression with
-   the settings key both on and off** – the guard on James's reason 1.
-6. `experienceFpm` NULL for `has_ending` 0 and for `has_ending` NULL.
-7. Tagless rows scoring `S = 0` rather than being dropped.
-8. The funnel summing exactly to the catalogue row count.
+**The port-8788 bug is fixed here.** Running `npm test` while a `claude-bridge` listens on 8788
+turns the suite red at 756/757, because a test probes the real port and branches on the answer.
+Increment 12 is the increment where the app gets driven live, repeatedly, on James's own machine
+with whatever else he has running – a red suite at the diff gate costs more to explain than the
+fix costs to make. Fix: stub the health probe or bind an ephemeral port. `test/` only.
 
 ---
 
-## 11. Gates
+## 7. Out of scope – hard, and where I refused
+
+Every deferred idea in this project will try to land on this page. These are the refusals, each
+with its reason.
+
+1. **The "all-time greats on deep sale" alert strip** (PRD open question 6). **Refused.** It is a
+   second attention-competing surface at the top of the one page whose gate is "one answer,
+   nothing touched" – the exact "squished ideas" failure Rev 3 exists to fix. The top-100-of-all-
+   time filter (§4.5) covers the browsing need now. Revisit once the gate has passed and we know
+   what the page feels like.
+2. **Marking a game played, finished, or scoring it** – increment **12.5**, already ruled a
+   separate increment in the PRD. Not folded in. "Finished" is not synthesised from playtime.
+3. **Any ranking change.** Weights, presets, normalisers, the `experience_score` /`game_score`
+   overlap James flagged, the rubric, `hasEnding`, `hoursToValue`. All frozen. The overlap is
+   parked for a tuning pass and this is not it.
+4. **A wishlist lane, filter or ranking boost.** Badge only – §4.7.
+5. **Deck badge and Deck filter.** §4.7 – it needs an upstream fetch that is not on `/api/rank`.
+6. **Deleting the six retiring routes and their tests.** §6 – increment 13.
+7. **Pagination, `?limit=`, and catalogue caching.** §5 – increment 13, with one stated lever.
+8. **The name change.** The PRD parks it "until the answer page exists". It exists at the *end*
+   of this increment, so the decision belongs to the next one, with the page in hand.
+9. **A JS framework or any new dependency.** §2, §6.
+10. **Mobile layout.** Readable at laptop width. Responsive polish is not a gate item and nobody
+    is opening this on a phone at localhost.
+11. **Any change to `src/`, `src/profile.js`, or the taste vector.** §3.
+12. **Hosting, auth, Steam OpenID.** The deploy epic. §1 says what "stranger" means without it.
+13. **Any re-fill of the 18,219 LLM-scored rows.** Nothing here triggers one. If something in the
+    build would, it stops and reports.
+14. **HLTB edition-suffix normalisation, price coverage for the ~16,600 priceless rows, the
+    `fpm_catalog` → `game_catalog` rename.** Still parked, still increment 13 or later.
+
+---
+
+## 8. Gates
 
 | # | Gate | Pass condition |
 |--:|---|---|
-| 1 | Migration + self-healing exclusion fill | Additive ALTER for both columns; `ensureRankExclusions` is idempotent – second call is a no-op; kill and restart `wrangler dev` loses nothing |
-| 2 | **Prologue list ruled before it is written** | `01-prologue-exclusions.md` in the review folder, build stopped, James's allowlist applied. All three negative controls survive. |
-| 3 | **Normaliser chosen by measurement** | `02-normalisation-probe.md` shows the cosine distribution and the top 20 under percentile and min-max side by side. James picks; the pick is a named constant, not a buried default. |
-| 4 | **The toggles visibly move the order** | Against `default`, each of `sale` and `similarity` changes **at least 20 of the top 50**, and pulls **at least one row up by 100+ ranks**. If `sale` cannot clear this over the 1,727 priced rows, `wSale` is the lever and the value is set at the gate. |
-| 5 | Funnel adds up; suppression measured; **owned never suppressed** | §8's table computed live, every line summing exactly to 18,306; top 50 rendered with suppression on and off. **Hard assertion: zero `source_owned = 1` rows appear in the suppressed set, and all 552 scored owned games are present in the ranked pool.** The 11 spared games are listed by name in the artifact as proof, not asserted. |
-| 6 | Ruling 3 held | Default sort is `experience_score`. *Portal* is #1 of the ranked set under `default`. FPM is reachable only via `?sort=fpm`. |
-| 7 | Zero-diff | The eight surfaces in §10 byte-identical vs `faff639` |
-| 8 | Tests + cost | Full suite green, 695+ passing, 0 skipped, offline-clean; `/api/rank` has an exhaustive key-set assertion; D1 row-reads per `/api/rank` call recorded for increment 13 |
+| 0 | **Catalogue backup** | **ALREADY DONE - commit `a4167bd`, 2026-09-04, before this spec was written.** Not work for this increment. `npm run backup` writes `backups/catalog.sql.gz` (3.2 MB, tracked in git so a copy lives off this machine); `npm run restore` refuses without `--force` and verifies every count against a header the dump carries. The round trip was exercised, not assumed: restored into a throwaway database and compared by SHA-256 across all 18,306 rows on appid, experience_score, game_score, has_ending, hours_to_value, experience_reason, tags and rank_exclude_reason - identical. See `backups/README.md`. |
+| 1 | **Layout and copy ruled before a page is built** | `01-page-layout-and-copy.md` in the review folder: a wireframe of the landing state, the pick-card anatomy, the **exact on-screen copy for every fixed string**, and the three first-run states. **The build stops for James's ruling.** The words on this page are as load-bearing as the layout, and neither should be discovered at the gate. |
+| 2 | **The landing state answers, with nothing touched** | `http://localhost:8787/` with no query string and no clicks renders five picks under `default`, each carrying every slot in §4.1's table. The landing preset is a named constant with a unit test asserting it is `default`. `sale` is unreachable without a click. |
+| 3 | **The no-library case is honest** | With `STEAM_API_KEY`/`STEAM_ID` unset: picks still render, the "not matched to your taste" banner shows, the similarity lens is disabled with its reason visible. With credentials set and Steam failing: `notice` rendered verbatim. All three states captured in `03-first-run-states.md`. |
+| 4 | **The lenses move, and the browser computes no rank** | Each lens button re-fetches with `?preset=` and the picks change. `public/` contains no blend arithmetic – reviewer-checkable by grep. The two chips behave distinctly on the worked example in §4.3, both named games shown. |
+| 5 | **Browse and filters – nothing lost** | The browse section opens one click below the picks. Every filter in §4.5 works over the full pool, with before/after counts per filter in the artifact. Top-100-of-all-time returns the Best-of rule's set and labels its real size. Filter state survives a reload. **The picks are provably unaffected by any filter.** |
+| 6 | **Performance, measured not asserted** | Warm first paint of the picks recorded; target under 3 s. Cold time recorded and attributed to increment 13. Payload size recorded. If warm misses, `?limit=` is **proposed to James, not taken**. |
+| 7 | **Zero diff** | `git diff a4167bd -- src/` is empty. `public/filters.js` and `public/weight.js` unchanged. All nine routes' key-set tests untouched and green. |
+| 8 | **Suite and hermeticity** | Full suite green, ≥757 passing, 0 skipped, offline-clean – **and green with a `claude-bridge` listening on 8788**, proven by running it both ways and showing both counts. |
+| 9 | **The stranger drive** | The 10-minute script (§9) run twice: once by James, once by someone who has never seen the app. Pass: the stranger names a game they would play, and says roughly why the page picked it, **before touching any control**. Their words recorded verbatim, including anything they got wrong. |
 
 ---
 
-## 12. Open questions – each with a recommendation
+## 9. The 10-minute drive script
 
-1. **RULED 2026-09-03: leave them alone.** James: *"leave it alone, as we could filter out
-   easily on the frontend I think"* - the owned/unowned split becomes a frontend filter at
-   increment 12, which is a second reason on top of the one below. Closed, not open.
+Written into `02-drive-script.md` before either run, and both runs recorded in it.
 
-   ~~**Do `/api/recs` and `/api/deals` get their sourcing changed?**~~ The PRD paragraph names
-   them. **Recommend: no – deviate deliberately.** The owned-games unlock is what matters, and
-   the new lane delivers it by sourcing from `fpm_catalog`, where owned games already live.
-   Both named lanes retire at increment 12, so rewriting their sourcing is work thrown away
-   three weeks later, on top of two zero-diff surfaces we would then lose. **Still open –
-   James has not ruled.**
-2. **Preset weights (0.70/0.30, 0.40/0.60, `wSale` 0.50).** *Recommend as written.* They are
-   overridable by query param, so gate 4 tunes them with the real top 50 in front of you
-   rather than on paper.
-3. **Normaliser.** *Recommend percentile rank*, because min-max cannot guarantee gate 4 if
-   the cosines compress. Settled by the gate-3 artifact, not by this recommendation.
-4. **Low-confidence suppression default.** *Recommend ON at under 1,000 reviews, with owned
-   games exempt*, per §7. The exemption is now a requirement from James's 2026-09-02 ruling,
-   not an option; only the default-on state of the key itself is still a choice.
-5. **Route name `/api/rank`.** *Recommend it.* `/api/next` reads better as a product name but
-   the route is a ranking API that increment 12 consumes, and the product name is parked in
-   the PRD anyway.
+| # | Step | What it tests |
+|--:|---|---|
+| 1 | Open `localhost:8787`. Say nothing. Ask: *what is this page for, and which of these would you play?* | **The gate.** No control touched. |
+| 2 | Ask why they think it picked the first one. | Whether the reason lines and the basis sentence do their job. |
+| 3 | Click **Worth buying**. Which would you buy? | The sale lens, and that it is reachable but not the landing state. |
+| 4 | Click **More like what I play**. | The third lens. |
+| 5 | Tick **Hide games I own**. What changed? | The chip James asked for, and whether the change is legible. |
+| 6 | Open **Browse all**. Find a game under $10 at 75% off or better. | Filter bar, and the old Deals tab's job. |
+| 7 | Tick **Top 100 of all time**. | The Best of Steam tab's replacement. |
+| 8 | Dismiss one game. Reload. | Dismissals persist – the old Dismissed tab's job. |
+| 9 | Search a game they know by name. | Search, and whether the numbers on that row read as sane to someone who knows the game. |
+| 10 | Ask: *would you use this?* | The thing no assertion encodes. |
+
+Steps 6 to 9 are the "nothing lost" check against the retiring tabs. Step 1 is the gate; the
+other nine are the increment.
 
 ---
 
-## 12b. Gate rulings – James, 2026-09-03, after the two pre-build checkpoints
+## 10. Open questions – each with a recommendation
 
-These close the checkpoints. They override the spec text above where they conflict.
+1. **Five picks.** *Recommend five*, per §4.1's reasoning. Settled at checkpoint 01 with the
+   wireframe in front of you – three and eight are both one number change.
+2. **The three lens labels.** *Recommend "Play next" / "Worth buying" / "More like what I play".*
+   Ruled at checkpoint 01 along with the rest of the copy.
+3. **Word bands instead of a taste-match percentage on the picks.** *Recommend as written* – the
+   number means two different things under two different normalisers, and the browse table
+   carries the raw number for when you want it.
+4. **The wishlist badge.** *Recommend in, badge only, non-blocking.* It closes PRD open question 2
+   at near-zero cost and kills a tab. It is also the first thing cut if the build runs long.
+5. **Does the stranger see your library and playtimes?** *Recommend yes* – it is your machine,
+   you are in the room, and the personalised page is the one the gate is about. The alternative
+   (run the stranger pass with credentials unset) tests the taste-blind page, which is a weaker
+   test of a weaker thing.
+6. **Should the two quick chips persist between sessions?** *Recommend no*, per §4.3 – a
+   persisted filter can poison the landing state, and the landing state is the gate.
+7. ~~**Does the backup script belong in this increment?**~~ **CLOSED - it was built and committed
+   on 2026-09-04 (`a4167bd`) before this spec existed, and the restore was exercised.** The
+   approach differs from what this spec proposed and is stronger: a gzipped SQL dump **tracked in
+   git**, so a copy leaves the machine, rather than a timestamped sqlite copy sitting on the same
+   disk as the thing it protects. No work here.
 
-**1. Low-confidence threshold: under 200 reviews, not under 1,000.** James: *"let's pull
-everything over 200 reviews, we can always suppress later."* §7's "close to a no-op" claim was
-wrong - measured, the 1,000 bar removed **6,812 rows, 37% of the catalogue**. The 200 bar removes
-**4,209** and the ranked pool goes 11,327 to **14,010**. What comes back is not noise: *Desvelado*
-(exp 91), *Re:Fresh* (88), *The Happyhills Homicide 2* (88), *Mr. Rainer's Solve-It Service* (86)
-were all hidden purely for being obscure. The owned exemption is unchanged and still sits outside
-the settings key.
+---
 
-**2. Normaliser: percentile for `default` and `sale`, min-max for `similarity`.** The spec's
-premise for recommending percentile did not survive contact with the data - the cosines do not
-collapse (median 0.147, max 0.625, only 5.9% below 0.05), so both were live options. The ruling
-splits them by what each lens is for. Percentile scores a game by its rank against the pool, so a
-good-but-not-perfect match still earns taste credit and experience leads. Min-max scores it by
-distance from the single best match, so only near-perfect matches earn credit - which is correct
-when the user has explicitly asked for "more like what I play", and wrong as a default, where it
-put deckbuilders at exp 76-81 above *Portal 2* at 96.
+## 11. Constraints
 
-`sale` takes `default`'s normaliser because it shares its base weights; letting the sale toggle
-also swap the normaliser would change two things at once and make gate 4's movement measurement
-meaningless.
+1. **Local-only** (`wrangler dev`, port 8787). No deploy, nothing bound beyond loopback.
+   Authentication does not exist; `/api/rank` returns the owner's library and playtimes. Auth is a
+   precondition for any deploy and that is the deploy epic, not this.
+2. **No ranking changes.** Frozen, §7 item 3.
+3. **Nothing that requires re-filling the 18,219 LLM-scored rows.**
+4. Suite stays ≥757 passing, 0 skipped, provably offline-clean – and hermetic with respect to
+   port 8788 by the end.
+5. **No new dependency, no bundler, no CDN.** §2.
+6. Fail-soft everywhere: a missing `FPM_DB`, absent credentials, a failed Steam fetch or a failed
+   settings write degrades the page to an honest state, never a blank screen and never a lie.
+7. Claude Design remains available as design input per Rev 2. Optional – checkpoint 01 is a
+   markdown wireframe plus a copy deck either way, so the loop stays self-contained.
+8. Append **"use context7"** on any task touching a third-party library API.
+9. **En dashes, never em dashes**, in every artifact.
+10. Stop before commit. An explicit in-session "commit"/"push" from James is sufficient
+    authorisation; never initiate one.
 
-**3. `KINGDOM HEARTS HD 2.8 Final Chapter Prologue` is spared**, via an explicit
-`RANK_EXCLUDE_ALLOWLIST`, so the rule stays `/\bprologue\b/i` and the exception stays visible.
-It is a paid retail game whose title merely ends in the word, and §6 anticipated exactly this
-case as one found by eye rather than by rule.
+---
 
-**4. Gate 6's wording is corrected.** "Portal at #1 of the ranked set" is unachievable and always
-was: at `wS = 0.3` the similarity term genuinely moves things, which is the toggle working.
-*Portal* is **1st of 18,219 on `experience_score` alone** and lands **10th under
-`default`/percentile**. The gate now reads: *Portal* is 1st on `experience_score`, and inside the
-top 10 under `default`.
+## 10b. Rulings – James, 2026-09-04, at scoping
+
+These override the spec text above where they conflict.
+
+**1. TEN picks, not five.** §4.1 argued for five on the grounds that they fit above the fold
+with every reason line readable. James chose ten. **Consequence, stated rather than
+discovered:** ten cards each carrying a reason line will not fit one laptop screen, so the
+landing state now involves scrolling. That does not breach the gate - scrolling is not touching
+a control - but the "one screenful" argument in §4.1 no longer holds and should not be quoted as
+though it does. The card design should be tightened accordingly: ten tall cards is a list, and
+the thing that keeps ten reading as an answer is that each card stays scannable. Make the count
+a named constant so it is one number to change at the checkpoint.
+
+**2. The stranger sees the real library and playtimes.** Open question 5, recommended and
+accepted. It is James's machine and he is in the room. The personalised page is the one the gate
+is about; running the pass with credentials unset would test the taste-blind fallback, which is
+a weaker test of a weaker thing. The no-library states in §4.6 still get built and still get
+verified - just not by the stranger pass.
+
+**3. Gate 0 is closed before this increment starts.** The catalogue backup and its exercised
+restore shipped in `a4167bd` on 2026-09-04, before this spec was written. See §8 and open
+question 7.
+
+---
+
+## 10c. Copy rulings – James, 2026-09-05, at the layout checkpoint
+
+**1. Taste match comes OFF the pick cards.** Measured on the real top ten under `default`:
+six read "Strong" and four read "Very strong". Across the top 60 it is 36 / 23 / 1. It cannot
+be otherwise - the top of the list **is** the best-matching set, so the slot repeats itself and
+reads as filler while looking like information. The raw `similarityNorm` stays in the browse
+table, where the full 0-to-1 range is visible and a column of numbers is what the reader is
+there for. The thresholds were NOT moved to manufacture variety, which would have been the
+dishonest fix. Frees a line on a card §10b already requires to stay scannable.
+
+**2. The Steam-down banner gets a plain sentence first, with the verbatim `notice` beneath it
+as technical detail.** §4.6 said render `notice` verbatim and `src/` is frozen, so the string
+cannot be rewritten at source - but it says "taste profile", "similarity is 0" and "lens",
+three phrases a first-time reader has never met. Gate 3 still finds the exact string on the
+page, so nothing is hidden; it is just no longer the first thing a stranger reads.
+
+**3. Loading copy is "Reading the game catalogue…" with no count.** The spec's
+"Reading 18,306 games…" needs a number that only arrives with the payload, so it would have to
+be hardcoded and would drift at the next crawl.
+
+**4. Four copy corrections the Coder raised, all accepted.**
+- The basis sentence is rewritten in a reader's words. "Complete experience per hour" is this
+  project's vocabulary, not a stranger's.
+- "About 9 hours" becomes "About 9 hours to finish", so it cannot be misread as playtime.
+- "Endless - no ending, so no per-hour figure" drops the second clause; it explains arithmetic
+  the reader never saw.
+- "No price on file" is rewritten without "on file", which describes our filing system rather
+  than the game. **This string renders on roughly 16,600 of 18,306 rows**, so it is the most
+  frequently read sentence on the site after the reason lines.
+
+**5. The footer numbers in §4.1 were illustrative and are wrong.** The real funnel is
+4,186 low-confidence / 109 prologues / 85 non-game / 2 unscored, summing exactly to 13,924 of
+18,306. The footer generates from `funnel` and suppresses any zero row.
 
 ---
 
 ## ⛩ REVIEW
 
-**Gate TLDR:** one ranked list over all 18,219 catalogued games answers "what do I play next"
-with owned and unowned side by side – *Portal* at the top, no prologues in it, all 552 owned
-games present including the 11 low-confidence ones, endless games sunk on their merits – and
-both the sale and similarity toggles visibly reorder the top 50.
+**Gate TLDR:** someone who has never seen this app opens `localhost:8787`, touches nothing, and
+can name a game they would play tonight and say roughly why the page picked it – and the same
+page, with no Steam library behind it, says so plainly instead of quietly serving taste-blind
+picks that look normal.
 
 **Output (what James holds while reviewing):**
 
-1. `01-prologue-exclusions.md` – every title matched by `\bprologue\b`, the three negative
-   controls, and the near-misses. **Opened before any row is written; the build stops here.**
-2. `02-normalisation-probe.md` – the IDF-cosine distribution across the pool, and the top 20
-   under percentile vs min-max side by side. **Opened before the blend is finalised; the build
-   stops here too.**
-3. `03-top50-default.md` – the answer, and the "what do I play next" lens. Experience,
-   quality, hours, similarity, FPM, owned flag, price and the why-line, per row.
-4. `04-top50-sale.md` – the "what do I buy" lens, with `wSale = 0.5`. Expect owned games to
-   fall; §4.2 says why, and that is the point of showing both.
-5. `05-top50-similarity.md` – the same run with `wS = 0.6`.
-6. `06-toggle-movement.md` – rows changed and biggest climbers between each preset and
-   `default`, measured against gate 4's numbers. **The gate artifact.**
-7. `07-funnel-and-suppression.md` – §8's table computed live and summing to 18,306, the top 50
-   with low-confidence suppression off for comparison, **the 11 owned low-confidence games
-   named and shown present in the ranked pool**, and D1 row-reads per request.
+1. `01-page-layout-and-copy.md` – the wireframe, the pick-card anatomy, and the exact on-screen
+   copy for every fixed string. **Pre-build checkpoint: opened before a line of the page is
+   written, and the build stops here for your ruling.**
+2. **The running page at `http://localhost:8787/`** – the landing state, nothing touched. Five
+   picks, the lens strip, the footer.
+3. `02-drive-script.md` – the 10-minute script, with both runs written into it: yours, and the
+   stranger's, verbatim including whatever they got wrong. **The gate artifact.**
+4. `03-first-run-states.md` – the three first-run states side by side: library present, no
+   credentials, Steam down.
+5. `04-lens-and-chips.md` – the five picks under each of the three lenses, and the worked
+   owned/played example naming the 0-hour game that survives one chip and not the other.
+6. `05-browse-and-filters.md` – the browse list, each filter's before/after row count, and the
+   top-100-of-all-time set with its real size.
+7. `06-performance-and-diff.md` – warm and cold first-paint timings, payload size, and the empty
+   `git diff a4167bd -- src/`.
+8. `07-catalogue-backup.md` – where the backup lives, its size, and the restore that was actually
+   run.
 
-Items 1 and 2 are pre-build checkpoints. Per review protocol Rule 3 the Coder writes them into
-the review folder as part of the work and halts – James is never asked to review from a chat
-message, a scratchpad or a code block.
+Item 1 is a pre-build checkpoint. Per review protocol Rule 3 the Coder writes it into the review
+folder as part of the work and halts – James is never asked to review from a chat message, a
+scratchpad or a code block.
 
-**Review folder:** `~/code/review/steam-sale-scout/inc-11/`
-**Index:** `/AI/projects/personal-projects/steam-sale-scout/reviews/inc-11.md`
+**Review folder:** `~/code/review/steam-sale-scout/inc-12/`
+**Index:** `/AI/projects/personal-projects/steam-sale-scout/reviews/inc-12.md`
 
-**Decision this gate needs:** approve the ranking as the product's headline and unblock
-increment 12's answer page, or send the weights back for another pass.
-
----
-
-## 13. Constraints
-
-1. Local-only (`wrangler dev`). No deploy.
-2. D1 for durable data, KV for cheap short-TTL. No new storage shapes.
-3. **Nothing that requires re-filling the 18,219 rows.** Nothing here does; if the build finds
-   something that would, it stops and reports rather than running it.
-4. Suite stays 695+ passing, 0 skipped, provably offline-clean, exhaustive key sets per lane.
-5. Fail-soft everywhere: a missing `FPM_DB`, an empty library or a failed Steam fetch degrades
-   `/api/rank` to an honest response, never a 500.
-6. Append **"use context7"** on any task touching a third-party library API.
-7. **En dashes, never em dashes**, in every artifact.
-8. Stop before commit. An explicit in-session "commit"/"push" from James is sufficient
-   authorization; never initiate one.
+**Decision this gate needs:** the answer page becomes the product's front door and the old tabs
+are gone for good – or the picks section goes back for another pass before the routes are deleted
+at increment 13.

@@ -1,2184 +1,904 @@
 <!doctype html>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Steam Sale Scout</title>
+<title>What should I play next?</title>
+
+<!--
+  Steam Sale Scout – the answer page (Increment 12).
+
+  ONE SCREEN THAT ANSWERS "what should I play next" BEFORE ANYONE TOUCHES
+  ANYTHING ON IT. The gate this file exists for, verbatim from SPEC.md §1:
+  a stranger can land on the front page and get a usable answer without
+  touching a single control.
+
+  WHAT REPLACED WHAT. The six tabs (Deals / Recs / Best of Steam / Library /
+  Wishlist / FPM) are gone from the UI. Their ROUTES are untouched and still
+  tested – SPEC.md §6 deletes the UI this increment and the handlers at 13,
+  so that if this page is wrong about a field the old one is still there to
+  compare against.
+
+  THREE RULES THIS FILE OBEYS, ALL REVIEWER-CHECKABLE:
+    1. THE BROWSER NEVER COMPUTES A RANK (SPEC.md §4.2). There is no blend
+       arithmetic anywhere under public/. Lens changes re-FETCH with
+       ?preset=. Sorting the browse table on a returned field is
+       presentation and is allowed; recomputing rankScore is not.
+    2. NO FRAMEWORK, NO BUNDLER, NO CDN (SPEC.md §2, §6). One static file
+       plus one ESM module, both served from ./public by the Worker's assets
+       binding. The suite is provably offline-clean and the app must run with
+       the network down.
+    3. EVERY FIXED STRING WAS RULED BY JAMES at checkpoint 01 before this
+       markup existed (SPEC.md §10c). The strings live in rankFilters.js with
+       tests, not inline here, so a ruling cannot drift silently.
+-->
+
 <style>
+  :root {
+    --ink: #1a1a1a;
+    --muted: #666;
+    --line: #e0e0e0;
+    --accent: #2a6df5;
+    --surface: #f4f4f4;
+  }
+  * { box-sizing: border-box; }
   body {
     font-family: system-ui, sans-serif;
     max-width: 900px;
-    margin: 2rem auto;
+    margin: 2rem auto 4rem;
     padding: 0 1rem;
-    color: #1a1a1a;
+    color: var(--ink);
+    line-height: 1.45;
   }
-  h1 { margin-bottom: 0.25rem; }
-  .subtitle { color: #666; margin-top: 0; }
-  .controls {
-    display: flex;
-    align-items: center;
-    gap: 1.5rem;
-    flex-wrap: wrap;
-    margin: 1rem 0;
-    padding: 0.75rem;
-    background: #f4f4f4;
-    border-radius: 6px;
-  }
-  .controls label { display: flex; align-items: center; gap: 0.4rem; }
-  .controls input[type="number"] { width: 4rem; }
-  .totals { margin: 0.75rem 0; color: #333; font-size: 0.95rem; }
-  table { border-collapse: collapse; width: 100%; }
-  th, td { text-align: left; padding: 0.35rem 0.5rem; border-bottom: 1px solid #e0e0e0; }
-  th { position: sticky; top: 0; background: #fff; cursor: default; }
-  img.icon { width: 32px; height: 32px; vertical-align: middle; }
-  .weight-bar-track {
-    background: #e0e0e0;
-    border-radius: 3px;
-    height: 14px;
-    width: 160px;
-    overflow: hidden;
-  }
-  .weight-bar-fill {
-    background: #2a6df5;
-    height: 100%;
-  }
-  .status { color: #666; font-style: italic; }
-  .error {
-    color: #900;
-    background: #fdeaea;
-    border: 1px solid #f0b8b8;
-    padding: 0.75rem;
-    border-radius: 6px;
-  }
-  button { cursor: pointer; }
-  .tabs {
-    display: flex;
-    gap: 0.5rem;
-    margin: 1rem 0 0;
-    border-bottom: 1px solid #ddd;
-  }
-  .tab-btn {
-    background: none;
-    border: none;
-    padding: 0.5rem 1rem;
-    font-size: 1rem;
-    color: #666;
-    border-bottom: 2px solid transparent;
-  }
-  .tab-btn[aria-selected="true"] {
-    color: #1a1a1a;
-    font-weight: 600;
-    border-bottom-color: #2a6df5;
-  }
-  .tab-panel { margin-top: 1rem; }
-  s.regular-price { color: #999; }
-  .badge {
-    display: inline-block;
-    padding: 0.1rem 0.45rem;
-    border-radius: 3px;
-    font-size: 0.8rem;
-    font-weight: 600;
-  }
-  .badge-cut { background: #2a6df5; color: #fff; }
-  .badge-low { background: #1a8a3c; color: #fff; margin-left: 0.4rem; }
-  .badge-owned { background: #6b5a1f; color: #fff; }
-  .progress-track {
-    background: #e0e0e0;
-    border-radius: 4px;
-    height: 10px;
-    width: 100%;
-    max-width: 320px;
-    overflow: hidden;
-  }
-  .progress-fill { background: #2a6df5; height: 100%; }
-  .progress-label { color: #666; font-size: 0.85rem; margin-top: 0.25rem; }
-  .why-line { color: #444; font-size: 0.85rem; }
-  .filter-bar {
-    display: flex;
-    flex-direction: column;
-    gap: 0.6rem;
-    margin: 1rem 0 0;
-    padding: 0.75rem;
-    background: #eef2fb;
-    border: 1px solid #d6dff2;
-    border-radius: 6px;
-  }
-  .filter-bar .filter-row {
-    display: flex;
-    align-items: center;
-    gap: 1.25rem;
-    flex-wrap: wrap;
-  }
-  .filter-bar label { display: flex; align-items: center; gap: 0.35rem; }
-  .filter-bar input[type="number"] { width: 4.5rem; }
-  .filter-hint { color: #667; font-size: 0.8rem; }
-  .chip-list { display: flex; flex-wrap: wrap; gap: 0.35rem; }
-  .chip {
-    border: 1px solid #ccc;
+  h1 { margin: 0 0 0.35rem; font-size: 2rem; }
+  .basis { color: var(--muted); margin: 0 0 1.25rem; max-width: 62ch; }
+
+  /* ---- The lens strip (SPEC.md §4.2) ---- */
+  .lenses { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+  .lens {
     background: #fff;
+    border: 1px solid var(--line);
     border-radius: 999px;
-    padding: 0.15rem 0.65rem;
-    font-size: 0.82rem;
+    padding: 0.4rem 1rem;
+    font-size: 0.95rem;
+    color: var(--ink);
     cursor: pointer;
   }
-  .chip.include { background: #2a6df5; border-color: #2a6df5; color: #fff; }
-  .chip.exclude { background: #c0392b; border-color: #c0392b; color: #fff; text-decoration: line-through; }
-  .reset-btn { margin-left: auto; }
-  .badge-deck-verified { background: #1a8a3c; color: #fff; }
-  .badge-deck-playable { background: #b7860b; color: #fff; }
-  .badge-battery { background: #2f7d6b; color: #fff; margin-left: 0.3rem; cursor: help; }
-  .wishlist-section {
-    margin-bottom: 1.25rem;
-    padding: 0.75rem;
-    background: #fbf7ec;
-    border: 1px solid #ecdfb8;
-    border-radius: 6px;
+  .lens[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  .lens[disabled] { opacity: 0.45; cursor: not-allowed; }
+  .lens-subline { color: var(--muted); font-size: 0.9rem; margin: 0.5rem 0 0; min-height: 1.3em; }
+
+  /* ---- The two quick chips (SPEC.md §4.3) ---- */
+  .chips { display: flex; gap: 1.25rem; flex-wrap: wrap; margin: 0.75rem 0 1.5rem; font-size: 0.95rem; }
+  .chips label { display: flex; align-items: center; gap: 0.4rem; cursor: pointer; }
+
+  /* ---- The picks. TEN cards, each exactly three text lines. ---- */
+  .pick {
+    display: grid;
+    grid-template-columns: 2.1rem 1fr;
+    gap: 0 0.6rem;
+    padding: 0.85rem 0;
+    border-bottom: 1px solid var(--line);
   }
-  .wishlist-section summary {
-    cursor: pointer;
-    font-weight: 600;
-    color: #6b5a1f;
+  .pick-n { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 1.05rem; padding-top: 0.05rem; }
+  .pick-head { display: flex; justify-content: space-between; align-items: baseline; gap: 1rem; }
+  .pick-title { font-size: 1.05rem; font-weight: 600; text-decoration: none; color: var(--ink); }
+  .pick-title:hover { color: var(--accent); text-decoration: underline; }
+  .pick-status { color: var(--muted); font-size: 0.9rem; white-space: nowrap; text-align: right; }
+  .pick-why { margin: 0.15rem 0 0.2rem; }
+  .pick-facts { color: var(--muted); font-size: 0.88rem; display: flex; justify-content: space-between; gap: 1rem; align-items: baseline; }
+  .pick-actions { display: flex; gap: 0.75rem; white-space: nowrap; }
+  .pick-actions a, .pick-actions button {
+    font-size: 0.85rem; color: var(--accent); background: none; border: none; padding: 0; cursor: pointer; text-decoration: none;
   }
-  .wishlist-section table { margin-top: 0.5rem; }
-  .settings-panel {
-    margin: 0.75rem 0 0;
-    padding: 0.5rem 0.75rem;
-    background: #f4f4f4;
-    border-radius: 6px;
+  .pick-actions a:hover, .pick-actions button:hover { text-decoration: underline; }
+  .mark {
+    display: inline-block; font-size: 0.75rem; padding: 0.05rem 0.4rem; border-radius: 3px;
+    background: var(--surface); color: #555; margin-left: 0.4rem; cursor: help;
   }
-  .settings-panel summary { cursor: pointer; font-weight: 600; color: #444; }
-  .settings-panel .filter-row { margin-top: 0.5rem; }
-  .dismiss-btn {
-    background: none;
-    border: 1px solid #ccc;
-    border-radius: 3px;
-    color: #900;
-    font-size: 0.8rem;
-    line-height: 1;
-    padding: 0.15rem 0.4rem;
+  .mark-wish { background: #e8f0fe; color: #1a4fb4; cursor: default; }
+
+  /* ---- Banners, notices, states ---- */
+  .banner {
+    background: #fff8e1; border: 1px solid #e6cf7a; border-radius: 6px;
+    padding: 0.85rem 1rem; margin: 0 0 1.25rem;
   }
-  .dismiss-btn:hover { background: #fdeaea; border-color: #f0b8b8; }
+  .banner p { margin: 0; font-weight: 600; }
+  .banner .verbatim { margin: 0.5rem 0 0; font-weight: 400; font-size: 0.85rem; color: #6b5a1f; }
+  .status { color: var(--muted); font-style: italic; padding: 1rem 0; }
+  .error { color: #900; background: #fdeaea; border: 1px solid #f0b8b8; padding: 0.75rem; border-radius: 6px; }
+  .error p { margin: 0; }
+  .error .verbatim { margin: 0.5rem 0 0; font-size: 0.85rem; color: #7a3a3a; }
+  .toast { color: var(--muted); font-size: 0.9rem; padding: 0.5rem 0; }
+  .toast button { background: none; border: none; color: var(--accent); cursor: pointer; padding: 0; font-size: 0.9rem; }
+
+  .more { display: block; margin: 1.25rem auto; padding: 0.5rem 1.25rem; background: #fff; border: 1px solid var(--line); border-radius: 6px; font-size: 0.95rem; cursor: pointer; }
+  /* `display: block` above beats the UA stylesheet's `[hidden] { display: none }`,
+     so `.hidden = true` on these two buttons did nothing and an EMPTY PILL was
+     left on screen - most visibly under the error box, where the page has
+     nothing to show. Found while capturing the database-down state; not on the
+     review list. */
+  .more[hidden] { display: none; }
+
+  /* ---- Browse, one click below (SPEC.md §4.4, §4.5) ---- */
+  details.browse { border-top: 1px solid var(--line); padding-top: 1rem; margin-top: 1.5rem; }
+  details.browse > summary { cursor: pointer; font-weight: 600; }
+  .filters {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+    gap: 0.6rem 1.25rem; background: var(--surface); border-radius: 6px; padding: 0.9rem; margin: 1rem 0;
+    font-size: 0.9rem;
+  }
+  .filters label { display: flex; flex-direction: column; gap: 0.2rem; }
+  .filters .inline { flex-direction: row; align-items: center; gap: 0.4rem; }
+  .tagchips { display: flex; flex-wrap: wrap; gap: 0.35rem; grid-column: 1 / -1; }
+  .tagchip { border: 1px solid var(--line); background: #fff; border-radius: 999px; padding: 0.15rem 0.6rem; font-size: 0.8rem; cursor: pointer; }
+  .tagchip[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .browse-count { color: var(--muted); font-size: 0.9rem; margin: 0.5rem 0; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.85rem; }
+  th, td { text-align: left; padding: 0.3rem 0.45rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { position: sticky; top: 0; background: #fff; cursor: pointer; white-space: nowrap; }
+  th[aria-sort] { color: var(--accent); }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  td.why { color: var(--muted); max-width: 26ch; }
+
+  /* ---- The honest footer (SPEC.md §4.1.7) ---- */
+  footer { margin-top: 2.5rem; border-top: 1px solid var(--line); padding-top: 1rem; color: var(--muted); font-size: 0.88rem; }
+  footer ul { margin: 0.5rem 0 0; padding-left: 1.1rem; }
+  footer summary { cursor: pointer; }
+  .dismissed-list { margin-top: 0.6rem; }
+  .dismissed-list li { margin-bottom: 0.2rem; }
 </style>
 
-<h1>Steam Sale Scout</h1>
-<p class="subtitle">Your library, ranked by what you actually play (hours × recency).</p>
+<h1>What should I play next?</h1>
+<p class="basis" id="basis"></p>
 
-<nav class="tabs">
-  <button type="button" class="tab-btn" data-tab="library" aria-selected="true">Library</button>
-  <button type="button" class="tab-btn" data-tab="deals" aria-selected="false">Deals</button>
-  <button type="button" class="tab-btn" data-tab="recs" aria-selected="false">Recs</button>
-  <button type="button" class="tab-btn" data-tab="hof" aria-selected="false">Best of Steam</button>
-  <button type="button" class="tab-btn" data-tab="fpm" aria-selected="false">Fun per minute</button>
-  <button type="button" class="tab-btn" data-tab="dismissed" aria-selected="false">Dismissed <span id="dismissed-count-badge"></span></button>
-</nav>
+<div id="banner-slot"></div>
+<div id="crash"></div>
 
-<!--
-  Settings panel (Increment 8): the one PRD-promised user setting (recency
-  window) gets its own small, always-reachable control here, separate from
-  the per-tab windowMonths inputs on Library/Recs (#window-months/
-  #recs-window-months) which keep working exactly as before — all three stay
-  in sync via the shared `windowMonths` in-memory value below. Everything
-  here now persists to D1 (GET/PUT /api/settings), not localStorage — see
-  the script's `persistedSettings` bootstrap.
--->
-<details id="settings-panel" class="settings-panel">
-  <summary>Settings</summary>
-  <div class="filter-row">
-    <label>
-      Recency window (months):
-      <input type="number" id="settings-window-months" min="1" step="1" />
-    </label>
-    <span class="filter-hint">How far back "recently played" looks, for Library weighting and Recs scoring.</span>
-  </div>
-</details>
+<div class="lenses" id="lenses"></div>
+<p class="lens-subline" id="lens-subline"></p>
 
-<!--
-  Filter bar (Increment 5; min-discount retired from a server param to a
-  client-side filter in Increment 5.5). One shared bar, applied to the sale
-  tabs (Deals, Recs, Best of Steam) — not Library, which is owned games with
-  no price/deal/tags in the same shape (see public/filters.js's header
-  FLAGGED note). Every field here, including Min discount, is a client-side
-  filter applied to whatever the active tab already fetched, via
-  public/filters.js's applyFilters() — none of them re-fetch. Deals/Recs
-  still send a fixed server minCut for SOURCING (see DEALS_SOURCING_MIN_CUT
-  in the script below); Best-of no longer sends minCut at all (its own
-  sourcing floor is a server-side config, not a query param — see SPEC.md §1).
--->
-<div id="filter-bar" class="filter-bar" hidden>
-  <div class="filter-row">
-    <label>
-      Min discount (%):
-      <input type="number" id="filter-min-discount" min="0" max="100" step="1" placeholder="any" />
-    </label>
-    <span id="filter-min-discount-hint" class="filter-hint"></span>
-    <label>
-      Max price (AUD):
-      <input type="number" id="filter-max-price" min="0" step="1" placeholder="any" />
-    </label>
-    <label>
-      Min similarity (%) <span class="filter-hint">(Recs only)</span>:
-      <input type="number" id="filter-min-similarity" min="0" max="100" step="1" placeholder="any" />
-    </label>
-    <button id="filter-reset-btn" class="reset-btn" type="button">Reset filters</button>
-  </div>
-  <div class="filter-row">
-    <label>
-      Steam Deck:
-      <select id="filter-deck-mode">
-        <option value="any">Any</option>
-        <option value="verified">Verified only</option>
-        <option value="verified+playable">Verified + Playable</option>
-      </select>
-    </label>
-    <label title="Tag-based estimate — no measured battery-life data exists for these games.">
-      <input type="checkbox" id="filter-battery-only" />
-      🔋 Battery friendly only
-    </label>
-    <label>
-      Min reviews <span class="filter-hint">(Recs + Best-of only)</span>:
-      <input type="number" id="filter-min-reviews" min="0" step="1" placeholder="default: 50" />
-    </label>
-    <label>
-      Min quality (%) <span class="filter-hint">(Recs + Best-of only)</span>:
-      <input type="number" id="filter-min-quality" min="0" max="100" step="1" placeholder="default: 70" />
-    </label>
-    <label>
-      Min owners <span class="filter-hint">(Recs + Best-of only)</span>:
-      <input type="number" id="filter-min-owners" min="0" step="1" placeholder="default: 5000" />
-    </label>
-  </div>
-  <div class="filter-row">
-    <span>Genre/tags (click to include, click again to exclude, once more to clear):</span>
-  </div>
-  <div class="filter-row">
-    <div id="filter-tag-chips" class="chip-list"></div>
-  </div>
-  <div class="filter-row">
-    <label>
-      Add tag filter:
-      <input type="text" id="filter-tag-search" list="filter-tag-datalist" placeholder="type a tag name" />
-    </label>
-    <datalist id="filter-tag-datalist"></datalist>
-    <select id="filter-tag-search-mode">
-      <option value="include">Include</option>
-      <option value="exclude">Exclude</option>
-    </select>
-    <button id="filter-tag-search-add" type="button">Add</button>
-  </div>
+<div class="chips">
+  <label><input type="checkbox" id="chip-owned" /> Hide games I own</label>
+  <label><input type="checkbox" id="chip-played" /> Hide games I've played</label>
 </div>
 
-<section id="tab-library" class="tab-panel">
-  <div class="controls">
-    <label>
-      Recency window (months):
-      <input type="number" id="window-months" min="1" step="1" />
-    </label>
-    <label>
-      <input type="checkbox" id="sort-hours" />
-      Sort by raw hours instead of weight
-    </label>
-    <button id="refresh-btn" type="button">Refresh from Steam</button>
-  </div>
+<div id="picks"></div>
+<div id="toast"></div>
+<button class="more" id="show-more" hidden></button>
 
-  <div id="status" class="status">Loading…</div>
-  <div id="totals" class="totals"></div>
-  <table id="table" hidden>
-    <thead>
-      <tr>
-        <th>#</th>
-        <th></th>
-        <th>Name</th>
-        <th>Hours</th>
-        <th>Last played</th>
-        <th>Weight</th>
-      </tr>
-    </thead>
-    <tbody id="table-body"></tbody>
-  </table>
-</section>
+<details class="browse" id="browse">
+  <summary id="browse-summary">Browse all games</summary>
 
-<section id="tab-deals" class="tab-panel" hidden>
-  <div class="controls">
-    <label>
-      Sort by:
-      <select id="deals-sort">
-        <option value="cut">% off</option>
-        <option value="price">Price</option>
-        <option value="title">Title</option>
+  <div class="filters" id="filters">
+    <label>Search by name
+      <input type="search" id="f-search" placeholder="Type a game name…" />
+    </label>
+    <label>Ownership
+      <select id="f-ownership">
+        <option value="all">All games</option>
+        <option value="hide">Hide games I own</option>
+        <option value="only">Only games I own</option>
       </select>
     </label>
-    <button id="deals-refresh-btn" type="button">Refresh from ITAD</button>
-  </div>
-
-  <div id="deals-status" class="status">Loading…</div>
-  <div id="deals-totals" class="totals"></div>
-  <table id="deals-table" hidden>
-    <thead>
-      <tr>
-        <th>Name</th>
-        <th>Price (AUD)</th>
-        <th>Regular</th>
-        <th>% off</th>
-        <th>Deck</th>
-        <th>Battery</th>
-        <th>Store</th>
-        <th></th>
-      </tr>
-    </thead>
-    <tbody id="deals-table-body"></tbody>
-  </table>
-</section>
-
-<section id="tab-recs" class="tab-panel" hidden>
-  <!--
-    Wishlist lane (Increment 6): top-billed, above Recs (PRD placement).
-    Explicit intent (wishlist membership) beats similarity, so it gets its
-    own collapsible section and its own table — no Similarity column, since
-    src/wishlist.js's ranking doesn't use taste scoring at all. Fail-soft:
-    #wishlist-section stays hidden and #wishlist-notice shows instead
-    whenever /api/wishlist comes back unavailable or the fetch throws (see
-    loadWishlist() below) — the rest of the Recs tab must keep working.
-  -->
-  <div id="wishlist-notice" class="status" hidden>Wishlist unavailable</div>
-  <details id="wishlist-section" class="wishlist-section" open hidden>
-    <summary>Wishlist bargains <span id="wishlist-count-badge"></span></summary>
-    <div id="wishlist-status" class="status">Loading…</div>
-    <div id="wishlist-totals" class="totals" hidden></div>
-    <div id="wishlist-empty" class="status" hidden>Nothing on your wishlist is on sale today.</div>
-    <table id="wishlist-table" hidden>
-      <thead>
-        <tr>
-          <th>Name</th>
-          <th>Price (AUD)</th>
-          <th>Regular</th>
-          <th>% off</th>
-          <th>Deck</th>
-          <th>Battery</th>
-          <th>Why</th>
-          <th>Store</th>
-        </tr>
-      </thead>
-      <tbody id="wishlist-table-body"></tbody>
-    </table>
-  </details>
-
-  <div class="controls">
-    <label>
-      Recency window (months):
-      <input type="number" id="recs-window-months" min="1" step="1" />
-    </label>
-    <button id="recs-refresh-btn" type="button">Refresh library + deals</button>
-  </div>
-
-  <div id="recs-status" class="status">Loading…</div>
-  <div id="recs-progress-wrap" hidden>
-    <div class="progress-track">
-      <div id="recs-progress-fill" class="progress-fill" style="width: 0%"></div>
-    </div>
-    <div id="recs-progress-label" class="progress-label"></div>
-  </div>
-  <div id="recs-totals" class="totals"></div>
-  <table id="recs-table" hidden>
-    <thead>
-      <tr>
-        <th>Name</th>
-        <th>Similarity</th>
-        <th>Price (AUD)</th>
-        <th>Regular</th>
-        <th>% off</th>
-        <th>Reviews</th>
-        <th>Deck</th>
-        <th>Battery</th>
-        <th>Why</th>
-        <th>Store</th>
-        <th></th>
-      </tr>
-    </thead>
-    <tbody id="recs-table-body"></tbody>
-  </table>
-</section>
-
-<section id="tab-hof" class="tab-panel" hidden>
-  <div class="controls">
-    <button id="hof-refresh-btn" type="button">Refresh library + deals</button>
-  </div>
-
-  <div id="hof-status" class="status">Loading…</div>
-  <div id="hof-progress-wrap" hidden>
-    <div class="progress-track">
-      <div id="hof-progress-fill" class="progress-fill" style="width: 0%"></div>
-    </div>
-    <div id="hof-progress-label" class="progress-label"></div>
-  </div>
-  <div id="hof-totals" class="totals"></div>
-  <table id="hof-table" hidden>
-    <thead>
-      <tr>
-        <th>Name</th>
-        <th>Price (AUD)</th>
-        <th>Regular</th>
-        <th>% off</th>
-        <th>Reviews</th>
-        <th>Also you?</th>
-        <th>Deck</th>
-        <th>Battery</th>
-        <th>Store</th>
-        <th></th>
-      </tr>
-    </thead>
-    <tbody id="hof-table-body"></tbody>
-  </table>
-</section>
-
-<!--
-  Fun per minute lane (Increment 7, tuned 7.5/7.6, re-sourced from a
-  catalog-wide D1 store in Increment 7.7): Wilson quality ÷ HowLongToBeat
-  main-story hours — surfaces short, excellent games over long good ones.
-
-  Increment 7.7: this is now "every floor-passing Steam game", not just a
-  deal-pool/owned candidate set — filled by an explicit background sync
-  (#fpm-sync-btn -> POST /api/fpm/sync), never sourced automatically on tab
-  open. GET /api/fpm itself is now a fast, static read (no HLTB traffic, no
-  per-request progressive-fill), so the old #fpm-progress-wrap bar is gone —
-  #fpm-sync-status shows the honest "ranked X of Y qualifying games" line,
-  driven by polling GET /api/fpm/sync/status, and that poll stops once a
-  sync finishes (see loadFpm.js's pollFpmSyncStatus below). "Show owned"
-  became a tri-state select (#fpm-owned-mode: all/hide/only) since owned is
-  now a live annotation, not a separate candidate stream — same as "On sale
-  only" (#fpm-on-sale-only), both FPM-tab-local controls, not the shared
-  #filter-bar (only this lane's rows ever carry `owned`/a possibly-null
-  `cut`). Still needs #tab-wishlist-style fail-soft (#fpm-notice) since
-  HowLongToBeat is an unofficial, no-API-key endpoint that can drift or go
-  down without notice during a sync.
--->
-<section id="tab-fpm" class="tab-panel" hidden>
-  <div id="fpm-notice" class="status" hidden>Fun-per-minute unavailable</div>
-
-  <div class="controls">
-    <button id="fpm-sync-btn" type="button">Sync catalog now</button>
-    <button id="fpm-sync-continue-btn" type="button">Sync to completion</button>
-    <button id="fpm-sync-stop-btn" type="button" hidden>Stop sync</button>
-    <button id="fpm-refresh-btn" type="button">Refresh prices/owned</button>
-    <label>
-      Ranking:
-      <select id="fpm-formula">
-        <option value="linear">Linear (quality ÷ hours)</option>
-        <option value="sqrt" selected>Sqrt (default — tapers length penalty)</option>
-        <option value="log">Log (gentlest on long games)</option>
+    <label class="inline"><input type="checkbox" id="f-played" /> Hide games I've played</label>
+    <label class="inline"><input type="checkbox" id="f-sale" /> On sale only</label>
+    <label>At least this much off
+      <select id="f-discount">
+        <option value="0">Any</option><option value="25">25%</option><option value="50">50%</option>
+        <option value="75">75%</option><option value="90">90%</option>
       </select>
     </label>
-    <label>
-      Quality exponent:
-      <input id="fpm-qexp" type="number" min="0" max="10" step="0.5" value="2" />
-    </label>
-    <label>
-      Breadth weight:
-      <input id="fpm-breadth" type="number" min="0" max="5" step="0.5" value="0" />
-    </label>
-    <label>
-      Owned:
-      <select id="fpm-owned-mode">
-        <option value="all" selected>Show all</option>
-        <option value="hide">Hide owned</option>
-        <option value="only">Only owned</option>
+    <label>Under this price (AUD)
+      <select id="f-price">
+        <option value="">Any</option><option value="5">$5</option><option value="10">$10</option>
+        <option value="20">$20</option><option value="50">$50</option>
       </select>
     </label>
-    <label>
-      <input id="fpm-on-sale-only" type="checkbox" />
-      On sale only
+    <label>At least this close to my taste
+      <select id="f-taste">
+        <option value="0">Any</option><option value="0.5">Some</option>
+        <option value="0.75">Strong</option><option value="0.9">Very strong</option>
+      </select>
     </label>
+    <label>Experience value at least
+      <select id="f-experience">
+        <option value="0">Any</option><option value="60">60</option><option value="70">70</option>
+        <option value="80">80</option><option value="90">90</option>
+      </select>
+    </label>
+    <label class="inline"><input type="checkbox" id="f-top100" /> Top 100 of all time</label>
+    <label class="inline"><button type="button" id="f-reset">Clear all filters</button></label>
+    <div class="tagchips" id="f-tags"></div>
   </div>
 
-  <div id="fpm-sync-status" class="status">Not synced yet — click "Sync catalog now".</div>
-  <div id="fpm-status" class="status">Loading…</div>
-  <div id="fpm-totals" class="totals"></div>
-  <div id="fpm-empty" class="status" hidden>No length data yet — try "Sync catalog now".</div>
-  <table id="fpm-table" hidden>
-    <thead>
-      <tr>
-        <th>Name</th>
-        <th>Price (AUD)</th>
-        <th>Regular</th>
-        <th>% off</th>
-        <th>Fun/hr</th>
-        <th title="Relative to the top-ranked game in this view (100 = best)">Score</th>
-        <th>Reviews</th>
-        <th>Main story</th>
-        <th>Deck</th>
-        <th>Battery</th>
-        <th>Store</th>
-        <th></th>
-      </tr>
-    </thead>
-    <tbody id="fpm-table-body"></tbody>
+  <p class="browse-count" id="browse-count"></p>
+  <table id="browse-table">
+    <thead><tr id="browse-head"></tr></thead>
+    <tbody id="browse-body"></tbody>
   </table>
-  <div id="fpm-show-more-wrap" hidden>
-    <button id="fpm-show-more-btn" type="button">Show more</button>
-  </div>
-</section>
+  <button class="more" id="browse-more" hidden>Show 100 more</button>
+</details>
 
-<!--
-  Dismissed (Increment 8) — "Not interested" management view. Dismissals are
-  app-wide across the sale lanes (Deals/Recs/Best of Steam/Fun per minute —
-  never Library or Wishlist), so this lives as its own tab rather than
-  nested inside any one lane (Coder's call — see the handoff notes).
--->
-<section id="tab-dismissed" class="tab-panel" hidden>
-  <div id="dismissed-status" class="status">Loading…</div>
-  <div id="dismissed-totals" class="totals"></div>
-  <div id="dismissed-empty" class="status" hidden>Nothing dismissed yet — click the ✕ on any Deals/Recs/Best of Steam/Fun per minute row to hide it everywhere.</div>
-  <table id="dismissed-table" hidden>
-    <thead>
-      <tr>
-        <th>Name</th>
-        <th>Dismissed</th>
-        <th></th>
-      </tr>
-    </thead>
-    <tbody id="dismissed-table-body"></tbody>
-  </table>
-</section>
+<footer id="footer"></footer>
 
 <script type="module">
-  import { weight } from "./weight.js";
   import {
-    DEFAULT_FILTERS,
-    computeTopTags,
-    computeAllTagNames,
-    applyFilters,
-    passesOnSaleOnly,
-  } from "./filters.js";
+    PICK_COUNT, PICK_STEP, LANDING_PRESET, LENSES, BROWSE_PAGE_SIZE,
+    DEFAULT_RANK_FILTERS, RANK_FILTERS_SETTINGS_KEY, normaliseFilters,
+    OWNERSHIP_ALL, applyRankFilters, selectPicks, selectTop100, computeTopTags,
+    tasteBand, statusLine, lengthLine, experienceLine, tagLine, perHourCell,
+    ownedCell, sortRows, confidenceTitle, steamUrl, basisSentence, formatCount,
+    formatPrice, footerLine, funnelBreakdown, libraryBanner, libraryState,
+    similarityLensEnabled, similarityDisabledReason,
+    LIBRARY_STATE_FETCH_FAILED,
+    isRenderablePayload, unavailableMessage, RANK_UNAVAILABLE_LEAD,
+  } from "./rankFilters.js";
 
-  const DEFAULT_WINDOW_MONTHS = 12;
-
-  // ---------------------------------------------------------------------
-  // Persisted settings (Increment 8) — filter-bar state, the recency
-  // window, and the FPM-tab-local controls now live in D1 (GET/PUT
-  // /api/settings), not localStorage: "no split-brain, the app's state
-  // lives where its catalog lives" (PO decision). `resetFilters`/
-  // `saveFilters`/`loadFilters` (public/filters.js) were the localStorage-
-  // backed versions of this — no longer called from here, but left in
-  // place/exported/tested since they're still valid pure helpers over any
-  // Storage-shaped backend.
-  //
-  // A top-level `await` here (supported natively by `<script type="module">`)
-  // blocks the rest of THIS module's execution until the persisted blob is
-  // back, so every synchronous "what's the starting value" read further
-  // down (windowInput.value=, filters=, applyFilterInputsToUi(), the FPM
-  // control defaults, etc.) sees the real restored state on the very first
-  // render — no flash of defaults then a jump to the real value. Fail-soft:
-  // any fetch/parse failure just leaves this {} and every reader below
-  // falls back to its own default, same merge-over-defaults discipline
-  // loadFilters() used to apply against localStorage.
-  let persistedSettings = {};
-  try {
-    const settingsRes = await fetch("/api/settings");
-    const settingsBody = await settingsRes.json();
-    if (settingsBody && typeof settingsBody.settings === "object" && settingsBody.settings) {
-      persistedSettings = settingsBody.settings;
-    }
-  } catch {
-    // fail soft — defaults apply everywhere below
-  }
-
-  const SETTINGS_SAVE_DEBOUNCE_MS = 500;
-  let settingsSaveTimer = null;
-
-  /** Debounced auto-save (spec: "auto-saved on change") — always sends the
-   * whole current in-memory settings snapshot, which src/settings.js's
-   * PUT upserts key-by-key. Simpler and always-correct vs. tracking exactly
-   * which key changed; fire-and-forget/best-effort (a save failure just
-   * means this change doesn't survive a reload, same session behaviour
-   * either way). References fpmOwnedModeSelect/fpmOnSaleOnlyCheckbox/
-   * fpmFormulaSelect, which are declared further down this script — safe,
-   * since this function's body only runs when actually called (an event),
-   * long after the whole module has finished its first pass. */
-  function scheduleSettingsSave() {
-    if (settingsSaveTimer) clearTimeout(settingsSaveTimer);
-    settingsSaveTimer = setTimeout(async () => {
-      const body = {
-        filters,
-        windowMonths: persistedSettings.windowMonths,
-        fpmOwnedMode: fpmOwnedModeSelect.value,
-        fpmOnSaleOnly: fpmOnSaleOnlyCheckbox.checked,
-        fpmFormula: fpmFormulaSelect.value,
-      };
-      try {
-        await fetch("/api/settings", {
-          method: "PUT",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(body),
-        });
-      } catch {
-        // best-effort — see the note above
-      }
-    }, SETTINGS_SAVE_DEBOUNCE_MS);
-  }
-
-  const statusEl = document.getElementById("status");
-  const totalsEl = document.getElementById("totals");
-  const tableEl = document.getElementById("table");
-  const tableBodyEl = document.getElementById("table-body");
-  const windowInput = document.getElementById("window-months");
-  const sortHoursCheckbox = document.getElementById("sort-hours");
-  const refreshBtn = document.getElementById("refresh-btn");
-  const settingsWindowInput = document.getElementById("settings-window-months");
-
-  let games = [];
-
-  /** In-memory "current recency window" — replaces the old localStorage
-   * read; `persistedSettings.windowMonths` is kept up to date by every
-   * control that changes it (Library tab, Recs tab, and the settings
-   * panel all share this one value). */
-  let windowMonths = persistedSettings.windowMonths > 0 ? persistedSettings.windowMonths : DEFAULT_WINDOW_MONTHS;
-  persistedSettings.windowMonths = windowMonths;
-
-  function loadWindowMonths() {
-    return windowMonths;
-  }
-
-  /** Shared by every recency-window control (Library tab, Recs tab, the
-   * settings panel) — updates the in-memory value, persists it, and keeps
-   * the other two inputs' displayed values in sync. */
-  function setWindowMonths(value) {
-    windowMonths = value;
-    persistedSettings.windowMonths = value;
-    windowInput.value = value;
-    recsWindowInput.value = value;
-    settingsWindowInput.value = value;
-    scheduleSettingsSave();
-  }
-
-  windowInput.value = loadWindowMonths();
-  settingsWindowInput.value = loadWindowMonths();
-
-  function iconUrl(game) {
-    if (!game.img_icon_url) return "";
-    return `https://media.steampowered.com/steamcommunity/public/images/apps/${game.appid}/${game.img_icon_url}.jpg`;
-  }
-
-  function formatHours(game) {
-    return ((game.playtime_forever || 0) / 60).toFixed(1);
-  }
-
-  function formatLastPlayed(game, now = Date.now()) {
-    const rtime = game.rtime_last_played;
-    if (!rtime) return "never";
-    const elapsedMs = now - rtime * 1000;
-    const days = elapsedMs / (24 * 60 * 60 * 1000);
-    if (days < 1) return "today";
-    if (days < 2) return "yesterday";
-    if (days < 30) {
-      const d = Math.round(days);
-      return `${d} day${d === 1 ? "" : "s"} ago`;
-    }
-    const months = Math.round(days / 30.44);
-    if (months < 12) {
-      return `${months} month${months === 1 ? "" : "s"} ago`;
-    }
-    const years = Math.round(months / 12);
-    return `${years} year${years === 1 ? "" : "s"} ago`;
-  }
-
-  function render() {
-    const windowMonths = Number(windowInput.value) || DEFAULT_WINDOW_MONTHS;
-    const sortByHours = sortHoursCheckbox.checked;
-
-    const rows = games.map((game) => ({
-      game,
-      weight: weight(game, windowMonths),
-    }));
-
-    rows.sort((a, b) => {
-      if (sortByHours) {
-        return (b.game.playtime_forever || 0) - (a.game.playtime_forever || 0);
-      }
-      return b.weight - a.weight;
-    });
-
-    const maxWeight = rows.reduce((max, r) => Math.max(max, r.weight), 0) || 1;
-
-    tableBodyEl.innerHTML = "";
-    rows.forEach((row, index) => {
-      const tr = document.createElement("tr");
-
-      const rankTd = document.createElement("td");
-      rankTd.textContent = index + 1;
-      tr.appendChild(rankTd);
-
-      const iconTd = document.createElement("td");
-      const url = iconUrl(row.game);
-      if (url) {
-        const img = document.createElement("img");
-        img.className = "icon";
-        img.src = url;
-        img.alt = "";
-        iconTd.appendChild(img);
-      }
-      tr.appendChild(iconTd);
-
-      const nameTd = document.createElement("td");
-      nameTd.textContent = row.game.name || `App ${row.game.appid}`;
-      tr.appendChild(nameTd);
-
-      const hoursTd = document.createElement("td");
-      hoursTd.textContent = formatHours(row.game);
-      tr.appendChild(hoursTd);
-
-      const lastPlayedTd = document.createElement("td");
-      lastPlayedTd.textContent = formatLastPlayed(row.game);
-      tr.appendChild(lastPlayedTd);
-
-      const weightTd = document.createElement("td");
-      const track = document.createElement("div");
-      track.className = "weight-bar-track";
-      const fill = document.createElement("div");
-      fill.className = "weight-bar-fill";
-      fill.style.width = `${(row.weight / maxWeight) * 100}%`;
-      track.appendChild(fill);
-      weightTd.appendChild(track);
-      tr.appendChild(weightTd);
-
-      tableBodyEl.appendChild(tr);
-    });
-
-    const neverPlayed = games.filter((g) => !g.rtime_last_played).length;
-    totalsEl.textContent = `${games.length} games · ${neverPlayed} never played`;
-
-    tableEl.hidden = false;
-  }
-
-  async function loadLibrary(refresh = false) {
-    statusEl.textContent = "Loading…";
-    statusEl.hidden = false;
-    tableEl.hidden = true;
-    statusEl.className = "status";
-
-    try {
-      const res = await fetch(refresh ? "/api/library?refresh=1" : "/api/library");
-      const body = await res.json();
-      if (!res.ok) {
-        throw new Error(body.error || `Request failed with status ${res.status}`);
-      }
-      games = body.games || [];
-      statusEl.hidden = true;
-      render();
-    } catch (err) {
-      statusEl.textContent = err.message;
-      statusEl.className = "status error";
-    }
-  }
-
-  windowInput.addEventListener("input", () => {
-    const raw = Number(windowInput.value);
-    const value = raw > 0 ? raw : DEFAULT_WINDOW_MONTHS;
-    setWindowMonths(value);
-    render();
-  });
-
-  settingsWindowInput.addEventListener("change", () => {
-    const raw = Number(settingsWindowInput.value);
-    const value = raw > 0 ? raw : DEFAULT_WINDOW_MONTHS;
-    setWindowMonths(value);
-    render();
-    if (recsLoaded) loadRecs(); // settings-panel change re-scores Recs too, same as the Recs tab's own input
-  });
-
-  sortHoursCheckbox.addEventListener("change", render);
-
-  refreshBtn.addEventListener("click", () => loadLibrary(true));
-
-  loadLibrary();
-
-  // --- Tabs ---------------------------------------------------------------
-
-  const tabButtons = document.querySelectorAll(".tab-btn");
-  const tabPanels = {
-    library: document.getElementById("tab-library"),
-    deals: document.getElementById("tab-deals"),
-    recs: document.getElementById("tab-recs"),
-    hof: document.getElementById("tab-hof"),
-    fpm: document.getElementById("tab-fpm"),
-    dismissed: document.getElementById("tab-dismissed"),
+  // -------------------------------------------------------------------------
+  // State. One fetch per lens, held in memory for the session (SPEC.md §5.1):
+  // all rows arrive at once and every filter is then instant, which is worth
+  // more than a smaller first payload. Pagination is increment 13's.
+  // -------------------------------------------------------------------------
+  const state = {
+    preset: LANDING_PRESET,
+    payloads: new Map(),          // preset -> the whole /api/rank response
+    chips: { hideOwned: false, hidePlayed: false },
+    filters: { ...DEFAULT_RANK_FILTERS },
+    picksShown: PICK_COUNT,
+    browseShown: BROWSE_PAGE_SIZE,
+    wishlist: new Set(),          // painted in later, never blocking
+    sort: { key: null, dir: "desc" },
+    lastDismissed: null,
   };
-  let dealsLoaded = false;
-  let recsLoaded = false;
-  let hofLoaded = false;
-  let wishlistLoaded = false;
-  let fpmLoaded = false;
-  let dismissedLoaded = false;
-  let activeTab = "library";
 
-  tabButtons.forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const tab = btn.dataset.tab;
-      activeTab = tab;
-      tabButtons.forEach((b) => b.setAttribute("aria-selected", String(b === btn)));
-      Object.entries(tabPanels).forEach(([name, panel]) => {
-        panel.hidden = name !== tab;
-      });
-      // The filter bar applies to the sale tabs only (Deals/Recs/Best of
-      // Steam) — Library is owned games with no price/deal/tags in the same
-      // shape, so a discount/deck/battery/tag filter has nothing to act on
-      // there (flagged in public/filters.js's header + the handoff notes).
-      // Dismissed (Increment 8) is a management list, not a filterable
-      // candidate pool, so it's exempt too.
-      filterBarEl.hidden = tab === "library" || tab === "dismissed";
-      if (tab === "deals" && !dealsLoaded) {
-        dealsLoaded = true;
-        loadDeals();
-      }
-      if (tab === "recs" && !recsLoaded) {
-        recsLoaded = true;
-        loadRecs();
-      }
-      if (tab === "recs" && !wishlistLoaded) {
-        wishlistLoaded = true;
-        loadWishlist();
-      }
-      if (tab === "hof" && !hofLoaded) {
-        hofLoaded = true;
-        loadHof();
-      }
-      if (tab === "fpm" && !fpmLoaded) {
-        fpmLoaded = true;
-        loadFpm();
-        pollFpmSyncStatus();
-      }
-      if (tab === "dismissed" && !dismissedLoaded) {
-        dismissedLoaded = true;
-        loadDismissed();
-      }
-      renderTagChips(currentTabRawItems());
-      updateMinDiscountHint();
-    });
-  });
+  const $ = (id) => document.getElementById(id);
+  const el = (tag, className, text) => {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    // textContent, NEVER markup: a game title, a tag and an LLM reason line are
+    // all upstream data, and this is the only place text enters the document.
+    // A test greps this whole file for every HTML-parsing sink (SEC-6), so
+    // the rule is pinned rather than merely observed.
+    if (text != null) node.textContent = text;
+    return node;
+  };
 
-  // --- Filter bar (Increment 5; min-discount client-sided in 5.5) ----------
-  // One shared bar (see the HTML comment above #filter-bar) driving
-  // public/filters.js's pure predicates. `filters` is the persisted state;
-  // every input below (including Min discount, as of 5.5) updates it, saves
-  // it, and re-renders whichever sale tab is currently active — cheap, since
-  // filtering runs client-side over data already fetched. Nothing in this
-  // bar re-fetches; Deals/Recs sourcing uses its own fixed server minCut
-  // (DEALS_SOURCING_MIN_CUT, below), untouched by this bar.
+  const payload = () => state.payloads.get(state.preset);
+  const rows = () => payload()?.rank ?? [];
 
-  const filterBarEl = document.getElementById("filter-bar");
-  const filterMinDiscountInput = document.getElementById("filter-min-discount");
-  const filterMinDiscountHintEl = document.getElementById("filter-min-discount-hint");
-  const filterMaxPriceInput = document.getElementById("filter-max-price");
-  const filterMinSimilarityInput = document.getElementById("filter-min-similarity");
-  const filterDeckModeSelect = document.getElementById("filter-deck-mode");
-  const filterBatteryOnlyCheckbox = document.getElementById("filter-battery-only");
-  const filterMinReviewsInput = document.getElementById("filter-min-reviews");
-  const filterMinQualityInput = document.getElementById("filter-min-quality");
-  const filterMinOwnersInput = document.getElementById("filter-min-owners");
-  const filterResetBtn = document.getElementById("filter-reset-btn");
-  const filterTagChipsEl = document.getElementById("filter-tag-chips");
-  const filterTagDatalistEl = document.getElementById("filter-tag-datalist");
-  const filterTagSearchInput = document.getElementById("filter-tag-search");
-  const filterTagSearchModeSelect = document.getElementById("filter-tag-search-mode");
-  const filterTagSearchAddBtn = document.getElementById("filter-tag-search-add");
-
-  let filters = { ...DEFAULT_FILTERS, ...(persistedSettings.filters && typeof persistedSettings.filters === "object" ? persistedSettings.filters : {}) };
-
-  function persistFilters() {
-    scheduleSettingsSave();
+  // -------------------------------------------------------------------------
+  // Loading. §10c.3: "Reading the game catalogue…" with NO count – the number
+  // only arrives with the payload, so printing one during the load would mean
+  // hardcoding a constant that drifts at the next crawl.
+  // -------------------------------------------------------------------------
+  let slowTimer = null;
+  function showLoading() {
+    const node = el("p", "status", "Reading the game catalogue…");
+    $("picks").replaceChildren(node);
+    clearTimeout(slowTimer);
+    slowTimer = setTimeout(() => {
+      // Cold start is ~30s and is increment 13's problem (SPEC.md §5). Saying
+      // so beats a spinner that implies something is wrong.
+      node.textContent = "Reading the game catalogue… the first load after a server restart can take up to 30 seconds.";
+    }, 5000);
   }
 
-  function applyFilterInputsToUi() {
-    filterMinDiscountInput.value = filters.minDiscount || "";
-    filterMaxPriceInput.value = filters.maxPrice ?? "";
-    filterMinSimilarityInput.value = filters.minSimilarity || "";
-    filterDeckModeSelect.value = filters.deckMode;
-    filterBatteryOnlyCheckbox.checked = filters.batteryOnly;
-    filterMinReviewsInput.value = filters.minReviews ?? "";
-    filterMinQualityInput.value = filters.minQuality != null ? Math.round(filters.minQuality * 100) : "";
-    filterMinOwnersInput.value = filters.minOwners ?? "";
-  }
-  applyFilterInputsToUi();
-
-  /** The raw (unfiltered) items currently loaded for whichever tab is
-   * active — feeds both the chip list (candidate-pool tag frequencies) and
-   * rerenderActiveTab (re-applies filters without a server round-trip). */
-  function currentTabRawItems() {
-    if (activeTab === "deals") return deals;
-    if (activeTab === "recs") return lastRecsBody?.recs || [];
-    if (activeTab === "hof") return lastHofBody?.hof || [];
-    if (activeTab === "fpm") return lastFpmBody?.fpm || [];
-    return [];
+  /** Thrown when /api/rank answered, honestly, that it has no answer. It
+   * carries the server's own words so the page can print them instead of
+   * guessing at a cause. */
+  class RankUnavailable extends Error {
+    constructor(payload) {
+      super("rank unavailable");
+      this.detail = unavailableMessage(payload);
+    }
   }
 
-  function rerenderActiveTab() {
-    if (activeTab === "deals" && dealsLoaded) renderDeals();
-    if (activeTab === "recs" && recsLoaded && lastRecsBody) renderRecs(lastRecsBody);
-    if (activeTab === "recs" && wishlistAvailable && lastWishlistBody) renderWishlist(lastWishlistBody);
-    if (activeTab === "hof" && hofLoaded && lastHofBody) renderHof(lastHofBody);
-    if (activeTab === "fpm" && fpmAvailable && lastFpmBody) renderFpm(lastFpmBody);
-  }
-
-  function chipState(tagName) {
-    if (filters.includeTags.includes(tagName)) return "include";
-    if (filters.excludeTags.includes(tagName)) return "exclude";
-    return "neutral";
-  }
-
-  /** Clicking a chip cycles neutral -> include -> exclude -> neutral. */
-  function cycleTag(tagName) {
-    const state = chipState(tagName);
-    filters.includeTags = filters.includeTags.filter((t) => t !== tagName);
-    filters.excludeTags = filters.excludeTags.filter((t) => t !== tagName);
-    if (state === "neutral") filters.includeTags.push(tagName);
-    else if (state === "include") filters.excludeTags.push(tagName);
-    persistFilters();
-    renderTagChips(currentTabRawItems());
-    rerenderActiveTab();
-  }
-
-  function renderTagChips(items) {
-    const top = computeTopTags(items);
-    // Keep any already-active include/exclude tag visible as a chip even if
-    // it falls outside the current top-~30, so it stays clickable to clear.
-    const extra = [...filters.includeTags, ...filters.excludeTags].filter((t) => !top.includes(t));
-    const allChipTags = [...top, ...extra];
-
-    filterTagChipsEl.innerHTML = "";
-    allChipTags.forEach((tagName) => {
-      const btn = document.createElement("button");
-      btn.type = "button";
-      const state = chipState(tagName);
-      btn.className = state === "neutral" ? "chip" : `chip ${state}`;
-      btn.textContent = tagName;
-      btn.addEventListener("click", () => cycleTag(tagName));
-      filterTagChipsEl.appendChild(btn);
-    });
-
-    filterTagDatalistEl.innerHTML = "";
-    computeAllTagNames(items).forEach((name) => {
-      const option = document.createElement("option");
-      option.value = name;
-      filterTagDatalistEl.appendChild(option);
-    });
+  async function loadPreset(preset) {
+    if (state.payloads.has(preset)) return;
+    showLoading();
+    const res = await fetch(`/api/rank?preset=${encodeURIComponent(preset)}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const body = await res.json();
+    clearTimeout(slowTimer);
+    // /api/rank FAIL-SOFTS AT HTTP 200 (SEC-2). `res.ok` is true for
+    // `{available:false, notice:"Ranking unavailable"}`, which has no `funnel`
+    // and no `rank`. Storing that as a payload made the render throw on
+    // `p.funnel.ranked` and the boot catch then blamed a cold start – a
+    // database failure reported as a slow start, with a remedy that can never
+    // work. Validate the shape here, once, and let the notice speak.
+    if (!isRenderablePayload(body)) throw new RankUnavailable(body);
+    state.payloads.set(preset, body);
   }
 
   /**
-   * Ride-along B (Increment 8) — root cause investigated and confirmed: the
-   * min-discount bar control is shared across every sale tab, but Deals/Recs
-   * always SOURCE at a fixed server floor (DEALS_SOURCING_MIN_CUT=60, below)
-   * while Best-of sources from a much lower floor (BESTOF_SOURCING_MIN_CUT,
-   * mirroring src/deals.js's BESTOF_MIN_CUT). A bar value below the ACTIVE
-   * tab's sourcing floor is a genuine no-op there — nothing below that floor
-   * was ever fetched, so there's nothing to filter. This is a UI-honesty fix
-   * only (an informational hint), not an engine/sourcing change: it makes
-   * that no-op visible per-tab instead of silently doing nothing.
+   * The honest failure paint. Used by boot and by a lens change, so the two
+   * cannot drift apart. Two shapes, and which one you get is the whole SEC-2
+   * fix:
+   *
+   *   * THE FETCH NEVER LANDED – no response at all. "The server may still be
+   *     starting up" is a fair guess and the cold start really is ~38 s.
+   *   * /api/rank ANSWERED AND SAID IT HAS NO RANKING – a missing FPM_DB or a
+   *     D1 throw, at HTTP 200. Reloading cannot fix that, so it must not be
+   *     suggested. §10c.2's pattern: the plain sentence leads, the server's
+   *     own words follow verbatim as technical detail.
    */
-  function updateMinDiscountHint() {
-    let floor = null;
-    if (activeTab === "deals" || activeTab === "recs") floor = DEALS_SOURCING_MIN_CUT;
-    else if (activeTab === "hof") floor = BESTOF_SOURCING_MIN_CUT;
+  function showFailure(err) {
+    clearTimeout(slowTimer);
+    const box = el("div", "error");
+    if (err instanceof RankUnavailable) {
+      box.append(el("p", null, RANK_UNAVAILABLE_LEAD));
+      box.append(el("p", "verbatim", err.detail));
+    } else {
+      // QA advisory, 2026-09-05. This branch used to claim "the server may
+      // still be starting up" for EVERY non-RankUnavailable error, including
+      // an HTTP 500 - and a 500 means the server answered, so that was the
+      // same lie A2 removed from the database-down path, one rung down. The
+      // page cannot tell a cold start from a crash, so it says only what it
+      // knows and offers the one action that sometimes helps, without
+      // promising it will.
+      box.append(el("p", null, "The page could not read the game catalogue. Reloading may help; if it does not, the server is not answering properly."));
+    }
+    $("picks").replaceChildren(box);
+    $("show-more").hidden = true;
+  }
 
-    if (floor == null) {
-      filterMinDiscountHintEl.textContent = "";
+  // -------------------------------------------------------------------------
+  // Render.
+  // -------------------------------------------------------------------------
+  function renderLenses() {
+    const enabled = similarityLensEnabled(payload());
+    const strip = $("lenses");
+    strip.replaceChildren();
+    for (const lens of LENSES) {
+      const btn = el("button", "lens", lens.label);
+      btn.setAttribute("aria-pressed", String(lens.preset === state.preset));
+      // The similarity lens needs a taste profile to mean anything, so with no
+      // library it is disabled WITH ITS REASON ON IT rather than silently
+      // serving a taste-blind list under a taste-shaped label (SPEC.md §4.6).
+      if (lens.preset === "similarity" && !enabled) {
+        btn.disabled = true;
+        btn.title = similarityDisabledReason(payload());
+      }
+      btn.addEventListener("click", () => selectLens(lens.preset));
+      strip.append(btn);
+      if (lens.preset === "similarity" && !enabled) {
+        strip.append(el("span", "lens-subline", similarityDisabledReason(payload())));
+      }
+    }
+    $("lens-subline").textContent = LENSES.find((l) => l.preset === state.preset)?.subline ?? "";
+  }
+
+  function renderBanner() {
+    const slot = $("banner-slot");
+    slot.replaceChildren();
+    const text = libraryBanner(payload());
+    if (!text) return;
+    const box = el("div", "banner");
+    box.append(el("p", null, text));
+    // §10c.2: the plain sentence leads; the payload's own `notice` follows
+    // VERBATIM as technical detail. src/ is frozen so the notice cannot be
+    // rewritten at source, and it says "taste profile", "similarity is 0" and
+    // "lens" – three phrases a first-time reader has never met. Gate 3 still
+    // finds the exact string on the page.
+    if (libraryState(payload()) === LIBRARY_STATE_FETCH_FAILED) {
+      box.append(el("p", "verbatim", payload().notice));
+    }
+    slot.append(box);
+  }
+
+  /** One pick card. Three text lines, always, so ten of them stay scannable
+   * (SPEC.md §10b.1 – ten cards is a list, and what keeps it reading as an
+   * answer is that each card is the same shape). */
+  function renderPick(row, index) {
+    const card = el("div", "pick");
+    card.append(el("div", "pick-n", String(index + 1)));
+
+    const body = el("div");
+
+    const head = el("div", "pick-head");
+    const link = el("a", "pick-title", row.title);
+    link.href = steamUrl(row.appid);
+    link.target = "_blank";
+    link.rel = "noopener";
+    const titleWrap = el("span");
+    titleWrap.append(link);
+    if (state.wishlist.has(row.appid)) titleWrap.append(el("span", "mark mark-wish", "On your wishlist"));
+    if (row.confidence === "low") {
+      const mark = el("span", "mark", "rough score");
+      mark.title = confidenceTitle(row);
+      titleWrap.append(mark);
+    }
+    head.append(titleWrap, el("span", "pick-status", statusLine(row)));
+    body.append(head);
+
+    // THE MOST LOAD-BEARING STRING ON THE PAGE (SPEC.md §4.1). The LLM's
+    // reason line, verbatim, never truncated, alone on its own full-width
+    // line so nothing competes with it.
+    body.append(el("p", "pick-why", `“${row.why ?? ""}”`));
+
+    // §10c.1: taste match is OFF the card. On the real top ten it read
+    // "Strong" six times and "Very strong" four – the top of the list IS the
+    // best-matching set, so the slot repeated itself while looking like
+    // information. The raw number stays in the browse table.
+    const facts = el("div", "pick-facts");
+    facts.append(el("span", null, [lengthLine(row), experienceLine(row), tagLine(row)].filter(Boolean).join(" · ")));
+
+    const actions = el("div", "pick-actions");
+    const view = el("a", null, "View on Steam");
+    view.href = steamUrl(row.appid);
+    view.target = "_blank";
+    view.rel = "noopener";
+    const dismiss = el("button", null, "Not interested");
+    dismiss.addEventListener("click", () => dismissRow(row));
+    actions.append(view, dismiss);
+    facts.append(actions);
+    body.append(facts);
+
+    card.append(body);
+    return card;
+  }
+
+  function renderPicks() {
+    const picks = selectPicks(rows(), state.chips, state.picksShown);
+    const host = $("picks");
+    host.replaceChildren();
+    if (picks.length === 0) {
+      host.append(el("p", "status", "No picks left with those filters on. Turn one off."));
+      $("show-more").hidden = true;
       return;
     }
-    const current = filters.minDiscount || 0;
-    if (current > 0 && current < floor) {
-      filterMinDiscountHintEl.textContent = `⚠ this tab only sources games ≥${floor}% off — values below ${floor} have no effect here`;
-    } else {
-      filterMinDiscountHintEl.textContent = `(this tab sources ≥${floor}% off)`;
+    picks.forEach((row, i) => host.append(renderPick(row, i)));
+    const total = selectPicks(rows(), state.chips, Infinity).length;
+    const more = $("show-more");
+    more.hidden = picks.length >= total;
+    more.textContent = `Show me ${PICK_STEP} more`;
+  }
+
+  // -------------------------------------------------------------------------
+  // Browse. Filtering runs over the FULL in-memory array; only the RENDERED
+  // WINDOW is capped, so a filter finds a match at rank 9,000 (SPEC.md §4.4).
+  // -------------------------------------------------------------------------
+  const COLUMNS = [
+    { key: null, label: "#", num: true, cell: (r, i) => String(i + 1) },
+    { key: "title", label: "Game", cell: (r) => r.title },
+    { key: "experienceScore", label: "Experience", num: true, cell: (r) => r.experienceScore ?? "–" },
+    { key: "gameScore", label: "Quality", num: true, cell: (r) => r.gameScore ?? "–" },
+    { key: "hoursToValue", label: "Hours", num: true, cell: (r) => r.hoursToValue ?? "–" },
+    { key: "similarityNorm", label: "Taste match", num: true, cell: (r) => `${(r.similarityNorm ?? 0).toFixed(2)} ${tasteBand(r.similarityNorm)}` },
+    { key: "experienceFpm", label: "Per hour", num: true, cell: (r) => perHourCell(r) },
+    // CR-4 / TC-4: this used to be `statusLine(r).replace("In your library – ", "")`
+    // – string surgery that hard-coded another module's separator. `ownedCell`
+    // and `statusLine` now share one `playedFragment`, and a test asserts the
+    // composition, so re-ruling the separator cannot silently make this column
+    // print the whole sentence.
+    { key: "owned", label: "Yours", cell: (r) => ownedCell(r) },
+    { key: "price", label: "Price", cell: (r) => (r.owned ? "" : r.price == null ? "–" : `${formatPrice(r.price)}${r.cut > 0 ? ` (-${Math.round(r.cut)}%)` : ""}`) },
+    { key: null, label: "Why", cell: (r) => r.why ?? "", why: true },
+  ];
+
+  function renderBrowse() {
+    const all = rows();
+    // The comparator itself lives in rankFilters.js and is tested in both
+    // directions (CR-3 / TC-3). §4.4's "nulls sort LAST in both directions so
+    // an endless game is never mistaken for a zero" is a named obligation, and
+    // it was unasserted while it sat in this file.
+    const filtered = sortRows(applyRankFilters(all, state.filters), state.sort);
+
+    const head = $("browse-head");
+    head.replaceChildren();
+    for (const col of COLUMNS) {
+      const th = el("th", col.num ? "num" : null, col.label);
+      if (col.key) {
+        if (state.sort.key === col.key) th.setAttribute("aria-sort", state.sort.dir === "asc" ? "ascending" : "descending");
+        th.addEventListener("click", () => {
+          state.sort = state.sort.key === col.key
+            ? { key: col.key, dir: state.sort.dir === "desc" ? "asc" : "desc" }
+            : { key: col.key, dir: "desc" };
+          renderBrowse();
+        });
+      } else {
+        th.style.cursor = "default";
+      }
+      head.append(th);
+    }
+
+    const body = $("browse-body");
+    body.replaceChildren();
+    if (filtered.length === 0) {
+      const tr = el("tr");
+      const td = el("td", null, "No games match those filters.");
+      td.colSpan = COLUMNS.length;
+      tr.append(td);
+      body.append(tr);
+    }
+    filtered.slice(0, state.browseShown).forEach((row, i) => {
+      const tr = el("tr");
+      for (const col of COLUMNS) {
+        const td = el("td", [col.num ? "num" : null, col.why ? "why" : null].filter(Boolean).join(" "));
+        if (col.label === "Game") {
+          const a = el("a", null, row.title);
+          a.href = steamUrl(row.appid);
+          a.target = "_blank";
+          a.rel = "noopener";
+          td.append(a);
+          if (row.confidence === "low") {
+            const mark = el("span", "mark", "rough score");
+            mark.title = confidenceTitle(row);
+            td.append(mark);
+          }
+          const dismiss = el("button", null, "Not interested");
+          dismiss.style.cssText = "background:none;border:none;color:#2a6df5;cursor:pointer;font-size:0.75rem;padding:0 0 0 0.4rem;";
+          dismiss.addEventListener("click", () => dismissRow(row));
+          td.append(dismiss);
+        } else {
+          td.textContent = String(col.cell(row, i));
+        }
+        tr.append(td);
+      }
+      body.append(tr);
+    });
+
+    // Top-100 says how many it FOUND rather than claiming 100 (SPEC.md §4.5.10).
+    const label = state.filters.top100
+      ? `Top ${formatCount(selectTop100(all).length)} of all time – showing ${formatCount(Math.min(filtered.length, state.browseShown))} of ${formatCount(filtered.length)} after filters.`
+      : `Showing ${formatCount(Math.min(filtered.length, state.browseShown))} of ${formatCount(filtered.length)} games`;
+    $("browse-count").textContent = label;
+
+    const more = $("browse-more");
+    more.hidden = filtered.length <= state.browseShown;
+  }
+
+  function renderTagChips() {
+    const host = $("f-tags");
+    if (host.childElementCount > 0) return;   // built once from the whole pool
+    for (const { name } of computeTopTags(rows())) {
+      const chip = el("button", "tagchip", name);
+      chip.type = "button";
+      chip.setAttribute("aria-pressed", String(state.filters.includeTags.includes(name)));
+      chip.addEventListener("click", () => {
+        const on = state.filters.includeTags.includes(name);
+        state.filters.includeTags = on
+          ? state.filters.includeTags.filter((t) => t !== name)
+          : [...state.filters.includeTags, name];
+        chip.setAttribute("aria-pressed", String(!on));
+        state.browseShown = BROWSE_PAGE_SIZE;
+        renderBrowse();
+        saveFilters();
+      });
+      host.append(chip);
     }
   }
 
-  filterMinDiscountInput.addEventListener("change", () => {
-    const raw = filterMinDiscountInput.value;
-    const value = Number(raw);
-    filters.minDiscount = raw === "" || !(value >= 0) ? 0 : value;
-    persistFilters();
-    updateMinDiscountHint();
-    rerenderActiveTab();
-  });
+  function renderFooter() {
+    const p = payload();
+    const foot = $("footer");
+    foot.replaceChildren();
+    foot.append(el("p", null, footerLine(p.funnel)));
 
-  filterMaxPriceInput.addEventListener("change", () => {
-    const raw = filterMaxPriceInput.value;
-    const value = Number(raw);
-    filters.maxPrice = raw === "" || !(value >= 0) ? null : value;
-    persistFilters();
-    rerenderActiveTab();
-  });
+    const details = el("details");
+    details.append(el("summary", null, "What was left out"));
+    const ul = el("ul");
+    for (const row of funnelBreakdown(p.funnel)) ul.append(el("li", null, row.text));
+    details.append(ul);
+    foot.append(details);
 
-  filterMinSimilarityInput.addEventListener("change", () => {
-    const raw = filterMinSimilarityInput.value;
-    const value = Number(raw);
-    filters.minSimilarity = raw === "" || !(value >= 0) ? 0 : value;
-    persistFilters();
-    rerenderActiveTab();
-  });
+    if (p.profileAvailable) {
+      foot.append(el("p", null, `Your taste is matched from ${formatCount(p.profileGames)} games in your Steam library.`));
+    }
 
-  filterDeckModeSelect.addEventListener("change", () => {
-    filters.deckMode = filterDeckModeSelect.value;
-    persistFilters();
-    rerenderActiveTab();
-  });
+    // The retiring Dismissed tab, reduced to a footer line (SPEC.md §4.7).
+    const dismissed = el("details");
+    const summary = el("summary", null, "Dismissed (…)");
+    dismissed.append(summary);
+    const list = el("ul", "dismissed-list");
+    dismissed.append(list);
+    dismissed.addEventListener("toggle", () => { if (dismissed.open) loadDismissals(summary, list); });
+    foot.append(dismissed);
+    loadDismissals(summary, list, true);
+  }
 
-  filterBatteryOnlyCheckbox.addEventListener("change", () => {
-    filters.batteryOnly = filterBatteryOnlyCheckbox.checked;
-    persistFilters();
-    rerenderActiveTab();
-  });
-
-  filterMinReviewsInput.addEventListener("change", () => {
-    const raw = filterMinReviewsInput.value;
-    const value = Number(raw);
-    filters.minReviews = raw === "" || !(value >= 0) ? null : value;
-    persistFilters();
-    rerenderActiveTab();
-  });
-
-  filterMinQualityInput.addEventListener("change", () => {
-    const raw = filterMinQualityInput.value;
-    const value = Number(raw);
-    filters.minQuality = raw === "" || !(value >= 0) ? null : value / 100;
-    persistFilters();
-    rerenderActiveTab();
-  });
-
-  filterMinOwnersInput.addEventListener("change", () => {
-    const raw = filterMinOwnersInput.value;
-    const value = Number(raw);
-    filters.minOwners = raw === "" || !(value >= 0) ? null : value;
-    persistFilters();
-    rerenderActiveTab();
-  });
-
-  filterResetBtn.addEventListener("click", () => {
-    filters = { ...DEFAULT_FILTERS };
-    persistFilters();
-    applyFilterInputsToUi();
-    renderTagChips(currentTabRawItems());
-    updateMinDiscountHint();
-    rerenderActiveTab();
-  });
-
-  filterTagSearchAddBtn.addEventListener("click", () => {
-    const name = filterTagSearchInput.value.trim();
-    if (!name) return;
-    const mode = filterTagSearchModeSelect.value;
-    filters.includeTags = filters.includeTags.filter((t) => t !== name);
-    filters.excludeTags = filters.excludeTags.filter((t) => t !== name);
-    if (mode === "include") filters.includeTags.push(name);
-    else filters.excludeTags.push(name);
-    filterTagSearchInput.value = "";
-    persistFilters();
-    renderTagChips(currentTabRawItems());
-    rerenderActiveTab();
-  });
-
-  /** Deck badge: ✅ Verified / 🟡 Playable / nothing for Unknown/Unsupported
-   * (spec §2). `deck` is the {deck, os, frame} shape from src/deckCompat.js —
-   * only the `deck` (handheld) category gets a badge here. */
-  function appendDeckBadge(td, deck) {
-    const category = deck?.deck ?? 0;
-    if (category === 3) {
-      const span = document.createElement("span");
-      span.className = "badge badge-deck-verified";
-      span.textContent = "✅ Verified";
-      td.appendChild(span);
-    } else if (category === 2) {
-      const span = document.createElement("span");
-      span.className = "badge badge-deck-playable";
-      span.textContent = "🟡 Playable";
-      td.appendChild(span);
+  async function loadDismissals(summary, list, countOnly = false) {
+    try {
+      const res = await fetch("/api/dismissals");
+      const { dismissals = [] } = await res.json();
+      summary.textContent = `Dismissed (${formatCount(dismissals.length)})`;
+      if (countOnly) return;
+      list.replaceChildren();
+      if (dismissals.length === 0) {
+        list.append(el("li", null, "You haven't dismissed anything yet."));
+        return;
+      }
+      for (const d of dismissals) {
+        const li = el("li");
+        li.append(el("span", null, `${d.name ?? d.appid} `));
+        const restore = el("button", null, "Put it back");
+        restore.style.cssText = "background:none;border:none;color:#2a6df5;cursor:pointer;font-size:0.85rem;padding:0;";
+        restore.addEventListener("click", async () => {
+          // Same shape as the toast's Undo, and the same SEC-1 fix: a 200 with
+          // `{restored:false}` used to remove the row from the list while the
+          // server still held the dismissal.
+          let restored = false;
+          try {
+            const res = await fetch(`/api/dismissals/${encodeURIComponent(d.appid)}`, { method: "DELETE" });
+            restored = res.ok && (await res.json())?.restored === true;
+          } catch {
+            restored = false;
+          }
+          if (!restored) {
+            restore.textContent = "Try again";
+            li.append(el("span", null, " Couldn't put that back."));
+            return;
+          }
+          li.remove();
+        });
+        li.append(restore);
+        list.append(li);
+      }
+    } catch {
+      // Fail-soft: a footer line is never worth a broken page.
     }
   }
 
-  /** Battery badge — honest tooltip per spec §3: this is a tag-based
-   * estimate, not measured data (no such data source exists). */
-  function appendBatteryBadge(td, item) {
-    if (!item.batteryFriendly) return;
-    const span = document.createElement("span");
-    span.className = "badge badge-battery";
-    span.textContent = "🔋";
-    span.title = "Tag-based estimate — no measured battery-life data exists for this game.";
-    td.appendChild(span);
+  function renderAll() {
+    const p = payload();
+    // CR-1: the library clause is dropped in both no-library states. It used
+    // to render unconditionally, DIRECTLY ABOVE the banner saying these picks
+    // are not matched to your taste.
+    $("basis").textContent = basisSentence(p.funnel.ranked, libraryState(p));
+    $("browse-summary").textContent = `Browse all ${formatCount(p.funnel.ranked)} games`;
+    renderBanner();
+    renderLenses();
+    renderPicks();
+    renderTagChips();
+    renderBrowse();
+    renderFooter();
   }
 
-  /**
-   * "Not interested" (Increment 8) — dismisses a game app-wide, server-side,
-   * across every sale lane (Deals/Recs/Best of Steam/Fun per minute) —
-   * Library and Wishlist rows never call this (PO's exemption). Optimistic:
-   * removes the row from every already-loaded lane's in-memory data
-   * immediately, so it's gone from this tab right now and from every other
-   * lane the next time it renders, then fires the POST best-effort (a
-   * failed request just means it reappears on the next reload, same as
-   * this app's settings auto-save). References lastRecsBody/lastHofBody/
-   * lastFpmBody/deals/dismissedLoaded/loadDismissed, all declared further
-   * down this script — safe, this only runs on a click, well after the
-   * whole module has finished its first pass.
-   */
-  async function dismissGame(item) {
-    if (item.appid == null) return;
-    deals = deals.filter((d) => d.appid !== item.appid);
-    if (lastRecsBody) lastRecsBody.recs = (lastRecsBody.recs || []).filter((r) => r.appid !== item.appid);
-    if (lastHofBody) lastHofBody.hof = (lastHofBody.hof || []).filter((h) => h.appid !== item.appid);
-    if (lastFpmBody) lastFpmBody.fpm = (lastFpmBody.fpm || []).filter((f) => f.appid !== item.appid);
-    rerenderActiveTab();
+  // -------------------------------------------------------------------------
+  // Actions.
+  // -------------------------------------------------------------------------
+  async function selectLens(preset) {
+    if (preset === state.preset) return;
+    // SEC-3: THE ROLLBACK IS THE POINT. `state.preset` has to move before the
+    // fetch so the lit button and the loading state agree, but if the fetch
+    // fails and it is left moved, `payload()` returns undefined, `rows()`
+    // returns [], and the next chip toggle repaints the honest error with
+    // "No picks left with those filters on. Turn one off." – a filter
+    // explanation for a network failure. Put it back.
+    const previous = state.preset;
+    state.preset = preset;
+    state.picksShown = PICK_COUNT;
+    state.browseShown = BROWSE_PAGE_SIZE;
+    try {
+      // A LENS CHANGE RE-FETCHES. It does not re-sort what is already here:
+      // the blend and the similarity normaliser are properties of the lens and
+      // they live in src/rank.js (SPEC.md §4.2).
+      await loadPreset(preset);
+      renderAll();
+    } catch (err) {
+      state.preset = previous;
+      renderLenses();
+      showFailure(err);
+    }
+  }
+
+  /** "Not interested". The card goes immediately and the next pick slides in
+   * without a reload; /api/rank already excludes dismissed rows server-side,
+   * so a reload keeps it gone (SPEC.md §4.7). */
+  async function dismissRow(row) {
+    const origin = state.preset;
+    for (const [, p] of state.payloads) {
+      p.rank = p.rank.filter((r) => r.appid !== row.appid);
+    }
+    renderPicks();
+    renderBrowse();
+    showToast(row, origin);
     try {
       await fetch("/api/dismissals", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ appid: item.appid, name: item.title || null }),
+        body: JSON.stringify({ appid: row.appid, name: row.title }),
       });
     } catch {
-      // best-effort — see the note above
-    }
-    if (dismissedLoaded) loadDismissed();
-  }
-
-  /** Appends the ✕ "Not interested" column every sale-lane row carries —
-   * shared across renderDeals/renderRecs/renderHof/renderFpm. */
-  function appendDismissTd(tr, item) {
-    const td = document.createElement("td");
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "dismiss-btn";
-    btn.title = "Not interested — hide this game everywhere";
-    btn.textContent = "✕";
-    btn.addEventListener("click", () => dismissGame(item));
-    td.appendChild(btn);
-    tr.appendChild(td);
-  }
-
-  // --- Deals (Increment 2, filters/deck/battery added Increment 5) --------
-
-  // Increment 5.5: min-discount is now a client-side bar filter (see the
-  // filter bar wiring above) — Deals/Recs sourcing still needs a fixed
-  // server minCut floor (the pool has to be fetched at SOME discount depth),
-  // so this constant keeps /api/deals?minCut=60 byte-identical to inc-5's
-  // default rather than exposing it as a user control.
-  const DEALS_SOURCING_MIN_CUT = 60;
-
-  // Increment 8 (ride-along B): mirrors src/deals.js's BESTOF_MIN_CUT —
-  // Best-of sources from a much lower floor than Deals/Recs (deliberately,
-  // since 5.5, so shallow-cut Hall-of-Fame qualifiers aren't excluded). Used
-  // only by updateMinDiscountHint() above to tell James per-tab why a
-  // min-discount value might be a no-op — never sent as a query param
-  // (Best-of's floor is a server-side config, not client-controlled).
-  const BESTOF_SOURCING_MIN_CUT = 10;
-
-  const dealsStatusEl = document.getElementById("deals-status");
-  const dealsTotalsEl = document.getElementById("deals-totals");
-  const dealsTableEl = document.getElementById("deals-table");
-  const dealsTableBodyEl = document.getElementById("deals-table-body");
-  const dealsSortSelect = document.getElementById("deals-sort");
-  const dealsRefreshBtn = document.getElementById("deals-refresh-btn");
-
-  let deals = [];
-
-  function renderDeals() {
-    const filtered = applyFilters(deals, filters);
-
-    const sortBy = dealsSortSelect.value;
-    const sorted = [...filtered];
-    if (sortBy === "price") {
-      sorted.sort((a, b) => (a.price ?? Infinity) - (b.price ?? Infinity));
-    } else if (sortBy === "title") {
-      sorted.sort((a, b) => (a.title || "").localeCompare(b.title || ""));
-    } else {
-      sorted.sort((a, b) => (b.cut ?? 0) - (a.cut ?? 0));
-    }
-
-    dealsTableBodyEl.innerHTML = "";
-    sorted.forEach((deal) => {
-      const tr = document.createElement("tr");
-
-      const nameTd = document.createElement("td");
-      nameTd.textContent = deal.title || "(untitled)";
-      tr.appendChild(nameTd);
-
-      const priceTd = document.createElement("td");
-      priceTd.textContent = deal.price != null ? `$${deal.price.toFixed(2)}` : "—";
-      tr.appendChild(priceTd);
-
-      const regularTd = document.createElement("td");
-      if (deal.regular != null) {
-        const s = document.createElement("s");
-        s.className = "regular-price";
-        s.textContent = `$${deal.regular.toFixed(2)}`;
-        regularTd.appendChild(s);
-      }
-      tr.appendChild(regularTd);
-
-      const cutTd = document.createElement("td");
-      const cutBadge = document.createElement("span");
-      cutBadge.className = "badge badge-cut";
-      cutBadge.textContent = `-${deal.cut}%`;
-      cutTd.appendChild(cutBadge);
-      if (deal.atHistoricalLow) {
-        const lowBadge = document.createElement("span");
-        lowBadge.className = "badge badge-low";
-        lowBadge.textContent = "HISTORICAL LOW";
-        if (deal.historicalLow != null) {
-          lowBadge.title = `Recorded low: $${deal.historicalLow.toFixed(2)}`;
-        }
-        cutTd.appendChild(lowBadge);
-      }
-      tr.appendChild(cutTd);
-
-      const deckTd = document.createElement("td");
-      appendDeckBadge(deckTd, deal.deck);
-      tr.appendChild(deckTd);
-
-      const batteryTd = document.createElement("td");
-      appendBatteryBadge(batteryTd, deal);
-      tr.appendChild(batteryTd);
-
-      const storeTd = document.createElement("td");
-      if (deal.appid) {
-        const a = document.createElement("a");
-        a.href = `https://store.steampowered.com/app/${deal.appid}`;
-        a.target = "_blank";
-        a.rel = "noopener";
-        a.textContent = "Steam";
-        storeTd.appendChild(a);
-      }
-      tr.appendChild(storeTd);
-
-      appendDismissTd(tr, deal);
-
-      dealsTableBodyEl.appendChild(tr);
-    });
-
-    const atLowCount = filtered.filter((d) => d.atHistoricalLow).length;
-    dealsTotalsEl.textContent =
-      `${filtered.length} of ${deals.length} deals shown (filters applied) · ${atLowCount} at historical low`;
-
-    dealsTableEl.hidden = false;
-  }
-
-  async function loadDeals(refresh = false) {
-    dealsStatusEl.textContent = "Loading…";
-    dealsStatusEl.hidden = false;
-    dealsTableEl.hidden = true;
-    dealsStatusEl.className = "status";
-
-    const params = new URLSearchParams({ minCut: String(DEALS_SOURCING_MIN_CUT) });
-    if (refresh) params.set("refresh", "1");
-
-    try {
-      const res = await fetch(`/api/deals?${params}`);
-      const body = await res.json();
-      if (!res.ok) {
-        throw new Error(body.error || `Request failed with status ${res.status}`);
-      }
-      deals = body.deals || [];
-      dealsStatusEl.hidden = true;
-      renderDeals();
-      if (activeTab === "deals") renderTagChips(currentTabRawItems());
-    } catch (err) {
-      dealsStatusEl.textContent = err.message;
-      dealsStatusEl.className = "status error";
+      // Fail-soft: the row is already gone locally; a failed write means it
+      // returns on the next reload, which is honest rather than silent.
     }
   }
 
-  dealsSortSelect.addEventListener("change", renderDeals);
-
-  dealsRefreshBtn.addEventListener("click", () => loadDeals(true));
-
-  // --- Wishlist (Increment 6) ----------------------------------------------
-  // Top-billed, above Recs (PRD placement) — explicit intent (being on the
-  // wishlist) beats taste similarity, so this lane has no Similarity column
-  // and isn't scored by src/score.js at all; /api/wishlist does its own
-  // qualify/sort server-side (src/wishlist.js). Fail-soft per spec: any
-  // `available:false` or a thrown fetch hides #wishlist-section entirely and
-  // shows #wishlist-notice instead — the rest of the Recs tab (and the app)
-  // must keep working regardless of Valve/ITAD wishlist trouble.
-
-  const wishlistNoticeEl = document.getElementById("wishlist-notice");
-  const wishlistSectionEl = document.getElementById("wishlist-section");
-  const wishlistCountBadgeEl = document.getElementById("wishlist-count-badge");
-  const wishlistStatusEl = document.getElementById("wishlist-status");
-  const wishlistTotalsEl = document.getElementById("wishlist-totals");
-  const wishlistEmptyEl = document.getElementById("wishlist-empty");
-  const wishlistTableEl = document.getElementById("wishlist-table");
-  const wishlistTableBodyEl = document.getElementById("wishlist-table-body");
-
-  let lastWishlistBody = null;
-  let wishlistAvailable = false;
-
-  /** Renders the wishlist lane from its last-fetched raw body, applying the
-   * shared filter bar with DEFAULT options (per spec §4) — min similarity
-   * and the quality floors are both exempt (this lane has neither a
-   * similarity score nor a quality/owners/reviews signal); min discount, max
-   * price, tag include/exclude, Deck, and battery all apply. Kept separate
-   * from the qualify/sort the server already did, so re-rendering on a
-   * filter-bar change never needs a refetch. */
-  function renderWishlist(body) {
-    lastWishlistBody = body;
-    const items = body.wishlist || [];
-    const filtered = applyFilters(items, filters);
-
-    wishlistCountBadgeEl.textContent = `(${items.length})`;
-
-    wishlistTableBodyEl.innerHTML = "";
-    filtered.forEach((item) => {
-      const tr = document.createElement("tr");
-
-      const nameTd = document.createElement("td");
-      nameTd.textContent = item.title || "(untitled)";
-      tr.appendChild(nameTd);
-
-      const priceTd = document.createElement("td");
-      priceTd.textContent = item.price != null ? `$${item.price.toFixed(2)}` : "—";
-      tr.appendChild(priceTd);
-
-      const regularTd = document.createElement("td");
-      if (item.regular != null) {
-        const s = document.createElement("s");
-        s.className = "regular-price";
-        s.textContent = `$${item.regular.toFixed(2)}`;
-        regularTd.appendChild(s);
+  function showToast(row, origin) {
+    const host = $("toast");
+    host.replaceChildren();
+    const line = el("div", "toast", `Dismissed. ${row.title} won't come back. `);
+    const undo = el("button", null, "Undo");
+    undo.addEventListener("click", async () => {
+      // SEC-1: THIS USED TO BE AN UNGUARDED AWAIT. DELETE /api/dismissals
+      // fail-softs at HTTP 200 with `{restored:false}`, so a failure neither
+      // threw nor was checked: the row stayed dismissed on the server, was
+      // never pushed back locally, the toast stayed up, and the user saw
+      // nothing at all. dismissRow's POST was already wrapped; these two were
+      // the inconsistency.
+      let restored = false;
+      try {
+        const res = await fetch(`/api/dismissals/${encodeURIComponent(row.appid)}`, { method: "DELETE" });
+        restored = res.ok && (await res.json())?.restored === true;
+      } catch {
+        restored = false;
       }
-      tr.appendChild(regularTd);
-
-      const cutTd = document.createElement("td");
-      const cutBadge = document.createElement("span");
-      cutBadge.className = "badge badge-cut";
-      cutBadge.textContent = `-${item.cut}%`;
-      cutTd.appendChild(cutBadge);
-      if (item.atHistoricalLow) {
-        const lowBadge = document.createElement("span");
-        lowBadge.className = "badge badge-low";
-        lowBadge.textContent = "HISTORICAL LOW";
-        if (item.historicalLow != null) {
-          lowBadge.title = `Recorded low: $${item.historicalLow.toFixed(2)}`;
-        }
-        cutTd.appendChild(lowBadge);
-      }
-      tr.appendChild(cutTd);
-
-      const deckTd = document.createElement("td");
-      appendDeckBadge(deckTd, item.deck);
-      tr.appendChild(deckTd);
-
-      const batteryTd = document.createElement("td");
-      appendBatteryBadge(batteryTd, item);
-      tr.appendChild(batteryTd);
-
-      const whyTd = document.createElement("td");
-      whyTd.className = "why-line";
-      whyTd.textContent = item.why || "—";
-      tr.appendChild(whyTd);
-
-      const storeTd = document.createElement("td");
-      if (item.appid) {
-        const a = document.createElement("a");
-        a.href = `https://store.steampowered.com/app/${item.appid}`;
-        a.target = "_blank";
-        a.rel = "noopener";
-        a.textContent = "Steam";
-        storeTd.appendChild(a);
-      }
-      tr.appendChild(storeTd);
-
-      wishlistTableBodyEl.appendChild(tr);
-    });
-
-    wishlistTotalsEl.textContent = `${filtered.length} of ${items.length} wishlist bargains shown (filters applied)`;
-    wishlistTotalsEl.hidden = false;
-    wishlistEmptyEl.hidden = filtered.length !== 0;
-    wishlistTableEl.hidden = filtered.length === 0;
-  }
-
-  async function loadWishlist(refresh = false) {
-    wishlistNoticeEl.hidden = true;
-    wishlistSectionEl.hidden = false;
-    wishlistStatusEl.textContent = "Loading…";
-    wishlistStatusEl.hidden = false;
-    wishlistTotalsEl.hidden = true;
-    wishlistEmptyEl.hidden = true;
-    wishlistTableEl.hidden = true;
-
-    try {
-      const res = await fetch(refresh ? "/api/wishlist?refresh=1" : "/api/wishlist");
-      const body = await res.json();
-      if (!res.ok || body.available === false) {
-        wishlistAvailable = false;
-        wishlistSectionEl.hidden = true;
-        wishlistNoticeEl.hidden = false;
+      if (!restored) {
+        undo.textContent = "Try again";
+        line.append(el("span", null, " Couldn't undo that – it is still dismissed."));
         return;
       }
-      wishlistAvailable = true;
-      wishlistStatusEl.hidden = true;
-      renderWishlist(body);
-    } catch (err) {
-      wishlistAvailable = false;
-      wishlistSectionEl.hidden = true;
-      wishlistNoticeEl.hidden = false;
-    }
-  }
-
-  // --- Recs (Increment 3; filters/deck/battery added Increment 5) ---------
-  // Reuses the shared min-discount control/storage (now in the filter bar)
-  // and the same recency-window control/storage as the Library tab —
-  // changing either recomputes the profile server-side via a fresh
-  // /api/recs request. Polls while the SteamSpy tag cache is still building
-  // (ready:false), stops once ready.
-
-  const RECS_POLL_MS = 2000;
-
-  const recsStatusEl = document.getElementById("recs-status");
-  const recsProgressWrapEl = document.getElementById("recs-progress-wrap");
-  const recsProgressFillEl = document.getElementById("recs-progress-fill");
-  const recsProgressLabelEl = document.getElementById("recs-progress-label");
-  const recsTotalsEl = document.getElementById("recs-totals");
-  const recsTableEl = document.getElementById("recs-table");
-  const recsTableBodyEl = document.getElementById("recs-table-body");
-  const recsWindowInput = document.getElementById("recs-window-months");
-  const recsRefreshBtn = document.getElementById("recs-refresh-btn");
-
-  recsWindowInput.value = loadWindowMonths();
-
-  let recsPollTimer = null;
-  let lastRecsBody = null;
-
-  function renderRecs(body) {
-    lastRecsBody = body;
-    const recs = applyFilters(body.recs || [], filters, {
-      includeSimilarity: true,
-      includeQualityFloors: true,
-    });
-
-    recsTableBodyEl.innerHTML = "";
-    recs.forEach((rec) => {
-      const tr = document.createElement("tr");
-
-      const nameTd = document.createElement("td");
-      nameTd.textContent = rec.title || "(untitled)";
-      tr.appendChild(nameTd);
-
-      const simTd = document.createElement("td");
-      simTd.textContent = `${Math.round((rec.similarity || 0) * 100)}%`;
-      tr.appendChild(simTd);
-
-      const priceTd = document.createElement("td");
-      priceTd.textContent = rec.price != null ? `$${rec.price.toFixed(2)}` : "—";
-      tr.appendChild(priceTd);
-
-      const regularTd = document.createElement("td");
-      if (rec.regular != null) {
-        const s = document.createElement("s");
-        s.className = "regular-price";
-        s.textContent = `$${rec.regular.toFixed(2)}`;
-        regularTd.appendChild(s);
+      // CR-2: RESTORE ONLY INTO THE LENS IT WAS DISMISSED UNDER. `row` carries
+      // the `rankScore` of that lens, and re-sorting another lens's array by
+      // it would place the game at a position that lens's own blend never
+      // produced – the browser inventing a rank, which §4.2 forbids. The other
+      // lenses are DROPPED so they re-fetch their own honest order.
+      const p = state.payloads.get(origin);
+      if (p && !p.rank.some((r) => r.appid === row.appid)) {
+        p.rank.push(row);
+        p.rank.sort((a, b) => b.rankScore - a.rankScore);   // restore rank ORDER, using the score the API sent
       }
-      tr.appendChild(regularTd);
-
-      const cutTd = document.createElement("td");
-      const cutBadge = document.createElement("span");
-      cutBadge.className = "badge badge-cut";
-      cutBadge.textContent = `-${rec.cut}%`;
-      cutTd.appendChild(cutBadge);
-      if (rec.atHistoricalLow) {
-        const lowBadge = document.createElement("span");
-        lowBadge.className = "badge badge-low";
-        lowBadge.textContent = "HISTORICAL LOW";
-        cutTd.appendChild(lowBadge);
+      for (const key of [...state.payloads.keys()]) {
+        if (key !== origin) state.payloads.delete(key);
       }
-      tr.appendChild(cutTd);
-
-      const reviewsTd = document.createElement("td");
-      reviewsTd.textContent =
-        rec.reviewCount > 0 ? `${rec.reviewPercent}% · ${rec.reviewCount.toLocaleString()}` : "—";
-      if (rec.owners > 0) {
-        reviewsTd.title = `~${rec.owners.toLocaleString()} owners`;
-      }
-      tr.appendChild(reviewsTd);
-
-      const deckTd = document.createElement("td");
-      appendDeckBadge(deckTd, rec.deck);
-      tr.appendChild(deckTd);
-
-      const batteryTd = document.createElement("td");
-      appendBatteryBadge(batteryTd, rec);
-      tr.appendChild(batteryTd);
-
-      const whyTd = document.createElement("td");
-      whyTd.className = "why-line";
-      whyTd.textContent = rec.why || "—";
-      tr.appendChild(whyTd);
-
-      const storeTd = document.createElement("td");
-      if (rec.appid) {
-        const a = document.createElement("a");
-        a.href = `https://store.steampowered.com/app/${rec.appid}`;
-        a.target = "_blank";
-        a.rel = "noopener";
-        a.textContent = "Steam";
-        storeTd.appendChild(a);
-      }
-      tr.appendChild(storeTd);
-
-      appendDismissTd(tr, rec);
-
-      recsTableBodyEl.appendChild(tr);
-    });
-
-    recsTotalsEl.textContent =
-      `${recs.length} of ${(body.recs || []).length} recs shown (filters applied) · ${body.pendingCount ?? 0} pending · ` +
-      `${body.excludedCount ?? 0} tagless · ${body.qualityExcludedCount ?? 0} below quality floor`;
-    recsTableEl.hidden = false;
-
-    if (body.ready) {
-      recsProgressWrapEl.hidden = true;
-    } else {
-      recsProgressWrapEl.hidden = false;
-      const pct = body.total > 0 ? Math.round((body.fetched / body.total) * 100) : 0;
-      recsProgressFillEl.style.width = `${pct}%`;
-      recsProgressLabelEl.textContent = `Building tag cache: ${body.fetched}/${body.total} games (${pct}%) — recs fill in as it goes`;
-    }
-  }
-
-  function stopRecsPoll() {
-    if (recsPollTimer) {
-      clearTimeout(recsPollTimer);
-      recsPollTimer = null;
-    }
-  }
-
-  async function loadRecs(refresh = false) {
-    stopRecsPoll();
-    recsStatusEl.textContent = "Loading…";
-    recsStatusEl.hidden = false;
-    recsStatusEl.className = "status";
-
-    const windowMonths = loadWindowMonths();
-    const params = new URLSearchParams({ minCut: String(DEALS_SOURCING_MIN_CUT), windowMonths: String(windowMonths) });
-    if (refresh) params.set("refresh", "1");
-
-    try {
-      const res = await fetch(`/api/recs?${params}`);
-      const body = await res.json();
-      if (!res.ok) {
-        throw new Error(body.error || `Request failed with status ${res.status}`);
-      }
-      recsStatusEl.hidden = true;
-      renderRecs(body);
-      if (activeTab === "recs") renderTagChips(currentTabRawItems());
-      if (!body.ready) {
-        recsPollTimer = setTimeout(() => loadRecs(false), RECS_POLL_MS);
-      }
-    } catch (err) {
-      recsStatusEl.textContent = err.message;
-      recsStatusEl.className = "status error";
-      recsProgressWrapEl.hidden = true;
-    }
-  }
-
-  recsWindowInput.addEventListener("change", () => {
-    const raw = Number(recsWindowInput.value);
-    const value = raw > 0 ? raw : DEFAULT_WINDOW_MONTHS;
-    setWindowMonths(value);
-    loadRecs();
-  });
-
-  recsRefreshBtn.addEventListener("click", () => {
-    loadRecs(true);
-    loadWishlist(true);
-  });
-
-  // --- Best of Steam (Increment 5) -----------------------------------------
-  // Taste-agnostic Hall of Fame: same deals pool + polling shape as Recs,
-  // ranked instead by src/hallOfFame.js (discount depth x Wilson quality).
-  // Similarity is shown as a secondary "Also you?" column only — never
-  // filtered on by minSimilarity (Recs-only) and never sorted on client-side.
-
-  const HOF_POLL_MS = 2000;
-
-  const hofStatusEl = document.getElementById("hof-status");
-  const hofProgressWrapEl = document.getElementById("hof-progress-wrap");
-  const hofProgressFillEl = document.getElementById("hof-progress-fill");
-  const hofProgressLabelEl = document.getElementById("hof-progress-label");
-  const hofTotalsEl = document.getElementById("hof-totals");
-  const hofTableEl = document.getElementById("hof-table");
-  const hofTableBodyEl = document.getElementById("hof-table-body");
-  const hofRefreshBtn = document.getElementById("hof-refresh-btn");
-
-  let hofPollTimer = null;
-  let lastHofBody = null;
-
-  function renderHof(body) {
-    lastHofBody = body;
-    // Best of Steam's own ranking already reflects discount x quality — no
-    // minSimilarity here (that filter is Recs-only per spec).
-    const hof = applyFilters(body.hof || [], filters, { includeQualityFloors: true });
-
-    hofTableBodyEl.innerHTML = "";
-    hof.forEach((entry) => {
-      const tr = document.createElement("tr");
-
-      const nameTd = document.createElement("td");
-      nameTd.textContent = entry.title || "(untitled)";
-      tr.appendChild(nameTd);
-
-      const priceTd = document.createElement("td");
-      priceTd.textContent = entry.price != null ? `$${entry.price.toFixed(2)}` : "—";
-      tr.appendChild(priceTd);
-
-      const regularTd = document.createElement("td");
-      if (entry.regular != null) {
-        const s = document.createElement("s");
-        s.className = "regular-price";
-        s.textContent = `$${entry.regular.toFixed(2)}`;
-        regularTd.appendChild(s);
-      }
-      tr.appendChild(regularTd);
-
-      const cutTd = document.createElement("td");
-      const cutBadge = document.createElement("span");
-      cutBadge.className = "badge badge-cut";
-      cutBadge.textContent = `-${entry.cut}%`;
-      cutTd.appendChild(cutBadge);
-      if (entry.atHistoricalLow) {
-        const lowBadge = document.createElement("span");
-        lowBadge.className = "badge badge-low";
-        lowBadge.textContent = "HISTORICAL LOW";
-        cutTd.appendChild(lowBadge);
-      }
-      tr.appendChild(cutTd);
-
-      const reviewsTd = document.createElement("td");
-      reviewsTd.textContent =
-        entry.reviewCount > 0 ? `${entry.reviewPercent}% · ${entry.reviewCount.toLocaleString()}` : "—";
-      if (entry.owners > 0) {
-        reviewsTd.title = `~${entry.owners.toLocaleString()} owners`;
-      }
-      tr.appendChild(reviewsTd);
-
-      const alsoYouTd = document.createElement("td");
-      alsoYouTd.textContent = `it's also ${Math.round((entry.similarity || 0) * 100)}% you`;
-      tr.appendChild(alsoYouTd);
-
-      const deckTd = document.createElement("td");
-      appendDeckBadge(deckTd, entry.deck);
-      tr.appendChild(deckTd);
-
-      const batteryTd = document.createElement("td");
-      appendBatteryBadge(batteryTd, entry);
-      tr.appendChild(batteryTd);
-
-      const storeTd = document.createElement("td");
-      if (entry.appid) {
-        const a = document.createElement("a");
-        a.href = `https://store.steampowered.com/app/${entry.appid}`;
-        a.target = "_blank";
-        a.rel = "noopener";
-        a.textContent = "Steam";
-        storeTd.appendChild(a);
-      }
-      tr.appendChild(storeTd);
-
-      appendDismissTd(tr, entry);
-
-      hofTableBodyEl.appendChild(tr);
-    });
-
-    hofTotalsEl.textContent =
-      `${hof.length} of ${(body.hof || []).length} Best-of-Steam picks shown (filters applied) · ${body.pendingCount ?? 0} pending`;
-    hofTableEl.hidden = false;
-
-    if (body.ready) {
-      hofProgressWrapEl.hidden = true;
-    } else {
-      hofProgressWrapEl.hidden = false;
-      const pct = body.total > 0 ? Math.round((body.fetched / body.total) * 100) : 0;
-      hofProgressFillEl.style.width = `${pct}%`;
-      hofProgressLabelEl.textContent = `Building tag cache: ${body.fetched}/${body.total} games (${pct}%) — picks fill in as it goes`;
-    }
-  }
-
-  function stopHofPoll() {
-    if (hofPollTimer) {
-      clearTimeout(hofPollTimer);
-      hofPollTimer = null;
-    }
-  }
-
-  async function loadHof(refresh = false) {
-    stopHofPoll();
-    hofStatusEl.textContent = "Loading…";
-    hofStatusEl.hidden = false;
-    hofStatusEl.className = "status";
-
-    // Increment 5.5: Best-of no longer sends minCut — its sourcing floor is
-    // the server-side BESTOF_MIN_CUT config, not a query param (see SPEC.md
-    // §1). Min-discount in the bar is a client-side filter (applyFilters)
-    // applied below in renderHof, same as the other two sale tabs.
-    const windowMonths = loadWindowMonths();
-    const params = new URLSearchParams({ windowMonths: String(windowMonths) });
-    if (refresh) params.set("refresh", "1");
-
-    try {
-      const res = await fetch(`/api/best-of?${params}`);
-      const body = await res.json();
-      if (!res.ok) {
-        throw new Error(body.error || `Request failed with status ${res.status}`);
-      }
-      hofStatusEl.hidden = true;
-      renderHof(body);
-      if (activeTab === "hof") renderTagChips(currentTabRawItems());
-      if (!body.ready) {
-        hofPollTimer = setTimeout(() => loadHof(false), HOF_POLL_MS);
-      }
-    } catch (err) {
-      hofStatusEl.textContent = err.message;
-      hofStatusEl.className = "status error";
-      hofProgressWrapEl.hidden = true;
-    }
-  }
-
-  hofRefreshBtn.addEventListener("click", () => loadHof(true));
-
-  // --- Fun per minute (Increment 7, re-sourced from a D1 catalog in 7.7) --
-  // Wilson quality ÷ HowLongToBeat main-story hours, over EVERY floor-
-  // passing Steam game (not just deal-pool/owned candidates — see SPEC.md's
-  // "Celeste finding"). GET /api/fpm is now a fast, static read: no HLTB
-  // traffic, no per-request progressive-fill — the D1 catalog is filled by
-  // an explicit background sync (#fpm-sync-btn -> POST /api/fpm/sync),
-  // whose progress is tracked separately via GET /api/fpm/sync/status
-  // (pollFpmSyncStatus below) rather than this route's own response. Also
-  // still needs /api/wishlist's fail-soft convention: the HowLongToBeat
-  // handshake (used only during a sync) is an unofficial, no-API-key
-  // endpoint that can drift or go down without notice.
-  //
-  // Bar filters apply EXCEPT min similarity (this lane has no similarity
-  // signal, same as Wishlist) AND the quality floors (Recs + Best-of only
-  // per spec) — applyFilters is called with includeQualityFloors:false and
-  // no includeSimilarity flag at all (its default is already false).
-  // "On sale only" (passesOnSaleOnly, filters.js) and the owned tri-state
-  // are FPM-only, in-memory controls — not part of the persisted shared
-  // `filters` object, so they can never leak into another tab.
-  //
-  // Display cap (Coder's call, SPEC.md §4): with an eventual 8-20k+ row
-  // catalog, the table renders at most FPM_DISPLAY_CAP rows at a time,
-  // growing via "Show more" — cheap, since filtering/sorting already
-  // happened server-side and this is just an array slice.
-
-  const FPM_SYNC_STATUS_POLL_MS = 2000;
-  const FPM_DISPLAY_CAP = 500;
-
-  const fpmNoticeEl = document.getElementById("fpm-notice");
-  const fpmStatusEl = document.getElementById("fpm-status");
-  const fpmSyncStatusEl = document.getElementById("fpm-sync-status");
-  const fpmTotalsEl = document.getElementById("fpm-totals");
-  const fpmEmptyEl = document.getElementById("fpm-empty");
-  const fpmTableEl = document.getElementById("fpm-table");
-  const fpmTableBodyEl = document.getElementById("fpm-table-body");
-  const fpmSyncBtn = document.getElementById("fpm-sync-btn");
-  const fpmSyncContinueBtn = document.getElementById("fpm-sync-continue-btn");
-  const fpmSyncStopBtn = document.getElementById("fpm-sync-stop-btn");
-  const fpmRefreshBtn = document.getElementById("fpm-refresh-btn");
-  const fpmFormulaSelect = document.getElementById("fpm-formula");
-  const fpmQexpInput = document.getElementById("fpm-qexp");
-  const fpmBreadthInput = document.getElementById("fpm-breadth");
-  const fpmOwnedModeSelect = document.getElementById("fpm-owned-mode");
-  const fpmOnSaleOnlyCheckbox = document.getElementById("fpm-on-sale-only");
-  const fpmShowMoreWrapEl = document.getElementById("fpm-show-more-wrap");
-  const fpmShowMoreBtn = document.getElementById("fpm-show-more-btn");
-
-  // Increment 8: restore the FPM-tab-local controls from persisted settings
-  // (see the top-level-await bootstrap) — these are NOT part of the shared
-  // `filters` object, so they're restored here individually. A restored
-  // formula-picker choice is a lens the user is looking through, not a
-  // change to the default — FPM_FORMULA stays 'sqrt' in src/hltb.js.
-  if (["hide", "only"].includes(persistedSettings.fpmOwnedMode)) {
-    fpmOwnedModeSelect.value = persistedSettings.fpmOwnedMode;
-  }
-  if (typeof persistedSettings.fpmOnSaleOnly === "boolean") {
-    fpmOnSaleOnlyCheckbox.checked = persistedSettings.fpmOnSaleOnly;
-  }
-  if (["linear", "sqrt", "log"].includes(persistedSettings.fpmFormula)) {
-    fpmFormulaSelect.value = persistedSettings.fpmFormula;
-  }
-
-  let fpmSyncPollTimer = null;
-  let lastFpmBody = null;
-  let fpmAvailable = false;
-  let fpmDisplayLimit = FPM_DISPLAY_CAP;
-
-  function renderFpm(body) {
-    lastFpmBody = body;
-    let sourceItems = body.fpm || [];
-    if (fpmOnSaleOnlyCheckbox.checked) {
-      sourceItems = sourceItems.filter((entry) => passesOnSaleOnly(entry, true));
-    }
-    const filtered = applyFilters(sourceItems, filters, { includeQualityFloors: false });
-    const items = filtered.slice(0, fpmDisplayLimit);
-    // Normalized 0-100 "Score" column (Increment 7.5.1): relative to the
-    // top-ranked item's actual sort score (entry.fpm) in this filtered view —
-    // recomputed per render since the filtered list/order can change.
-    const maxFpmScore = Math.max(...items.map((i) => i.fpm ?? 0), 0);
-
-    fpmTableBodyEl.innerHTML = "";
-    items.forEach((entry) => {
-      const tr = document.createElement("tr");
-
-      const nameTd = document.createElement("td");
-      nameTd.textContent = entry.title || "(untitled)";
-      tr.appendChild(nameTd);
-
-      const priceTd = document.createElement("td");
-      priceTd.textContent = entry.price != null ? `$${entry.price.toFixed(2)}` : "—";
-      tr.appendChild(priceTd);
-
-      const regularTd = document.createElement("td");
-      if (entry.regular != null) {
-        const s = document.createElement("s");
-        s.className = "regular-price";
-        s.textContent = `$${entry.regular.toFixed(2)}`;
-        regularTd.appendChild(s);
-      }
-      tr.appendChild(regularTd);
-
-      const cutTd = document.createElement("td");
-      if (entry.owned) {
-        // Increment 7.6: owned rows carry no cut — an Owned badge renders
-        // where the discount badge would, price cell already reads "—"
-        // above since entry.price is null.
-        const ownedBadge = document.createElement("span");
-        ownedBadge.className = "badge badge-owned";
-        ownedBadge.textContent = "OWNED";
-        cutTd.appendChild(ownedBadge);
-      } else if (entry.cut != null) {
-        const cutBadge = document.createElement("span");
-        cutBadge.className = "badge badge-cut";
-        cutBadge.textContent = `-${entry.cut}%`;
-        cutTd.appendChild(cutBadge);
-        if (entry.atHistoricalLow) {
-          const lowBadge = document.createElement("span");
-          lowBadge.className = "badge badge-low";
-          lowBadge.textContent = "HISTORICAL LOW";
-          cutTd.appendChild(lowBadge);
+      host.replaceChildren();
+      if (!state.payloads.has(state.preset)) {
+        // The lens moved while the toast was up, and its payload was just
+        // dropped. Re-fetch rather than paint against nothing.
+        try {
+          await loadPreset(state.preset);
+        } catch (err) {
+          showFailure(err);
+          return;
         }
       }
-      // Increment 7.7: an unowned catalog row with no deal annotation at all
-      // (the third row shape — most of the catalog, e.g. a full-price
-      // evergreen title) renders no badge here at all, same as its price
-      // cell already reading "—" above.
-      tr.appendChild(cutTd);
-
-      const funPerHourTd = document.createElement("td");
-      funPerHourTd.textContent = entry.funPerHour != null ? entry.funPerHour.toFixed(1) : "—";
-      if (entry.why) funPerHourTd.title = entry.why;
-      tr.appendChild(funPerHourTd);
-
-      const scoreTd = document.createElement("td");
-      scoreTd.textContent =
-        maxFpmScore > 0 && entry.fpm != null ? String(Math.round((entry.fpm / maxFpmScore) * 100)) : "—";
-      tr.appendChild(scoreTd);
-
-      const reviewsTd = document.createElement("td");
-      reviewsTd.textContent =
-        entry.reviewCount > 0 ? `${entry.reviewPercent}% · ${entry.reviewCount.toLocaleString()}` : "—";
-      if (entry.owners > 0) {
-        reviewsTd.title = `~${entry.owners.toLocaleString()} owners`;
-      }
-      tr.appendChild(reviewsTd);
-
-      const mainHoursTd = document.createElement("td");
-      mainHoursTd.textContent = entry.mainHours != null ? `${entry.mainHours.toFixed(1)}h` : "—";
-      tr.appendChild(mainHoursTd);
-
-      const deckTd = document.createElement("td");
-      appendDeckBadge(deckTd, entry.deck);
-      tr.appendChild(deckTd);
-
-      const batteryTd = document.createElement("td");
-      appendBatteryBadge(batteryTd, entry);
-      tr.appendChild(batteryTd);
-
-      const storeTd = document.createElement("td");
-      if (entry.appid) {
-        const a = document.createElement("a");
-        a.href = `https://store.steampowered.com/app/${entry.appid}`;
-        a.target = "_blank";
-        a.rel = "noopener";
-        a.textContent = "Steam";
-        storeTd.appendChild(a);
-      }
-      tr.appendChild(storeTd);
-
-      appendDismissTd(tr, entry);
-
-      fpmTableBodyEl.appendChild(tr);
+      renderAll();
     });
-
-    fpmTotalsEl.textContent =
-      `Showing top ${items.length} of ${filtered.length} qualifying (filters applied) · ${body.unmatchedCount ?? 0} games had no length data`;
-    // While the catalog hasn't matched anything at all yet (a cold/never-
-    // synced D1), show the "nothing yet" empty state instead of a bare
-    // 0-row table.
-    const nothingMatchedYet = (body.matched ?? 0) === 0 && (body.fpm || []).length === 0;
-    fpmEmptyEl.hidden = !nothingMatchedYet;
-    fpmTableEl.hidden = false;
-    fpmShowMoreWrapEl.hidden = filtered.length <= items.length;
+    line.append(undo);
+    host.append(line);
+    setTimeout(() => { if (host.firstChild === line) host.replaceChildren(); }, 8000);
   }
 
-  /** Honest "ranked X of Y qualifying games" line (SPEC.md §3) — driven by
-   * GET /api/fpm/sync/status's D1-wide counts, independent of whatever
-   * filters happen to be narrowing the visible table right now.
-   *
-   * Increment 7.8: app-type classification is a second, separate fill
-   * (matched rows can be fully HLTB-resolved yet still be hidden from the
-   * lane if unclassified) — the line now also names how many rows are still
-   * awaiting classification whenever that fill isn't complete, so the
-   * status line stays honest about BOTH backfills, not just the HLTB one. */
-  function renderFpmSyncStatus(status) {
-    // Increment 8: the Stop control only makes sense while an auto-continue
-    // LOOP is driving (a single "Sync catalog now" batch isn't stoppable
-    // mid-batch, same as before) — status.autoContinue distinguishes the two.
-    fpmSyncStopBtn.hidden = !status?.autoContinue;
-
-    if (!status) {
-      fpmSyncStatusEl.textContent = "";
-      return;
-    }
-    if (status.total === 0) {
-      fpmSyncStatusEl.textContent = status.running
-        ? "Sync running — crawling the catalog…"
-        : 'Not synced yet — click "Sync catalog now".';
-      return;
-    }
-    const pendingNote = status.pending > 0 ? ` (${status.pending} pending)` : "";
-    const unclassified = Math.max((status.total ?? 0) - (status.classified ?? 0), 0);
-    const classificationNote = unclassified > 0 ? ` · ${unclassified} awaiting classification` : "";
-    const runningNote = status.autoContinue ? " — syncing to completion…" : status.running ? " — sync running…" : "";
-    fpmSyncStatusEl.textContent = `Ranked ${status.matched} of ${status.total} qualifying games${pendingNote}${classificationNote}${runningNote}`;
+  // -------------------------------------------------------------------------
+  // Filter persistence through the existing increment-8 settings lane, under
+  // ONE new key holding a JSON blob. GET /api/settings returns only what is
+  // stored, so an untouched store yields an unchanged response and there is no
+  // zero-diff breach. Failure is silent and never blocks a render.
+  //
+  // THE PICKS ARE NOT PERSISTED AND NEVER READ THIS. The two chips default off
+  // every session, because a persisted filter could poison the landing state
+  // and the landing state is the gate (SPEC.md §4.3).
+  // -------------------------------------------------------------------------
+  let saveTimer = null;
+  function saveFilters() {
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => {
+      fetch("/api/settings", {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ [RANK_FILTERS_SETTINGS_KEY]: state.filters }),
+      }).catch(() => {});
+    }, 400);
   }
 
-  function stopFpmSyncPoll() {
-    if (fpmSyncPollTimer) {
-      clearTimeout(fpmSyncPollTimer);
-      fpmSyncPollTimer = null;
-    }
-  }
-
-  /**
-   * Poll GET /api/fpm/sync/status. Polls only while a sync is actively
-   * running (SPEC.md §3's "the frontend poll actually stops" requirement) —
-   * a single fetch when idle updates the status line and does not
-   * reschedule itself. While running, also periodically reloads /api/fpm so
-   * newly-matched rows fill into the visible table as the sync progresses.
-   */
-  async function pollFpmSyncStatus() {
-    stopFpmSyncPoll();
-    let status;
+  async function restoreFilters() {
     try {
-      const res = await fetch("/api/fpm/sync/status");
-      status = await res.json();
+      const res = await fetch("/api/settings");
+      const { settings = {} } = await res.json();
+      state.filters = normaliseFilters(settings[RANK_FILTERS_SETTINGS_KEY]);
     } catch {
-      return;
+      state.filters = { ...DEFAULT_RANK_FILTERS };
     }
-    renderFpmSyncStatus(status);
-    if (status.running) {
-      await loadFpm(false);
-      fpmSyncPollTimer = setTimeout(pollFpmSyncStatus, FPM_SYNC_STATUS_POLL_MS);
-    } else {
-      await loadFpm(false);
-    }
+    restoreControlsFromState();
   }
 
-  async function loadFpm(refresh = false) {
-    fpmNoticeEl.hidden = true;
-    fpmStatusEl.textContent = "Loading…";
-    fpmStatusEl.hidden = false;
-    fpmStatusEl.className = "status";
-
-    const params = new URLSearchParams();
-    if (refresh) params.set("refresh", "1");
-    // Formula picker overrides (Increment 7.5) — re-rank already-matched D1
-    // rows only, never trigger new HLTB traffic server-side.
-    params.set("formula", fpmFormulaSelect.value);
-    params.set("qexp", fpmQexpInput.value);
-    params.set("breadth", fpmBreadthInput.value);
-    // Owned tri-state (Increment 7.7): a pure post-hoc filter server-side —
-    // owned/deal status is now a live annotation, not a sourcing decision.
-    params.set("owned", fpmOwnedModeSelect.value);
-
-    try {
-      const res = await fetch(`/api/fpm?${params}`);
-      const body = await res.json();
-      if (!res.ok) {
-        throw new Error(body.error || `Request failed with status ${res.status}`);
-      }
-
-      if (!body.available) {
-        fpmAvailable = false;
-        fpmStatusEl.hidden = true;
-        fpmTableEl.hidden = true;
-        fpmEmptyEl.hidden = true;
-        fpmTotalsEl.textContent = "";
-        fpmNoticeEl.textContent = body.notice || "Fun-per-minute unavailable";
-        fpmNoticeEl.hidden = false;
-        return;
-      }
-
-      fpmAvailable = true;
-      fpmStatusEl.hidden = true;
-      fpmDisplayLimit = FPM_DISPLAY_CAP; // fresh server data -> reset lazy-render position
-      renderFpm(body);
-      if (activeTab === "fpm") renderTagChips(currentTabRawItems());
-    } catch (err) {
-      fpmStatusEl.textContent = err.message;
-      fpmStatusEl.className = "status error";
-    }
-  }
-
-  fpmSyncBtn.addEventListener("click", async () => {
-    fpmSyncBtn.disabled = true;
-    fpmSyncStatusEl.textContent = "Starting sync…";
-    try {
-      await fetch("/api/fpm/sync", { method: "POST" });
-    } catch (err) {
-      fpmSyncStatusEl.textContent = `Sync failed to start: ${err.message}`;
-    } finally {
-      fpmSyncBtn.disabled = false;
-    }
-    pollFpmSyncStatus();
-  });
-
-  /** "Sync to completion" (Increment 8, ride-along A) — POST
-   * /api/fpm/sync?continue=1 starts the auto-continue loop; GET
-   * /api/fpm/sync/status's existing `running` flag stays true for the
-   * WHOLE loop's duration (not just one batch), so the existing
-   * pollFpmSyncStatus() below already keeps polling throughout — no new
-   * polling semantics needed, per the build note. */
-  fpmSyncContinueBtn.addEventListener("click", async () => {
-    fpmSyncContinueBtn.disabled = true;
-    fpmSyncStatusEl.textContent = "Starting sync to completion…";
-    try {
-      await fetch("/api/fpm/sync?continue=1", { method: "POST" });
-    } catch (err) {
-      fpmSyncStatusEl.textContent = `Sync failed to start: ${err.message}`;
-    } finally {
-      fpmSyncContinueBtn.disabled = false;
-    }
-    pollFpmSyncStatus();
-  });
-
-  fpmSyncStopBtn.addEventListener("click", async () => {
-    fpmSyncStopBtn.disabled = true;
-    try {
-      await fetch("/api/fpm/sync/stop", { method: "POST" });
-    } catch {
-      // best-effort — the next status poll will reflect reality either way
-    } finally {
-      fpmSyncStopBtn.disabled = false;
-    }
-  });
-
-  fpmRefreshBtn.addEventListener("click", () => loadFpm(true));
-  fpmFormulaSelect.addEventListener("change", () => {
-    scheduleSettingsSave();
-    loadFpm(false);
-  });
-  fpmQexpInput.addEventListener("change", () => loadFpm(false));
-  fpmBreadthInput.addEventListener("change", () => loadFpm(false));
-  fpmOwnedModeSelect.addEventListener("change", () => {
-    scheduleSettingsSave();
-    loadFpm(false);
-  });
-  fpmOnSaleOnlyCheckbox.addEventListener("change", () => {
-    scheduleSettingsSave();
-    if (lastFpmBody) renderFpm(lastFpmBody); // client-side only, no refetch
-  });
-  fpmShowMoreBtn.addEventListener("click", () => {
-    fpmDisplayLimit += FPM_DISPLAY_CAP;
-    if (lastFpmBody) renderFpm(lastFpmBody);
-  });
-
-  // --- Dismissed (Increment 8) ---------------------------------------------
-  // "Not interested" management view — app-wide across the sale lanes (see
-  // dismissGame()/appendDismissTd() above). No filter bar here (this is a
-  // management list, not a filterable candidate pool — see the tab-click
-  // handler's filterBarEl.hidden logic).
-
-  const dismissedStatusEl = document.getElementById("dismissed-status");
-  const dismissedTotalsEl = document.getElementById("dismissed-totals");
-  const dismissedEmptyEl = document.getElementById("dismissed-empty");
-  const dismissedTableEl = document.getElementById("dismissed-table");
-  const dismissedTableBodyEl = document.getElementById("dismissed-table-body");
-  const dismissedCountBadgeEl = document.getElementById("dismissed-count-badge");
-
-  function formatDismissedAt(ms) {
-    if (!ms) return "—";
-    return new Date(ms).toLocaleDateString();
-  }
-
-  function renderDismissed(list) {
-    dismissedCountBadgeEl.textContent = list.length ? `(${list.length})` : "";
-
-    dismissedTableBodyEl.innerHTML = "";
-    list.forEach((item) => {
-      const tr = document.createElement("tr");
-
-      const nameTd = document.createElement("td");
-      nameTd.textContent = item.name || `App ${item.appid}`;
-      tr.appendChild(nameTd);
-
-      const dateTd = document.createElement("td");
-      dateTd.textContent = formatDismissedAt(item.dismissed_at);
-      tr.appendChild(dateTd);
-
-      const actionTd = document.createElement("td");
-      const btn = document.createElement("button");
-      btn.type = "button";
-      btn.textContent = "Restore";
-      btn.addEventListener("click", () => restoreGame(item.appid));
-      actionTd.appendChild(btn);
-      tr.appendChild(actionTd);
-
-      dismissedTableBodyEl.appendChild(tr);
+  function bindFilters() {
+    const change = (fn) => () => {
+      fn();
+      state.browseShown = BROWSE_PAGE_SIZE;
+      renderBrowse();
+      saveFilters();
+    };
+    // Debounce the INPUT, not the filter chain – the chain over 13,924 rows is
+    // a handful of milliseconds; it is the keystroke rate that needs damping.
+    let searchTimer = null;
+    const applySearch = change(() => { state.filters.search = $("f-search").value; });
+    $("f-search").addEventListener("input", () => {
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(applySearch, 150);
     });
-
-    dismissedTotalsEl.textContent = `${list.length} dismissed`;
-    dismissedEmptyEl.hidden = list.length !== 0;
-    dismissedTableEl.hidden = list.length === 0;
+    $("f-ownership").addEventListener("change", change(() => { state.filters.ownership = $("f-ownership").value; }));
+    $("f-played").addEventListener("change", change(() => { state.filters.hidePlayed = $("f-played").checked; }));
+    $("f-sale").addEventListener("change", change(() => { state.filters.onSaleOnly = $("f-sale").checked; }));
+    $("f-discount").addEventListener("change", change(() => { state.filters.minDiscount = Number($("f-discount").value); }));
+    $("f-price").addEventListener("change", change(() => { state.filters.maxPrice = $("f-price").value === "" ? null : Number($("f-price").value); }));
+    $("f-taste").addEventListener("change", change(() => { state.filters.minTaste = Number($("f-taste").value); }));
+    $("f-experience").addEventListener("change", change(() => { state.filters.minExperience = Number($("f-experience").value); }));
+    $("f-top100").addEventListener("change", change(() => { state.filters.top100 = $("f-top100").checked; }));
+    $("f-reset").addEventListener("click", () => {
+      state.filters = { ...DEFAULT_RANK_FILTERS };
+      restoreControlsFromState();
+      for (const chip of $("f-tags").children) chip.setAttribute("aria-pressed", "false");
+      state.browseShown = BROWSE_PAGE_SIZE;
+      renderBrowse();
+      saveFilters();
+    });
+    $("browse-more").addEventListener("click", () => { state.browseShown += BROWSE_PAGE_SIZE; renderBrowse(); });
   }
 
-  async function loadDismissed() {
-    dismissedStatusEl.textContent = "Loading…";
-    dismissedStatusEl.hidden = false;
-    dismissedStatusEl.className = "status";
-    dismissedTableEl.hidden = true;
+  function restoreControlsFromState() {
+    $("f-search").value = state.filters.search;
+    $("f-ownership").value = state.filters.ownership || OWNERSHIP_ALL;
+    $("f-played").checked = state.filters.hidePlayed;
+    $("f-sale").checked = state.filters.onSaleOnly;
+    $("f-discount").value = String(state.filters.minDiscount ?? 0);
+    $("f-price").value = state.filters.maxPrice == null ? "" : String(state.filters.maxPrice);
+    $("f-taste").value = String(state.filters.minTaste ?? 0);
+    $("f-experience").value = String(state.filters.minExperience ?? 0);
+    $("f-top100").checked = state.filters.top100;
+  }
 
+  function bindChips() {
+    // The two chips apply to the PICKS only, and neither is persisted.
+    $("chip-owned").addEventListener("change", () => {
+      state.chips.hideOwned = $("chip-owned").checked;
+      state.picksShown = PICK_COUNT;
+      renderPicks();
+    });
+    $("chip-played").addEventListener("change", () => {
+      state.chips.hidePlayed = $("chip-played").checked;
+      state.picksShown = PICK_COUNT;
+      renderPicks();
+    });
+    $("show-more").addEventListener("click", () => { state.picksShown += PICK_STEP; renderPicks(); });
+  }
+
+  /** The wishlist badge (SPEC.md §4.7). Fired AFTER the picks paint, never
+   * awaited by the render, and a failure is silent – it is a badge, and the
+   * first thing cut if it ever threatens the gate. */
+  function paintWishlist() {
+    fetch("/api/wishlist")
+      .then((r) => r.json())
+      .then(({ wishlist = [] }) => {
+        state.wishlist = new Set(wishlist.map((w) => w.appid).filter((id) => id != null));
+        if (state.wishlist.size > 0) renderPicks();
+      })
+      .catch(() => {});
+  }
+
+  // -------------------------------------------------------------------------
+  // The last-resort net (SEC-5). This is the project's first real client-side
+  // app – roughly fifteen event handlers, every one of them able to throw – and
+  // an unhandled throw inside a listener leaves the page HALF-PAINTED with
+  // nothing but a console entry the reader will never open. Two listeners,
+  // painting the `.error` box that already exists.
+  // -------------------------------------------------------------------------
+  function reportCrash() {
+    $("crash").replaceChildren(
+      el("p", "error", "Something on this page stopped working, so what you are looking at may be incomplete. Reload to try again."),
+    );
+  }
+  window.addEventListener("error", reportCrash);
+  window.addEventListener("unhandledrejection", reportCrash);
+
+  // -------------------------------------------------------------------------
+  // Boot. Nothing here needs a click: the landing state is a fetch and a paint.
+  // -------------------------------------------------------------------------
+  (async function main() {
+    bindChips();
+    bindFilters();
+    showLoading();
     try {
-      const res = await fetch("/api/dismissals");
-      const body = await res.json();
-      dismissedStatusEl.hidden = true;
-      renderDismissed(body.dismissals || []);
+      await restoreFilters();
+      await loadPreset(LANDING_PRESET);
+      renderAll();
+      paintWishlist();
     } catch (err) {
-      dismissedStatusEl.textContent = err.message;
-      dismissedStatusEl.className = "status error";
+      // SEC-2: "the server may still be starting up" is the message for a
+      // fetch that never landed. When /api/rank ANSWERED and said it has no
+      // ranking, the server's own notice is printed instead – reloading would
+      // never have fixed a missing FPM_DB.
+      showFailure(err);
     }
-  }
-
-  /** Un-dismiss: DELETE the D1 row, refresh the Dismissed list, and refetch
-   * whichever sale lanes are already loaded so the restored game reappears
-   * there too — a plain refetch (no ?refresh=1) is enough since dismissal
-   * exclusion is a request-time join, never baked into the deals/pool
-   * caches (see src/worker.js's handleDeals/handleRecs/handleHof/handleFpm). */
-  async function restoreGame(appid) {
-    try {
-      await fetch(`/api/dismissals/${appid}`, { method: "DELETE" });
-    } catch {
-      // best-effort — see loadDismissed's own fail-soft handling below
-    }
-    await loadDismissed();
-    if (dealsLoaded) loadDeals();
-    if (recsLoaded) loadRecs();
-    if (hofLoaded) loadHof();
-    if (fpmLoaded) loadFpm();
-  }
-
-  // --- Initial state: apply everything restored from persistedSettings ----
-
-  updateMinDiscountHint();
+  })();
 </script>
