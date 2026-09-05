@@ -227,7 +227,7 @@ test("mocked ITAD upstream -> /api/deals returns assembled/filtered/owned-exclud
 
   const env = makeEnv({ STEAM_API_KEY: "steam-key", STEAM_ID: "76561198000000000" });
   // Prime the library cache so owned-exclusion doesn't need its own fetch mock.
-  const libraryCacheKey = `https://steam-sale-scout.cache/api/library?steamid=${env.STEAM_ID}`;
+  const libraryCacheKey = `https://steam-sale-scout.cache/api/library?steamid=${env.STEAM_ID}&v=2`;
   cache.store.set(libraryCacheKey, jsonResponse({ games: [{ appid: 999 }] }));
 
   const ctx = makeCtx();

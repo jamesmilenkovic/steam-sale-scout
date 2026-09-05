@@ -141,10 +141,24 @@ export function passesHideOwned(row, hideOwned) {
   return row?.owned !== true;
 }
 
-/** @param {object} row @returns {boolean} true = keep. */
+/**
+ * THE CHIP THAT TRIGGERED INCREMENT 12.5.
+ *
+ * This used to be `(row?.hoursPlayed ?? 0) <= 0` – "played" meaning "Steam
+ * recorded some minutes". James ticked it and **Portal stayed on screen**,
+ * because Steam began recording playtime in March 2009 and Portal shipped in
+ * 2007. 297 owned games are in that position: zero on `playtime_forever`,
+ * zero on every per-platform field, zero on `playtime_disconnected` and zero
+ * on `rtime_last_played`. Steam's 0 there means "no record", not "never".
+ *
+ * It now reads `played`, the field src/marks.js's derivePlayed builds from
+ * ALL the evidence – any Steam signal, or the user's own mark. That is the
+ * whole fix, and it is what makes Portal disappear.
+ * @param {object} row @returns {boolean} true = keep.
+ */
 export function passesHidePlayed(row, hidePlayed) {
   if (!hidePlayed) return true;
-  return (row?.hoursPlayed ?? 0) <= 0;
+  return row?.played !== true;
 }
 
 /**
@@ -168,6 +182,26 @@ export function selectPicks(rows, chips = {}, count = PICK_COUNT) {
 // predicate over a field already on the row. No new fetch, no new parameter.
 // ---------------------------------------------------------------------------
 
+/**
+ * The browse section's play-state select (increment 12.5 §6.4). Four values,
+ * and the third one is the point: **"Played, not finished" is the backlog
+ * query** – the single thing every backlog tracker surveyed exists to answer,
+ * arriving here as one option in one select over a list that is already ranked
+ * by what a game gives back per hour. It lives inside the collapsed browse
+ * section, so it costs the landing gate nothing.
+ */
+export const PLAY_STATE_ALL = "all";
+export const PLAY_STATE_NOT_PLAYED = "not-played";
+export const PLAY_STATE_PLAYING = "played-not-finished";
+export const PLAY_STATE_FINISHED = "finished";
+
+export const PLAY_STATES = Object.freeze([
+  { value: PLAY_STATE_ALL, label: "All" },
+  { value: PLAY_STATE_NOT_PLAYED, label: "Not played" },
+  { value: PLAY_STATE_PLAYING, label: "Played, not finished" },
+  { value: PLAY_STATE_FINISHED, label: "Finished" },
+]);
+
 export const OWNERSHIP_ALL = "all";
 export const OWNERSHIP_HIDE = "hide";
 export const OWNERSHIP_ONLY = "only";
@@ -177,6 +211,7 @@ export const RANK_FILTERS_SETTINGS_KEY = "rankFilters";
 export const DEFAULT_RANK_FILTERS = Object.freeze({
   search: "",
   ownership: OWNERSHIP_ALL,
+  playState: PLAY_STATE_ALL,
   hidePlayed: false,
   onSaleOnly: false,
   minDiscount: 0,
@@ -198,6 +233,11 @@ export function normaliseFilters(stored) {
   const merged = { ...DEFAULT_RANK_FILTERS, ...stored };
   merged.includeTags = Array.isArray(merged.includeTags) ? merged.includeTags.filter((t) => typeof t === "string") : [];
   if (![OWNERSHIP_ALL, OWNERSHIP_HIDE, OWNERSHIP_ONLY].includes(merged.ownership)) merged.ownership = OWNERSHIP_ALL;
+  // `playState` joins the SAME saved settings blob rather than taking a new
+  // settings key, so a blob saved before increment 12.5 still loads and simply
+  // gets the default – which is what the merge above already does for every
+  // other field, and why nothing had to change in src/settings.js.
+  if (!PLAY_STATES.some((s) => s.value === merged.playState)) merged.playState = PLAY_STATE_ALL;
   return merged;
 }
 
@@ -212,6 +252,19 @@ export function passesSearch(row, search) {
 export function passesOwnership(row, ownership) {
   if (ownership === OWNERSHIP_HIDE) return row?.owned !== true;
   if (ownership === OWNERSHIP_ONLY) return row?.owned === true;
+  return true;
+}
+
+/**
+ * 3b. Play state. Reads the two derived fields and nothing else, so it agrees
+ * with the chip and the status line by construction. `finished` implies
+ * `played` server-side, which is what lets "Played, not finished" be a plain
+ * two-term test rather than a special case.
+ */
+export function passesPlayState(row, playState) {
+  if (playState === PLAY_STATE_NOT_PLAYED) return row?.played !== true;
+  if (playState === PLAY_STATE_PLAYING) return row?.played === true && row?.finished !== true;
+  if (playState === PLAY_STATE_FINISHED) return row?.finished === true;
   return true;
 }
 
@@ -291,6 +344,7 @@ export function applyRankFilters(rows, filters) {
   return list
     .filter((r) => passesSearch(r, f.search))
     .filter((r) => passesOwnership(r, f.ownership))
+    .filter((r) => passesPlayState(r, f.playState))
     .filter((r) => passesHidePlayed(r, f.hidePlayed))
     .filter((r) => passesOnSaleOnly(r, f.onSaleOnly))
     .filter((r) => passesMinDiscount(r, f.minDiscount))
@@ -379,6 +433,10 @@ export function formatPrice(price) {
  */
 export const OWNED_PREFIX = "In your library";
 
+/** How far down the ranking "Games to check" looks. Ruled by James at
+ * checkpoint 01 over 200 and 1,000: five games, one sitting. */
+export const GAMES_TO_CHECK_WINDOW = 50;
+
 /**
  * How much of a game you have played, as the fragment that follows the owned
  * prefix - and NOTHING ELSE. The browse table's "Yours" column wants exactly
@@ -397,15 +455,103 @@ export const OWNED_PREFIX = "In your library";
  * because D1 carries its own `source_owned` stamp from an earlier sync.
  * Printing "never played" there asserts a fact the page does not have.
  *
- * @returns {string|null} null when the playtime is not known at all.
+ * INCREMENT 12.5 – THE SAME DEFECT, ONE LAYER UP, AND JAMES'S RULING ON IT.
+ * The line above caught null-mistaken-for-zero. This one is
+ * no-record-mistaken-for-did-not-happen: `hoursPlayed === 0` used to render
+ * **"never played"**, and on **297 owned games that is a false assertion the
+ * page has no basis for** (Steam started recording playtime in March 2009;
+ * Portal is from 2007), while on **45 more it is flatly wrong** because Steam
+ * holds a real `rtime_last_played` for them. Ruled 2026-09-05: 0 becomes
+ * **"no play recorded"**, which is true in both cases and claims nothing.
+ *
+ * THE OTHER RULE THIS FUNCTION ENFORCES: the page must never present a user's
+ * mark as though Steam measured it, and must never hide Steam's number behind
+ * the mark. So a user assertion always carries **"(you said so)"**, and when
+ * both exist they are stacked - `finished · 17 hours played` - Steam's number
+ * and James's verdict on one line, neither disguised as the other.
+ *
+ * Seven cases, all six from SPEC.md §6.2 plus the stacked-evidence one James
+ * ruled on at checkpoint 01:
+ *
+ *   hoursPlayed null, no mark          -> null            ("In your library")
+ *   hours > 0                          -> "17 hours played"
+ *   hours 0, Steam has a play signal   -> "played, hours not recorded"
+ *   hours 0, Steam has nothing, marked -> "played (you said so)"
+ *   finished + hours > 0               -> "finished · 17 hours played"
+ *   finished + Steam signal only       -> "finished · played, hours not recorded"
+ *   finished, Steam has nothing        -> "finished (you said so)"
+ *   hours 0, Steam has nothing, unmarked -> "no play recorded"
+ *
+ * @returns {string|null} null when nothing at all is known about play.
  */
 export function playedFragment(row) {
-  if (row?.hoursPlayed == null) return null;
-  const hours = Number(row.hoursPlayed);
-  if (!(hours > 0)) return "never played";
-  if (hours < 1) return "under an hour played";
-  const whole = Math.round(hours);
-  return `${formatCount(whole)} hour${whole === 1 ? "" : "s"} played`;
+  const hours = row?.hoursPlayed == null ? null : Number(row.hoursPlayed);
+
+  // What STEAM can support, in derivePlayed's own precedence order. A source
+  // of "you" is deliberately NOT evidence here - that is the whole point.
+  let evidence = null;
+  if (hours != null && hours > 0) {
+    if (hours < 1) evidence = "under an hour played";
+    else {
+      const whole = Math.round(hours);
+      evidence = `${formatCount(whole)} hour${whole === 1 ? "" : "s"} played`;
+    }
+  } else if (row?.playedSource === "steam-disconnected" || row?.playedSource === "steam-last-played") {
+    // THE 45. Zero recorded minutes but a real last-played date - the field
+    // has been arriving on every library fetch since increment 1 and nothing
+    // read it. "Played, hours not recorded" is the honest reading of it.
+    evidence = "played, hours not recorded";
+  }
+
+  if (row?.finished === true) return evidence ? `finished · ${evidence}` : "finished (you said so)";
+  if (evidence) return evidence;
+  if (row?.played === true) return "played (you said so)";
+  // Nothing known at all: no live library row AND no mark. Unknown, not zero.
+  if (hours == null) return null;
+  return "no play recorded";
+}
+
+/**
+ * Re-derive a row's four play fields after the user presses a toggle, WITHOUT
+ * a re-fetch of /api/rank (10.1 MB) and WITHOUT the browser inventing its own
+ * precedence rule.
+ *
+ * The row already encodes Steam's verdict in `playedSource`: anything starting
+ * `steam-` means Steam has evidence, which the user can never contradict
+ * (SPEC.md §4.2). So Steam's source is kept if it exists, and the mark only
+ * fills the gap - which is src/marks.js's derivePlayed, expressed over the one
+ * row the page is holding.
+ * @param {object} row
+ * @param {{played?: unknown, finished?: unknown}} mark - the state now stored.
+ * @returns {object} a new row; the caller replaces the old one.
+ */
+export function applyMark(row, mark) {
+  const steamSource = typeof row?.playedSource === "string" && row.playedSource.startsWith("steam-")
+    ? row.playedSource
+    : null;
+  const finished = mark?.finished === 1 || mark?.finished === true;
+  const marked = finished || mark?.played === 1 || mark?.played === true;
+  const playedSource = steamSource ?? (marked ? "you" : null);
+  return { ...row, played: playedSource !== null, finished, playedSource };
+}
+
+/**
+ * "GAMES TO CHECK" (SPEC.md §6.5) - what turns 297 into a tractable list.
+ *
+ * An unmarked game costs exactly ONE thing: it can appear as a pick for a game
+ * you have already played. So the work is bounded by the top of the ranking,
+ * not by the size of the library. Measured against the live ranking on
+ * 2026-09-05: of the 297 owned games Steam has no record of, **5 are in the
+ * top 50**, 16 in the top 200 and 62 in the top 1,000. James ruled the window
+ * at the top 50 - a list finishable in one sitting rather than a chore.
+ * @param {object[]} rows - the ranked array, in rank order.
+ * @param {number} [window]
+ * @returns {object[]} owned rows in that window with no play record and no mark.
+ */
+export function gamesToCheck(rows, window = GAMES_TO_CHECK_WINDOW) {
+  return (rows || [])
+    .slice(0, Math.max(0, window))
+    .filter((r) => r?.owned === true && r?.played !== true);
 }
 
 /** The browse table's "Yours" cell: the fragment alone, or the bare prefix when

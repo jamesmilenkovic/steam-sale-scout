@@ -65,11 +65,25 @@ if (into) {
 
 execFileSync("sqlite3", [target], { input: text, encoding: "utf8", maxBuffer: 512e6 });
 
+/** Row count for a table the header named, or 0 if the restored database has
+ * no such table. A header can honestly say `game_marks=0`: the table is
+ * created lazily on the first request that touches a mark, so a backup taken
+ * before that ever happened has the line but no CREATE for it. Counting
+ * straight off a missing table would fail the verification of a backup that is
+ * perfectly good. */
+function countRows(table) {
+  const exists = execFileSync("sqlite3",
+    [target, `select count(*) from sqlite_master where type='table' and name='${table}'`],
+    { encoding: "utf8" }).trim();
+  if (exists === "0") return 0;
+  return Number(execFileSync("sqlite3", [target, `select count(*) from ${table}`], { encoding: "utf8" }).trim());
+}
+
 // Verify against the header rather than trusting the exit code.
 const actual = {};
 for (const t of Object.keys(expect)) {
   if (t === "experience_scored" || t === "tagged") continue;
-  actual[t] = Number(execFileSync("sqlite3", [target, `select count(*) from ${t}`], { encoding: "utf8" }).trim());
+  actual[t] = countRows(t);
 }
 actual.experience_scored = Number(execFileSync("sqlite3", [target,
   "select count(*) from fpm_catalog where experience_score is not null"], { encoding: "utf8" }).trim());

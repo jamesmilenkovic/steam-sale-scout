@@ -125,7 +125,7 @@ function makeEnv(overrides = {}) {
 }
 
 function primeLibrary(cache, env, games) {
-  const key = `https://steam-sale-scout.cache/api/library?steamid=${env.STEAM_ID}`;
+  const key = `https://steam-sale-scout.cache/api/library?steamid=${env.STEAM_ID}&v=2`;
   cache.store.set(key, jsonResponse({ games }));
 }
 

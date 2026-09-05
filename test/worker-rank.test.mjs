@@ -89,7 +89,7 @@ function makeEnv(overrides = {}) {
  * loadLibraryForRank finds it without any fetch. */
 function seedLibrary(cache, games) {
   cache.store.set(
-    `https://steam-sale-scout.cache/api/library?steamid=${STEAM_ID}`,
+    `https://steam-sale-scout.cache/api/library?steamid=${STEAM_ID}&v=2`,
     new Response(JSON.stringify({ games }), { headers: { "content-type": "application/json" } }),
   );
 }
@@ -166,13 +166,200 @@ test("gate 8: /api/rank's response key set is EXACTLY this, top level and per ro
     "lowConfidenceOwnedSpared", "lowConfidenceSuppressed", "nonGame", "owned", "priced",
     "pricedOwned", "rankExcluded", "ranked", "tagless", "unscored",
   ]);
+  // Increment 12.5 adds exactly FOUR keys, and they are annotations rather
+  // than inputs: `played`, `finished`, `playedSource`, `lastPlayedAt`. Nothing
+  // else about this shape moves, which is half of gate 7.
   assert.deepEqual(Object.keys(body.rank[0]).sort(), [
     "appid", "atHistoricalLow", "base", "confidence", "cut", "experienceFpm",
-    "experienceScore", "gameScore", "hasEnding", "hoursPlayed", "hoursToGood",
-    "hoursToValue", "owned", "price", "priceCents", "priceCheckedAt", "rankScore",
-    "regular", "reviewCount", "reviewPercent", "similarity", "similarityNorm",
-    "tagNames", "title", "why",
+    "experienceScore", "finished", "gameScore", "hasEnding", "hoursPlayed", "hoursToGood",
+    "hoursToValue", "lastPlayedAt", "owned", "playedSource", "played", "price", "priceCents",
+    "priceCheckedAt", "rankScore", "regular", "reviewCount", "reviewPercent", "similarity",
+    "similarityNorm", "tagNames", "title", "why",
+  ].sort());
+});
+
+// ---------------------------------------------------------------------------
+// Increment 12.5 gate 5 – the marks cannot reach the ranking.
+// ---------------------------------------------------------------------------
+
+test("12.5 GATE 5: twenty marks change NOTHING about the ranking – same order, same rankScore, same pool", async () => {
+  // THE LOUDEST REQUIREMENT IN SPEC 12.5. A mark rides on the row as data and
+  // only the browser acts on it. Unlike a dismissal, which is excluded
+  // server-side so it frees a slot, a mark must not change pool membership,
+  // order or score by a single digit – every ruling since increment 11 rests
+  // on the ranking not moving, and src/profile.js is frozen.
+  //
+  // The live proof is the artifact: /api/rank captured under all three lenses
+  // before and after twenty real marks. This is the same claim, in-process
+  // and deterministic, so it fails in CI rather than in a capture.
+  const env = makeEnv();
+  const ctx = makeCtx();
+  globalThis.caches = { default: makeMockCache() };
+
+  const games = Array.from({ length: 20 }, (_, i) => ({ appid: 1000 + i, name: `Owned ${i}`, playtime_forever: 60 * (i + 1) }));
+  seedLibrary(caches.default, games);
+  await seedCatalog(env, [
+    ...games.map((g, i) => ({ appid: g.appid, name: g.name, experience_score: 60 + i, source_owned: 1 })),
+    { appid: 400, name: "Portal", experience_score: 98 },
+    { appid: 620, name: "Portal 2", experience_score: 96 },
   ]);
+
+  // ALL THREE LENSES ARE CAPTURED BEFORE A SINGLE MARK EXISTS. Capturing only
+  // `default` here is what let a leak into `rankScore` under `sale` and
+  // `similarity` pass this test green – the loop at the end used to compare
+  // nothing but `profileGames`, which is preset-independent.
+  const PRESETS = ["default", "sale", "similarity"];
+  const beforeByPreset = new Map();
+  for (const preset of PRESETS) {
+    beforeByPreset.set(preset, (await callRank(env, ctx, `?preset=${preset}`)).body);
+  }
+  const before = beforeByPreset.get("default");
+
+  // Twenty marks, including a finished one on a game with Steam hours and a
+  // played one on a game Steam has no record of at all.
+  for (const g of games) {
+    await worker.fetch(
+      new Request("https://x.test/api/marks", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ appid: g.appid, name: g.name, played: 1, finished: g.appid % 2 === 0 ? 1 : 0 }),
+      }),
+      env,
+      makeCtx(),
+    );
+  }
+  await worker.fetch(
+    new Request("https://x.test/api/marks", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ appid: 400, name: "Portal", played: 1, finished: 1 }),
+    }),
+    env,
+    makeCtx(),
+  );
+
+  const after = (await callRank(env, ctx, "?preset=default")).body;
+
+  assert.deepEqual(after.rank.map((r) => r.appid), before.rank.map((r) => r.appid), "the order moved");
+  assert.deepEqual(after.rank.map((r) => r.rankScore), before.rank.map((r) => r.rankScore), "a score moved");
+  assert.deepEqual(after.rank.map((r) => r.base), before.rank.map((r) => r.base));
+  assert.deepEqual(after.rank.map((r) => r.similarityNorm), before.rank.map((r) => r.similarityNorm));
+  assert.deepEqual(after.funnel, before.funnel, "a mark changed the funnel, so it reached the pool");
+  assert.equal(after.count, before.count, "a mark freed or filled a slot, which is a dismissal's job, not a mark's");
+
+  // The ONLY difference is the four annotation fields.
+  const portalBefore = before.rank.find((r) => r.appid === 400);
+  const portalAfter = after.rank.find((r) => r.appid === 400);
+  assert.equal(portalBefore.played, false, "Portal has no play record before the mark");
+  assert.equal(portalAfter.played, true);
+  assert.equal(portalAfter.finished, true);
+  assert.equal(portalAfter.playedSource, "you");
+  assert.equal(portalAfter.rankScore, portalBefore.rankScore, "Portal's own score moved");
+
+  // And the same for all three lenses – the FULL comparison, not just the
+  // profile size. `sale` and `similarity` weight the blend differently, so a
+  // mark that reached `rankScore` could move them while leaving `default`
+  // untouched; asserting only `profileGames` here could never see it.
+  for (const preset of PRESETS) {
+    const lensBefore = beforeByPreset.get(preset);
+    const lensAfter = (await callRank(env, ctx, `?preset=${preset}`)).body;
+    assert.deepEqual(
+      lensAfter.rank.map((r) => r.appid),
+      lensBefore.rank.map((r) => r.appid),
+      `${preset}: the order moved`,
+    );
+    assert.deepEqual(
+      lensAfter.rank.map((r) => r.rankScore),
+      lensBefore.rank.map((r) => r.rankScore),
+      `${preset}: a rankScore moved, so a mark reached the blend`,
+    );
+    assert.deepEqual(
+      lensAfter.rank.map((r) => r.base),
+      lensBefore.rank.map((r) => r.base),
+      `${preset}: a base moved`,
+    );
+    assert.deepEqual(
+      lensAfter.rank.map((r) => r.similarityNorm),
+      lensBefore.rank.map((r) => r.similarityNorm),
+      `${preset}: a similarityNorm moved, so a mark reached the taste vector`,
+    );
+    assert.deepEqual(
+      lensAfter.funnel,
+      lensBefore.funnel,
+      `${preset}: a mark changed the funnel, so it reached the pool`,
+    );
+    assert.equal(
+      lensAfter.count,
+      lensBefore.count,
+      `${preset}: a mark freed or filled a slot, which is a dismissal's job, not a mark's`,
+    );
+    assert.equal(lensAfter.profileGames, lensBefore.profileGames, `${preset}: the taste profile changed size`);
+  }
+});
+
+test("12.5: the derived fields are correct on a REAL library shape, including the 45 and the 297", async () => {
+  const env = makeEnv();
+  const ctx = makeCtx();
+  globalThis.caches = { default: makeMockCache() };
+
+  seedLibrary(caches.default, [
+    // Portal 2: Steam has the hours.
+    { appid: 620, name: "Portal 2", playtime_forever: 1014, rtime_last_played: 1750000000, playtime_disconnected: 0 },
+    // Tactical Breach Wizards: one of the 45 – zero hours, real date.
+    { appid: 1043810, name: "Tactical Breach Wizards", playtime_forever: 0, rtime_last_played: 1742688000, playtime_disconnected: 83 },
+    // Portal: one of the 297 – zero on everything Steam has.
+    { appid: 400, name: "Portal", playtime_forever: 0, rtime_last_played: 0, playtime_disconnected: 0 },
+  ]);
+  await seedCatalog(env, [
+    { appid: 620, name: "Portal 2", experience_score: 96, source_owned: 1 },
+    { appid: 1043810, name: "Tactical Breach Wizards", experience_score: 94, source_owned: 1 },
+    { appid: 400, name: "Portal", experience_score: 98, source_owned: 1 },
+    { appid: 1671210, name: "DELTARUNE", experience_score: 88 },
+  ]);
+
+  const byAppid = new Map((await callRank(env, ctx)).body.rank.map((r) => [r.appid, r]));
+
+  assert.deepEqual(
+    { ...byAppid.get(620), ...{} } && {
+      played: byAppid.get(620).played, source: byAppid.get(620).playedSource, hours: byAppid.get(620).hoursPlayed,
+    },
+    { played: true, source: "steam-playtime", hours: 16.9 },
+  );
+  // THE 45. Played, and hoursPlayed stays 0 – playtime_disconnected is a
+  // signal, never an addition to a number the page renders.
+  assert.equal(byAppid.get(1043810).played, true);
+  assert.equal(byAppid.get(1043810).playedSource, "steam-disconnected");
+  assert.equal(byAppid.get(1043810).hoursPlayed, 0, "disconnected minutes must NEVER be added into hoursPlayed");
+  assert.equal(byAppid.get(1043810).lastPlayedAt, 1742688000);
+  // THE 297.
+  assert.equal(byAppid.get(400).played, false);
+  assert.equal(byAppid.get(400).playedSource, null);
+  assert.equal(byAppid.get(400).lastPlayedAt, null);
+  // Unowned rows carry the fields too, so the page's shape never varies.
+  assert.equal(byAppid.get(1671210).played, false);
+  assert.equal(byAppid.get(1671210).finished, false);
+});
+
+test("12.5: /api/rank still answers with no FPM_DB-backed marks table and with marks unreadable", async () => {
+  // Fail-soft: a D1 hiccup on the marks read must cost annotations, never the
+  // ranking. Same posture as the dismissals join beside it.
+  const env = makeEnv();
+  const ctx = makeCtx();
+  globalThis.caches = { default: makeMockCache() };
+  seedLibrary(caches.default, []);
+  await seedCatalog(env, [{ appid: 400, name: "Portal", experience_score: 98 }]);
+
+  const realPrepare = env.FPM_DB.prepare.bind(env.FPM_DB);
+  env.FPM_DB.prepare = (sql) => {
+    if (/game_marks/.test(sql)) throw new Error("marks table is unreachable");
+    return realPrepare(sql);
+  };
+
+  const { response, body } = await callRank(env, ctx);
+  assert.equal(response.status, 200);
+  assert.equal(body.rank.length, 1);
+  assert.equal(body.rank[0].played, false);
+  assert.equal(body.rank[0].finished, false);
 });
 
 // ---------------------------------------------------------------------------

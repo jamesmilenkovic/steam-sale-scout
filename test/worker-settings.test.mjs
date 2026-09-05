@@ -146,3 +146,38 @@ test("PUT /api/settings with unparsable JSON -> 400, not a 500", async () => {
   );
   assert.equal(res.status, 400);
 });
+
+// ---------------------------------------------------------------------------
+// SECURITY (increment 12.5's security review). PUT /api/settings was covered by
+// the same false CSRF rationale as the two POST routes, so it gets the same
+// guard: application/json only, and no cross-site writes.
+// ---------------------------------------------------------------------------
+
+test("SEC-2: PUT /api/settings without an application/json content-type -> 415, nothing saved", async () => {
+  const env = makeEnv({ FPM_DB: makeMockD1() });
+  const res = await worker.fetch(
+    new Request("https://x/api/settings", {
+      method: "PUT",
+      headers: { "content-type": "text/plain;charset=UTF-8" },
+      body: JSON.stringify({ hijacked: true }),
+    }),
+    env,
+    makeCtx(),
+  );
+  assert.equal(res.status, 415);
+  assert.deepEqual(await (await worker.fetch(new Request("https://x/api/settings"), env, makeCtx())).json(), { settings: {} });
+});
+
+test("SEC-2: PUT /api/settings from a cross-site fetch -> 403", async () => {
+  const env = makeEnv({ FPM_DB: makeMockD1() });
+  const res = await worker.fetch(
+    new Request("https://x/api/settings", {
+      method: "PUT",
+      headers: { "content-type": "application/json", "sec-fetch-site": "cross-site" },
+      body: JSON.stringify({ hijacked: true }),
+    }),
+    env,
+    makeCtx(),
+  );
+  assert.equal(res.status, 403);
+});

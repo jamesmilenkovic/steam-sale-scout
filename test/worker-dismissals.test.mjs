@@ -148,3 +148,56 @@ test("DELETE /api/dismissals/not-a-number -> 400, not a 500", async () => {
   const res = await worker.fetch(new Request("https://x/api/dismissals/not-a-number", { method: "DELETE" }), env, makeCtx());
   assert.equal(res.status, 400);
 });
+
+// ---------------------------------------------------------------------------
+// SECURITY (found in increment 12.5's security review, defect dates from
+// increment 8). Lower stakes than the marks equivalents – a dismissal is
+// recoverable – but the identical defect, fixed in the same pass.
+// ---------------------------------------------------------------------------
+
+function dismiss(env, body, headers = { "content-type": "application/json" }) {
+  return worker.fetch(
+    new Request("https://x/api/dismissals", { method: "POST", headers, body: JSON.stringify(body) }),
+    env,
+    makeCtx(),
+  );
+}
+
+test("SEC-1: a GET to /api/dismissals/:appid does NOT restore/delete the dismissal – it is a 405", async () => {
+  const env = makeEnv({ FPM_DB: makeMockD1() });
+  await dismiss(env, { appid: 100, name: "Some Game" });
+
+  const res = await worker.fetch(new Request("https://x/api/dismissals/100"), env, makeCtx());
+  assert.equal(res.status, 405, "a GET is not allowed to be a write");
+
+  const body = await (await worker.fetch(new Request("https://x/api/dismissals"), env, makeCtx())).json();
+  assert.equal(body.dismissals.length, 1, "the dismissal survived the drive-by GET");
+  assert.equal(body.dismissals[0].appid, 100);
+});
+
+test("SEC-2: POST /api/dismissals without an application/json content-type -> 415, nothing stored", async () => {
+  const env = makeEnv({ FPM_DB: makeMockD1() });
+  const res = await dismiss(env, { appid: 100, name: "Some Game" }, { "content-type": "text/plain;charset=UTF-8" });
+  assert.equal(res.status, 415);
+  assert.deepEqual(
+    await (await worker.fetch(new Request("https://x/api/dismissals"), env, makeCtx())).json(),
+    { dismissals: [] },
+  );
+});
+
+test("SEC-2: POST /api/dismissals from a cross-site fetch -> 403", async () => {
+  const env = makeEnv({ FPM_DB: makeMockD1() });
+  const res = await dismiss(env, { appid: 100 }, { "content-type": "application/json", "sec-fetch-site": "cross-site" });
+  assert.equal(res.status, 403);
+});
+
+test("SEC-4: appid must be a whole positive number on both dismissal verbs", async () => {
+  const env = makeEnv({ FPM_DB: makeMockD1() });
+  for (const appid of ["", [], true, "0x10", 1.5, 0, -100]) {
+    assert.equal((await dismiss(env, { appid })).status, 400, `appid ${JSON.stringify(appid)} must be rejected`);
+  }
+  for (const tail of ["1.5", "0", "-100"]) {
+    const res = await worker.fetch(new Request(`https://x/api/dismissals/${tail}`, { method: "DELETE" }), env, makeCtx());
+    assert.equal(res.status, 400, `DELETE /api/dismissals/${tail} must be a 400`);
+  }
+});

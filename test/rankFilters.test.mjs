@@ -32,6 +32,15 @@ import {
   OWNERSHIP_ALL,
   OWNERSHIP_HIDE,
   OWNERSHIP_ONLY,
+  PLAY_STATE_ALL,
+  PLAY_STATE_NOT_PLAYED,
+  PLAY_STATE_PLAYING,
+  PLAY_STATE_FINISHED,
+  PLAY_STATES,
+  passesPlayState,
+  gamesToCheck,
+  GAMES_TO_CHECK_WINDOW,
+  applyMark,
   DEFAULT_RANK_FILTERS,
   RANK_FILTERS_SETTINGS_KEY,
   normaliseFilters,
@@ -84,13 +93,19 @@ import { readFileSync } from "node:fs";
 // Real rows.
 // ---------------------------------------------------------------------------
 
-/** appid 1043810. Owned, NEVER PLAYED – the case Valve's Play Next exists for
- * and the one the two chips are proved distinct on. */
+/** appid 1043810. **ONE OF THE 45** – owned, zero recorded hours, but Steam
+ * holds a real `rtime_last_played` of 23 March 2025. Measured on the live
+ * library 2026-09-05, and it sits at rank #5 today wearing the word "never".
+ * Increment 12.5 flips it, and this fixture is the proof. */
 const TACTICAL_BREACH_WIZARDS = {
   appid: 1043810,
   title: "Tactical Breach Wizards",
   owned: true,
   hoursPlayed: 0,
+  played: true,
+  finished: false,
+  playedSource: "steam-last-played",
+  lastPlayedAt: 1742688000,
   experienceScore: 94,
   gameScore: 93,
   hasEnding: 1,
@@ -106,12 +121,17 @@ const TACTICAL_BREACH_WIZARDS = {
   tagNames: ["Turn-Based Tactics", "Puzzle", "Turn-Based Strategy", "Story Rich"],
 };
 
-/** appid 620. Owned AND played – disappears under BOTH chips. */
+/** appid 620. Owned AND played, with Steam's own hours – disappears under
+ * BOTH chips. */
 const PORTAL_2 = {
   appid: 620,
   title: "Portal 2",
   owned: true,
   hoursPlayed: 17,
+  played: true,
+  finished: false,
+  playedSource: "steam-playtime",
+  lastPlayedAt: 1750000000,
   experienceScore: 96,
   gameScore: 97,
   hasEnding: 1,
@@ -127,12 +147,50 @@ const PORTAL_2 = {
   tagNames: ["Platformer", "Puzzle", "First-Person"],
 };
 
+/**
+ * appid 400. **ONE OF THE 297, AND THE GAME THAT TRIGGERED INCREMENT 12.5.**
+ * Owned, and Steam returns zero on every field it has: `playtime_forever`,
+ * all four per-platform fields, `playtime_disconnected` and
+ * `rtime_last_played`. Steam began recording playtime in March 2009 and
+ * Portal shipped in 2007, so that data was never captured and no API call
+ * conjures it. It sits at rank #6 today. This is now the fixture the two
+ * chips are proved distinct on, because it is the one that is genuinely
+ * unplayed-as-far-as-anyone-knows.
+ */
+const PORTAL = {
+  appid: 400,
+  title: "Portal",
+  owned: true,
+  hoursPlayed: 0,
+  played: false,
+  finished: false,
+  playedSource: null,
+  lastPlayedAt: null,
+  experienceScore: 98,
+  gameScore: 95,
+  hasEnding: 1,
+  hoursToValue: 3,
+  confidence: "high",
+  why: "Perfect pacing, no filler, and it ends before it outstays itself.",
+  similarityNorm: 0.8,
+  experienceFpm: 32.6,
+  price: null,
+  cut: null,
+  reviewCount: 120000,
+  reviewPercent: 98,
+  tagNames: ["Puzzle", "First-Person", "Sci-fi"],
+};
+
 /** appid 1671210. ENDLESS – hasEnding 0, hoursToValue null, experienceFpm null. */
 const DELTARUNE = {
   appid: 1671210,
   title: "DELTARUNE",
   owned: false,
   hoursPlayed: null,
+  played: false,
+  finished: false,
+  playedSource: null,
+  lastPlayedAt: null,
   experienceScore: 88,
   gameScore: 95,
   hasEnding: 0,
@@ -154,6 +212,10 @@ const DESVELADO = {
   title: "Desvelado",
   owned: false,
   hoursPlayed: null,
+  played: false,
+  finished: false,
+  playedSource: null,
+  lastPlayedAt: null,
   experienceScore: 91,
   gameScore: 88,
   hasEnding: 1,
@@ -175,6 +237,10 @@ const AMNESIA_BUNKER = {
   title: "Amnesia: The Bunker",
   owned: false,
   hoursPlayed: null,
+  played: false,
+  finished: false,
+  playedSource: null,
+  lastPlayedAt: null,
   experienceScore: 90,
   gameScore: 88,
   hasEnding: 1,
@@ -191,7 +257,7 @@ const AMNESIA_BUNKER = {
   tagNames: ["Horror", "First-Person", "Survival Horror"],
 };
 
-const ALL = [PORTAL_2, TACTICAL_BREACH_WIZARDS, DELTARUNE, AMNESIA_BUNKER, DESVELADO];
+const ALL = [PORTAL_2, TACTICAL_BREACH_WIZARDS, PORTAL, DELTARUNE, AMNESIA_BUNKER, DESVELADO];
 
 // ---------------------------------------------------------------------------
 // The constants the gates name.
@@ -233,6 +299,11 @@ test("no copy anywhere in the module uses an em dash", () => {
   const strings = [
     ...LENSES.map((l) => l.subline),
     statusLine(TACTICAL_BREACH_WIZARDS),
+    statusLine(PORTAL),
+    statusLine({ ...PORTAL, played: true, playedSource: "you" }),
+    statusLine({ ...PORTAL, played: true, finished: true, playedSource: "you" }),
+    statusLine({ ...PORTAL_2, finished: true }),
+    ...PLAY_STATES.map((s) => s.label),
     statusLine(AMNESIA_BUNKER),
     lengthLine(DELTARUNE),
     lengthLine(PORTAL_2),
@@ -255,11 +326,28 @@ test("no copy anywhere in the module uses an em dash", () => {
 // The two chips – proved DISTINCT on the 0-hour owned game (gate 4).
 // ---------------------------------------------------------------------------
 
-test("GATE 4: the two chips are distinct, and Tactical Breach Wizards (owned, 0h) is where that shows", () => {
-  // The worked example SPEC.md §4.3 names. An owned game with 0 hours
+test("GATE 4: the two chips are distinct, and Portal (owned, no play record) is where that shows", () => {
+  // The worked example SPEC.md §4.3 names. An owned game with no play record
   // SURVIVES "hide games I've played" and DISAPPEARS under "hide games I
   // own". If a single predicate served both chips this test could not pass.
-  assert.equal(passesHidePlayed(TACTICAL_BREACH_WIZARDS, true), true, "never played, so it survives 'hide played'");
+  //
+  // INCREMENT 12.5 MOVED THIS FIXTURE, and the move is the increment in one
+  // line: Tactical Breach Wizards used to play this role as "owned, 0 hours,
+  // therefore unplayed", and it turns out James played it on 23 March 2025 –
+  // Steam has been sending the date on every library fetch and nothing read
+  // it. Portal takes the role because Portal is genuinely unrecorded: it is
+  // one of the 297 games Steam has nothing at all for.
+  assert.equal(passesHidePlayed(PORTAL, true), true, "no play record, so it survives 'hide played'");
+  assert.equal(passesHideOwned(PORTAL, true), false, "owned, so it goes under 'hide owned'");
+
+  // THE TRIGGER FOR THIS INCREMENT, CLOSED. Mark Portal played and the chip
+  // finally removes it – which is the entire bug report.
+  assert.equal(passesHidePlayed({ ...PORTAL, played: true, playedSource: "you" }, true), false);
+
+  // And the 45: zero recorded hours, but Steam holds a last-played date, so
+  // it is played and the chip hides it. Under the old `hoursPlayed <= 0` rule
+  // this row survived, which was wrong on 45 owned games.
+  assert.equal(passesHidePlayed(TACTICAL_BREACH_WIZARDS, true), false, "one of the 45 – Steam knows it was played");
   assert.equal(passesHideOwned(TACTICAL_BREACH_WIZARDS, true), false, "owned, so it goes under 'hide owned'");
 
   // Portal 2 is owned AND played, so it disappears under both.
@@ -283,7 +371,7 @@ test("selectPicks composes the two chips and caps at PICK_COUNT", () => {
   );
   assert.deepEqual(
     selectPicks(ALL, { hidePlayed: true }).map((r) => r.title),
-    ["Tactical Breach Wizards", "DELTARUNE", "Amnesia: The Bunker", "Desvelado"],
+    ["Portal", "DELTARUNE", "Amnesia: The Bunker", "Desvelado"],
   );
   assert.deepEqual(
     selectPicks(ALL, { hideOwned: true, hidePlayed: true }).map((r) => r.title),
@@ -363,9 +451,10 @@ test("9. tags are include-only and two chips read as EITHER, not both", () => {
 
 test("10. top 100 of all time is the Best-of rule with the discount gate removed, and it can return fewer than 100", () => {
   const set = selectTop100(ALL);
-  // Only Portal 2 clears 95% AND 10,000 reviews in this fixture; Amnesia has
-  // 9,094 reviews at 93%, DELTARUNE 2,835. The label must say the real size.
-  assert.deepEqual(set.map((r) => r.title), ["Portal 2"]);
+  // Only Portal 2 and Portal clear 95% AND 10,000 reviews in this fixture;
+  // Amnesia has 9,094 reviews at 93%, DELTARUNE 2,835. The label must say the
+  // real size, and the order is review count descending.
+  assert.deepEqual(set.map((r) => r.title), ["Portal 2", "Portal"]);
   assert.equal(set.length < TOP100_LIMIT, true);
   assert.equal(TOP100_MIN_REVIEW_PERCENT, 95);
   assert.equal(TOP100_MIN_REVIEW_COUNT, 10000);
@@ -401,13 +490,151 @@ test("filter state normalises a partial, an older or a corrupt saved blob withou
 
 test("tag chips are ranked by how many rows in the pool carry them", () => {
   const tags = computeTopTags(ALL, 3);
-  // "First-Person" and "Puzzle" both appear twice; ties break alphabetically
-  // so the chip order is stable across reloads rather than hash-order.
+  // "First-Person" and "Puzzle" both appear three times; ties break
+  // alphabetically so the chip order is stable across reloads rather than
+  // hash-order.
   assert.deepEqual(tags.slice(0, 2), [
-    { name: "First-Person", count: 2 },
-    { name: "Puzzle", count: 2 },
+    { name: "First-Person", count: 3 },
+    { name: "Puzzle", count: 3 },
   ]);
   assert.equal(tags.length, 3);
+});
+
+// ---------------------------------------------------------------------------
+// Increment 12.5 – the play-state select and "Games to check".
+// ---------------------------------------------------------------------------
+
+test("12.5 gate 3: the play-state select is four values and they partition the pool", () => {
+  const FINISHED = { ...PORTAL, played: true, finished: true, playedSource: "you" };
+  const rows = [PORTAL_2, TACTICAL_BREACH_WIZARDS, PORTAL, FINISHED, DELTARUNE];
+
+  assert.deepEqual(PLAY_STATES.map((s) => s.value), ["all", "not-played", "played-not-finished", "finished"]);
+  assert.deepEqual(PLAY_STATES.map((s) => s.label), ["All", "Not played", "Played, not finished", "Finished"]);
+
+  const under = (v) => rows.filter((r) => passesPlayState(r, v)).map((r) => r.title);
+  assert.deepEqual(under(PLAY_STATE_ALL), ["Portal 2", "Tactical Breach Wizards", "Portal", "Portal", "DELTARUNE"]);
+  assert.deepEqual(under(PLAY_STATE_NOT_PLAYED), ["Portal", "DELTARUNE"]);
+  // THE BACKLOG QUERY. Everything played that is not yet finished.
+  assert.deepEqual(under(PLAY_STATE_PLAYING), ["Portal 2", "Tactical Breach Wizards"]);
+  assert.deepEqual(under(PLAY_STATE_FINISHED), ["Portal"]);
+
+  // The four are a partition of the pool: every row lands in exactly one of
+  // the three non-"all" buckets.
+  for (const row of rows) {
+    const hits = [PLAY_STATE_NOT_PLAYED, PLAY_STATE_PLAYING, PLAY_STATE_FINISHED]
+      .filter((v) => passesPlayState(row, v));
+    assert.equal(hits.length, 1, `${row.title} landed in ${hits.length} buckets`);
+  }
+});
+
+test("12.5: playState joins the saved blob and an older saved shape still loads", () => {
+  assert.equal(DEFAULT_RANK_FILTERS.playState, PLAY_STATE_ALL);
+  // A blob saved before increment 12.5 has no playState at all.
+  assert.equal(normaliseFilters({ search: "portal", ownership: "only" }).playState, PLAY_STATE_ALL);
+  // And a corrupt or hostile value falls back rather than filtering to nothing.
+  assert.equal(normaliseFilters({ playState: "played" }).playState, PLAY_STATE_ALL);
+  assert.equal(normaliseFilters({ playState: null }).playState, PLAY_STATE_ALL);
+  assert.equal(normaliseFilters({ playState: PLAY_STATE_PLAYING }).playState, PLAY_STATE_PLAYING);
+  // It is a BROWSE filter, so it must never reach the picks.
+  assert.deepEqual(selectPicks(ALL, { playState: PLAY_STATE_FINISHED }), ALL);
+});
+
+test("12.5 gate 10: 'Games to check' is the top 50, owned, with no play record and no mark", () => {
+  assert.equal(GAMES_TO_CHECK_WINDOW, 50, "James ruled the top 50 over 200 and 1,000");
+
+  // Portal is the only row in ALL that qualifies: owned, and neither Steam nor
+  // James can say it was played.
+  assert.deepEqual(gamesToCheck(ALL).map((r) => r.title), ["Portal"]);
+
+  // Marking it - by either toggle - takes it off the list, and that is the
+  // whole mechanism by which 297 becomes a finite job.
+  assert.deepEqual(gamesToCheck([{ ...PORTAL, played: true, playedSource: "you" }]), []);
+
+  // The 45 are already off it without anyone lifting a finger.
+  assert.deepEqual(gamesToCheck([TACTICAL_BREACH_WIZARDS]), []);
+  // An unowned game is never "yours to check", however unplayed it is.
+  assert.deepEqual(gamesToCheck([DELTARUNE]), []);
+
+  // THE WINDOW IS THE POINT. A game at rank 51 is not in your way, so it is
+  // not on the list - the work is bounded by the top of the ranking, not by
+  // the size of the library.
+  const deep = [...Array.from({ length: 50 }, (_, i) => ({ ...PORTAL_2, appid: i })), PORTAL];
+  assert.deepEqual(gamesToCheck(deep), []);
+  assert.deepEqual(gamesToCheck(deep, 51).map((r) => r.title), ["Portal"]);
+  assert.deepEqual(gamesToCheck(null), []);
+});
+
+test("12.5 TC-3: a row with NO `played` key at all is treated as no-play-record, not as played", () => {
+  // Every other 12.5 fixture sets `played` explicitly, so the three predicates
+  // that read it survived `!== true` being rewritten to `=== false` – the
+  // absent-key case was never exercised. It is a real shape: the page holds
+  // rows across a cache version bump and a fail-soft /api/rank, and the source
+  // uses `row?.played` optional chaining precisely because it may be missing.
+  // The rule is the same one derivePlayed follows: absence is "no record",
+  // and "no record" is NOT "played".
+  const NO_KEY = { appid: 400, title: "Portal (no derived fields)", owned: true, hoursPlayed: 0 };
+  assert.equal("played" in NO_KEY, false, "the fixture must genuinely lack the key");
+  assert.equal("finished" in NO_KEY, false);
+
+  // The chip keeps it: we have no basis for hiding it.
+  assert.equal(passesHidePlayed(NO_KEY, true), true);
+  // The select puts it in "Not played" and nowhere else – still a partition.
+  assert.equal(passesPlayState(NO_KEY, PLAY_STATE_NOT_PLAYED), true);
+  assert.equal(passesPlayState(NO_KEY, PLAY_STATE_PLAYING), false);
+  assert.equal(passesPlayState(NO_KEY, PLAY_STATE_FINISHED), false);
+  assert.equal(passesPlayState(NO_KEY, PLAY_STATE_ALL), true);
+  // And it IS a game to check – an owned row with nothing saying it was played
+  // is exactly what the list exists to surface.
+  assert.deepEqual(gamesToCheck([NO_KEY]).map((r) => r.title), ["Portal (no derived fields)"]);
+
+  // The same for an unowned row with no key: not played, and never "yours to
+  // check", so the ownership term still does its own work.
+  const UNOWNED_NO_KEY = { appid: 1671210, title: "DELTARUNE (no derived fields)", owned: false };
+  assert.equal(passesHidePlayed(UNOWNED_NO_KEY, true), true);
+  assert.equal(passesPlayState(UNOWNED_NO_KEY, PLAY_STATE_NOT_PLAYED), true);
+  assert.deepEqual(gamesToCheck([UNOWNED_NO_KEY]), []);
+
+  // An explicit `played: false` and an absent key must agree – if they ever
+  // stop agreeing, the page has two meanings for "no record".
+  assert.equal(passesHidePlayed({ ...NO_KEY, played: false }, true), passesHidePlayed(NO_KEY, true));
+  assert.equal(
+    gamesToCheck([{ ...NO_KEY, played: false }]).length,
+    gamesToCheck([NO_KEY]).length,
+  );
+});
+
+test("12.5: applyMark re-derives a row after a toggle, and a mark never overrides Steam", () => {
+  // What the page does after a successful write, instead of re-fetching 10 MB.
+
+  // The 297: the mark is the only evidence there is, so it becomes the source.
+  const marked = applyMark(PORTAL, { played: 1, finished: 0 });
+  assert.equal(marked.played, true);
+  assert.equal(marked.finished, false);
+  assert.equal(marked.playedSource, "you");
+  assert.equal(statusLine(marked), "In your library – played (you said so)");
+
+  // Finished implies played, exactly as the server stores it.
+  const finished = applyMark(PORTAL, { played: 0, finished: 1 });
+  assert.equal(finished.played, true);
+  assert.equal(finished.finished, true);
+
+  // Clearing removes the assertion and nothing else.
+  assert.equal(applyMark(marked, { played: 0, finished: 0 }).played, false);
+  assert.equal(applyMark(marked, { played: 0, finished: 0 }).playedSource, null);
+  assert.equal(statusLine(applyMark(marked, { played: 0, finished: 0 })), "In your library – no play recorded");
+
+  // STEAM ALWAYS KEEPS ITS SOURCE. Marking, or clearing a mark on, a game
+  // Steam measured cannot make it unplayed - that is the refusal in §4.2.
+  assert.equal(applyMark(PORTAL_2, { played: 0, finished: 0 }).played, true);
+  assert.equal(applyMark(PORTAL_2, { played: 0, finished: 0 }).playedSource, "steam-playtime");
+  assert.equal(applyMark(TACTICAL_BREACH_WIZARDS, { played: 0, finished: 0 }).played, true);
+  assert.equal(applyMark(PORTAL_2, { played: 1, finished: 1 }).playedSource, "steam-playtime");
+  assert.equal(statusLine(applyMark(PORTAL_2, { finished: 1 })), "In your library – finished · 17 hours played");
+
+  // It is a copy, not a mutation - the caller replaces the row.
+  const before = { ...PORTAL };
+  applyMark(PORTAL, { played: 1 });
+  assert.deepEqual(PORTAL, before);
 });
 
 test("BROWSE_PAGE_SIZE renders a window, not the pool", () => {
@@ -419,7 +646,8 @@ test("BROWSE_PAGE_SIZE renders a window, not the pool", () => {
 // ---------------------------------------------------------------------------
 
 test("§10c: the status line, in evaluation order, with price SUPPRESSED for an owned game", () => {
-  assert.equal(statusLine(TACTICAL_BREACH_WIZARDS), "In your library – never played");
+  assert.equal(statusLine(PORTAL), "In your library – no play recorded");
+  assert.equal(statusLine(TACTICAL_BREACH_WIZARDS), "In your library – played, hours not recorded");
   assert.equal(statusLine(PORTAL_2), "In your library – 17 hours played");
   assert.equal(statusLine({ owned: true, hoursPlayed: 1 }), "In your library – 1 hour played");
   assert.equal(statusLine({ owned: true, hoursPlayed: 0.4 }), "In your library – under an hour played");
@@ -431,7 +659,68 @@ test("§10c: the status line, in evaluation order, with price SUPPRESSED for an 
   assert.equal(statusLine(DELTARUNE), "Price not known");
 
   // An owned game never shows a price, even when it has one.
-  assert.equal(statusLine({ owned: true, hoursPlayed: 0, price: 12.5, cut: 50 }), "In your library – never played");
+  assert.equal(statusLine({ owned: true, hoursPlayed: 0, price: 12.5, cut: 50 }), "In your library – no play recorded");
+});
+
+test("12.5 gate 4: all SEVEN status-line cases, and no line disguises a mark as a measurement", () => {
+  // James's ruled copy, literally, each against the real game that produces
+  // it on the live page. The requirement every one of them serves: Steam's
+  // number and James's verdict may both appear, and neither is ever dressed
+  // up as the other.
+  const marked = (extra) => ({ ...PORTAL, played: true, playedSource: "you", ...extra });
+
+  // 1. Steam has hours. Unchanged from increment 12.
+  assert.equal(statusLine(PORTAL_2), "In your library – 17 hours played");
+  // 2. THE 45. Zero hours, but Steam holds a last-played date.
+  assert.equal(statusLine(TACTICAL_BREACH_WIZARDS), "In your library – played, hours not recorded");
+  assert.equal(
+    statusLine({ owned: true, hoursPlayed: 0, played: true, playedSource: "steam-disconnected" }),
+    "In your library – played, hours not recorded",
+  );
+  // 3. THE 297, marked played by James.
+  assert.equal(statusLine(marked()), "In your library – played (you said so)");
+  // 4. Finished, with Steam's hours beside it - BOTH facts, one line.
+  assert.equal(
+    statusLine({ ...PORTAL_2, finished: true }),
+    "In your library – finished · 17 hours played",
+  );
+  // 5. Finished, Steam has nothing.
+  assert.equal(statusLine(marked({ finished: true })), "In your library – finished (you said so)");
+  // 6. THE CHANGED LINE. Owned, Steam has nothing, no mark.
+  assert.equal(statusLine(PORTAL), "In your library – no play recorded");
+  // 7. The seventh case, ruled at checkpoint 01: finished, and Steam knows a
+  //    last-played date but no hours. One consistent rule, not a special case.
+  assert.equal(
+    statusLine({ ...TACTICAL_BREACH_WIZARDS, finished: true }),
+    "In your library – finished · played, hours not recorded",
+  );
+
+  // THE INVARIANT THE COPY RESTS ON: a user assertion always carries "(you
+  // said so)", and a Steam measurement never does.
+  for (const row of [marked(), marked({ finished: true })]) {
+    assert.equal(statusLine(row).includes("(you said so)"), true);
+  }
+  for (const row of [PORTAL_2, TACTICAL_BREACH_WIZARDS, PORTAL, { ...PORTAL_2, finished: true }]) {
+    assert.equal(statusLine(row).includes("(you said so)"), false, `${row.title} presented a measurement as a mark`);
+  }
+
+  // And the browse column is the same fragment, still composed rather than
+  // carved out of the sentence.
+  assert.equal(ownedCell(marked()), "played (you said so)");
+  assert.equal(ownedCell({ ...PORTAL_2, finished: true }), "finished · 17 hours played");
+});
+
+test("12.5: a mark on a row the live library never returned still reads honestly", () => {
+  // Steam down, or no credentials: hoursPlayed is null on every row. A mark is
+  // still the user's own assertion and is still true, so it renders - and an
+  // UNMARKED row in that state still says nothing at all rather than "no play
+  // recorded", because zero and unknown are different (the increment 12 bug).
+  assert.equal(statusLine({ owned: true, hoursPlayed: null }), "In your library");
+  assert.equal(
+    statusLine({ owned: true, hoursPlayed: null, played: true, playedSource: "you" }),
+    "In your library – played (you said so)",
+  );
+  assert.equal(playedFragment({ owned: true, hoursPlayed: null }), null);
 });
 
 test("§10c: the length line reads all THREE hasEnding states differently", () => {
@@ -649,7 +938,8 @@ test("CR-4 / TC-4: the browse 'Yours' cell is COMPOSED from the status line, nev
   // touches that separator the replace silently no-ops and the column prints
   // the whole sentence instead of the fragment.
   assert.equal(ownedCell(PORTAL_2), "17 hours played");
-  assert.equal(ownedCell(TACTICAL_BREACH_WIZARDS), "never played");
+  assert.equal(ownedCell(PORTAL), "no play recorded");
+  assert.equal(ownedCell(TACTICAL_BREACH_WIZARDS), "played, hours not recorded");
   assert.equal(ownedCell({ owned: true, hoursPlayed: 0.4 }), "under an hour played");
   assert.equal(ownedCell({ owned: true, hoursPlayed: 1 }), "1 hour played");
   assert.equal(ownedCell(DELTARUNE), "", "a game you do not own has nothing in the Yours column");
@@ -661,7 +951,7 @@ test("CR-4 / TC-4: the browse 'Yours' cell is COMPOSED from the status line, nev
 
   // THE COUPLING ITSELF, asserted. If the separator or the prefix is re-ruled,
   // this fails rather than the column quietly changing shape.
-  for (const row of [PORTAL_2, TACTICAL_BREACH_WIZARDS, { owned: true, hoursPlayed: 0.4 }]) {
+  for (const row of [PORTAL_2, TACTICAL_BREACH_WIZARDS, PORTAL, { owned: true, hoursPlayed: 0.4 }]) {
     assert.equal(statusLine(row), `${OWNED_PREFIX} – ${playedFragment(row)}`);
     assert.equal(statusLine(row).endsWith(ownedCell(row)), true);
   }
@@ -772,14 +1062,21 @@ test("SEC-6: nothing under public/ ever builds DOM from a string – the whole X
   }
 });
 
-test("a NULL hoursPlayed on an owned row says nothing about playtime - it is not 'never played'", () => {
+test("a NULL hoursPlayed on an owned row says nothing about playtime - it is not 'no play recorded'", () => {
   // Caught while capturing the first-run states. With no credentials, or with
   // Steam down, the LIVE library join is empty so every hoursPlayed is null -
   // but `owned` survives on D1's own source_owned stamp. Portal 2 has 17
   // hours on it and was being rendered "never played".
   assert.equal(statusLine({ owned: true, hoursPlayed: null }), "In your library");
   assert.equal(statusLine({ owned: true, hoursPlayed: undefined }), "In your library");
-  assert.equal(statusLine({ owned: true, hoursPlayed: 0 }), "In your library – never played");
+
+  // Increment 12.5: 0 is not null and neither of them is "never". A LIVE zero
+  // means Steam holds no record - true of 297 owned games, of which Portal is
+  // one - and an ABSENT hoursPlayed means the library join did not happen at
+  // all, which says nothing about anything.
+  assert.equal(statusLine({ owned: true, hoursPlayed: 0 }), "In your library – no play recorded");
+  // The string that used to render there, gone from the module entirely.
+  assert.equal(/never played/.test(statusLine({ owned: true, hoursPlayed: 0 })), false);
   assert.equal(statusLine({ owned: true, hoursPlayed: 17 }), "In your library – 17 hours played");
 });
 
@@ -929,6 +1226,10 @@ test("GATE 5, TC-2: the picks are provably unaffected by a REAL filter object, n
     minExperience: 97,
     includeTags: ["Horror"],
     top100: true,
+    // Increment 12.5. "Finished" bites hard on this fixture: nothing in ALL
+    // is marked finished, so the browse list empties while the picks must not
+    // move by a single row.
+    playState: PLAY_STATE_FINISHED,
   };
   for (const key of Object.keys(DEFAULT_RANK_FILTERS)) {
     if (CHIP_KEYS.has(key)) continue;
@@ -950,7 +1251,7 @@ test("GATE 5, TC-2: the picks are provably unaffected by a REAL filter object, n
   );
   assert.deepEqual(
     selectPicks(ALL, { ...filterShaped, hidePlayed: true }).map((r) => r.title),
-    ["Tactical Breach Wizards", "DELTARUNE", "Amnesia: The Bunker", "Desvelado"],
+    ["Portal", "DELTARUNE", "Amnesia: The Bunker", "Desvelado"],
   );
 
   // NOTE FOR THE NEXT CHANGE, and it is the one live hazard here: the browse
@@ -964,7 +1265,7 @@ test("GATE 5, TC-2: the picks are provably unaffected by a REAL filter object, n
   assert.equal("hideOwned" in DEFAULT_RANK_FILTERS, false);
   assert.deepEqual(
     selectPicks(ALL, { ...DEFAULT_RANK_FILTERS, hidePlayed: true }).map((r) => r.title),
-    ["Tactical Breach Wizards", "DELTARUNE", "Amnesia: The Bunker", "Desvelado"],
+    ["Portal", "DELTARUNE", "Amnesia: The Bunker", "Desvelado"],
     "the collision, stated: this is the one key of the blob that would move the picks",
   );
 });

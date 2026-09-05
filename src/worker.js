@@ -86,6 +86,15 @@ import {
   removeDismissal,
   excludeDismissed,
 } from "./dismissals.js";
+import {
+  ensureMarksSchema,
+  listMarks,
+  getMarksByAppid,
+  setMark,
+  removeMark,
+  normaliseMark,
+  derivePlayed,
+} from "./marks.js";
 
 const STEAM_API_URL =
   "https://api.steampowered.com/IPlayerService/GetOwnedGames/v1/";
@@ -105,6 +114,104 @@ function jsonError(message, status, headers = {}) {
   });
 }
 
+/** A caller-supplied display name on its way into a durable table. Kept only
+ * if it is a string, and capped at 200 characters - long enough for the
+ * longest name Steam ships, short enough that nothing unbounded is stored
+ * forever in a table nothing prunes. */
+/**
+ * An appid from anywhere untrusted - a JSON body or the tail of a `/:appid`
+ * path - as a whole positive number, or NaN, which every caller answers with
+ * a 400.
+ *
+ * WHY NOT `Number(value)` AND `Number.isFinite`, which is what this was.
+ * Number() coerces far more than it looks like it does: `""` and `[]` become
+ * 0, `true` becomes 1, `"0x10"` becomes 16, and `1.5` stayed finite and
+ * reached SQLite, where it threw into the fail-soft catch and reported a
+ * failure the caller could do nothing with. Junk appids landing in
+ * `game_marks` matter more than anywhere else in this project because that
+ * table cannot be re-fetched from anything. This accepts a JSON number that is
+ * already a whole positive integer, or an all-digits string (a path tail is
+ * always a string), and nothing else.
+ */
+function toAppid(value) {
+  if (typeof value === "number") return Number.isInteger(value) && value > 0 ? value : NaN;
+  if (typeof value === "string" && /^\d+$/.test(value)) {
+    const n = Number(value);
+    return n > 0 ? n : NaN;
+  }
+  return NaN;
+}
+
+const MAX_NAME_LENGTH = 200;
+function capName(value) {
+  return typeof value === "string" ? value.slice(0, MAX_NAME_LENGTH) : null;
+}
+
+/**
+ * Guard for the three state-changing JSON routes (POST /api/marks, POST
+ * /api/dismissals, PUT /api/settings). Returns a Response to send back, or
+ * null when the request may proceed.
+ *
+ * WHY THIS EXISTS. Increment 12's audit accepted these routes on the reasoning
+ * that "a JSON content-type blocks simple-form CSRF". That was never true:
+ * `request.json()` is the fetch spec's Body.json() and parses the body
+ * whatever the Content-Type claims, and nothing in this file looked at a
+ * header. A cross-origin `<form method="POST" enctype="text/plain">` sends a
+ * CORS-safelisted content type with no preflight and a body an attacker can
+ * shape into valid JSON, so these routes were CSRF-writable from any page open
+ * in the browser. The rationale is now enforced in code rather than asserted.
+ *
+ * TWO CHECKS.
+ *   1. Content-Type must be application/json. This is the load-bearing one. A
+ *      `<form>` can only ever send the three CORS-safelisted content types,
+ *      and a cross-origin fetch() carrying application/json triggers a
+ *      preflight this worker never answers with CORS headers, so the real
+ *      request never fires.
+ *   2. Sec-Fetch-Site, WHEN PRESENT, must be same-origin. Defence in depth:
+ *      the browser sets it and page script cannot forge it.
+ *
+ * A MISSING Sec-Fetch-Site IS ALLOWED, deliberately. The header is absent on
+ * every non-browser client - curl, this project's own tools, the tests - and
+ * this is a single-user local app those callers legitimately talk to. Failing
+ * closed on absence would break them in order to defend against the browsers
+ * that omit the header, and those browsers are already stopped by check 1,
+ * which does not depend on Sec-Fetch-Site at all.
+ */
+function rejectUnsafeWrite(request) {
+  const type = (request.headers.get("content-type") || "").trim().toLowerCase();
+  if (!type.startsWith("application/json")) {
+    return jsonError("content-type must be application/json", 415);
+  }
+  return rejectCrossSite(request);
+}
+
+/**
+ * The `Sec-Fetch-Site` half of the guard, on its own.
+ *
+ * QA, 2026-09-05. `rejectUnsafeWrite` covered the two POST routes but neither
+ * DELETE, so `DELETE /api/marks/400` with `Sec-Fetch-Site: cross-site`
+ * returned 200 and cleared the mark. It is not browser-exploitable - the
+ * preflight `OPTIONS /api/marks/400` answers 405 with no CORS headers, so a
+ * page cannot get there - but that makes the browser the defence rather than
+ * the worker, on the one table in this project that cannot be rebuilt from
+ * anywhere. The whole reason the GET-deletes blocker was a blocker.
+ *
+ * Split out rather than reusing `rejectUnsafeWrite` because a DELETE has no
+ * body: demanding `application/json` on it would reject `curl -X DELETE` and
+ * this project's own tools for nothing.
+ *
+ * A MISSING header is still allowed, same decision as the POST path: curl,
+ * the tools and the tests never send one, and every browser that can reach a
+ * cross-origin request sends it.
+ */
+function rejectCrossSite(request) {
+  const site = request.headers.get("sec-fetch-site");
+  if (site && site !== "same-origin") {
+    return jsonError("cross-site write rejected", 403);
+  }
+  return null;
+}
+
 /** Build the jsonError() response for an Error thrown by the ITAD-calling
  * helpers below (each throws with a `.status`, and `.retryAfter` for 429s). */
 function upstreamErrorResponse(err) {
@@ -120,14 +227,38 @@ function trimGame(game) {
     playtime_forever: game.playtime_forever,
     playtime_2weeks: game.playtime_2weeks,
     rtime_last_played: game.rtime_last_played,
+    // Increment 12.5. Steam sends this without being asked, same as
+    // `rtime_last_played`, and it is a played SIGNAL only – never added into
+    // `hoursPlayed` (src/marks.js's derivePlayed explains why). Measured on
+    // the live library 2026-09-05: all 42 games carrying it are already inside
+    // the 45 that `rtime_last_played` recovers, so it recovers ZERO additional
+    // games today. It is carried because it is an independent signal on a
+    // request we already make and Steam guarantees nothing about the two
+    // always travelling together, not because it found anything.
+    playtime_disconnected: game.playtime_disconnected,
   };
 }
+
+/**
+ * THE SHAPE OF THE CACHED PAYLOAD, AS A NUMBER. Bump this whenever trimGame's
+ * key set changes.
+ *
+ * 2 – increment 12.5 added `playtime_disconnected`.
+ *
+ * Without it this increment ships a trap with a 24-hour fuse: a library
+ * payload cached BEFORE the deploy has no `playtime_disconnected` field, so a
+ * game whose only play evidence is that field would silently read "no play
+ * recorded" for up to a day – and the symptom looks exactly like the new code
+ * not working. One line here removes it. Asking anyone to remember `?refresh=1`
+ * does not.
+ */
+const LIBRARY_CACHE_VERSION = 2;
 
 /** Cache key for the trimmed-library response, stable per steamid and
  * independent of ?refresh= so a refresh both bypasses and repopulates it. */
 function libraryCacheKey(env) {
   return new Request(
-    `https://steam-sale-scout.cache/api/library?steamid=${env.STEAM_ID}`,
+    `https://steam-sale-scout.cache/api/library?steamid=${env.STEAM_ID}&v=${LIBRARY_CACHE_VERSION}`,
   );
 }
 
@@ -288,6 +419,31 @@ async function getDismissedAppIds(env) {
     return await getDismissedAppIdSet(env);
   } catch {
     return new Set();
+  }
+}
+
+/**
+ * Per-game marks (Increment 12.5) for /api/rank's row build, keyed by appid.
+ *
+ * READ ONLY, AND IT MUST STAY THAT WAY. Unlike getDismissedAppIds above,
+ * whose result is JOINED AGAINST TO REMOVE ROWS FROM THE POOL, this map is
+ * only ever read to ANNOTATE a row that is already in the pool. A mark never
+ * filters /api/rank's pool and never enters any score (SPEC.md §2, §7.3) –
+ * it rides on the row as data and the browser is the only thing that acts on
+ * it. That is what makes gate 5's "the ranking is unmoved by twenty marks"
+ * true by construction rather than by testing.
+ *
+ * Fail-soft exactly like getDismissedAppIds: a missing FPM_DB or a D1 hiccup
+ * means no annotations this request, never a broken lane.
+ * @returns {Promise<Map<number, {played: number, finished: number}>>}
+ */
+async function getGameMarks(env) {
+  if (!env.FPM_DB) return new Map();
+  try {
+    await ensureMarksSchema(env);
+    return await getMarksByAppid(env);
+  } catch {
+    return new Map();
   }
 }
 
@@ -2276,6 +2432,11 @@ async function handleRank(request, env, ctx) {
   }
 
   const dismissedAppIds = await getDismissedAppIds(env);
+  // Increment 12.5. Loaded here, next to the dismissals, so the contrast is
+  // visible at the call site: `dismissedAppIds` is consumed by a `continue`
+  // in the pool loop below; `marksByAppid` is consumed ONLY in the response
+  // row build, never in the loop, never in a score.
+  const marksByAppid = await getGameMarks(env);
   const libraryGames = await loadLibraryForRank(env, ctx, refresh);
   const libraryByAppid = new Map(libraryGames.map((game) => [game.appid, game]));
 
@@ -2517,6 +2678,11 @@ async function handleRank(request, env, ctx) {
 
     const reviewCount = (row.positive || 0) + (row.negative || 0);
     const libraryGame = libraryByAppid.get(row.appid);
+    // Increment 12.5. Four derived fields, computed by the same pure function
+    // the tests exercise, AFTER the blend above has already been computed from
+    // `row` and `entry` alone – so there is no path by which a mark can reach
+    // `rankScore`.
+    const playState = derivePlayed(libraryGame, marksByAppid.get(row.appid));
 
     funnel.ranked++;
     if (entry.owned) funnel.owned++;
@@ -2532,6 +2698,16 @@ async function handleRank(request, env, ctx) {
       title: row.name,
       owned: entry.owned,
       hoursPlayed: libraryGame ? (libraryGame.playtime_forever || 0) / 60 : null,
+      // THE FOUR FIELDS THIS INCREMENT ADDS, AND THEY ARE ANNOTATIONS, NOT
+      // INPUTS. `played` is true if Steam has ANY evidence or the user said
+      // so; `playedSource` names WHICH, so the page can show Steam's number
+      // and the user's verdict side by side without ever disguising one as
+      // the other. `hoursPlayed` above is untouched – `playtime_disconnected`
+      // is deliberately NOT merged into it.
+      played: playState.played,
+      finished: playState.finished,
+      playedSource: playState.playedSource,
+      lastPlayedAt: playState.lastPlayedAt,
       experienceScore: row.experience_score,
       gameScore: row.game_score ?? null,
       // hasEnding stays the INTEGER 0/1/null D1 holds rather than a boolean,
@@ -2665,6 +2841,8 @@ async function handleGetSettings(request, env, ctx) {
  * case below, which reports {saved:false} rather than breaking the caller's
  * flow (the frontend's save is already fire-and-forget/best-effort). */
 async function handlePutSettings(request, env, ctx) {
+  const unsafe = rejectUnsafeWrite(request);
+  if (unsafe) return unsafe;
   if (!env.FPM_DB) {
     return new Response(JSON.stringify({ saved: false }), {
       status: 200,
@@ -2730,6 +2908,8 @@ async function handleGetDismissals(request, env, ctx) {
 }
 
 async function handlePostDismissal(request, env, ctx) {
+  const unsafe = rejectUnsafeWrite(request);
+  if (unsafe) return unsafe;
   if (!env.FPM_DB) {
     return new Response(JSON.stringify({ dismissed: false }), {
       status: 200,
@@ -2743,11 +2923,12 @@ async function handlePostDismissal(request, env, ctx) {
   } catch {
     body = null;
   }
-  const appid = Number(body?.appid);
-  if (!Number.isFinite(appid)) {
+  // A whole positive appid only - see toAppid() for what Number() let through.
+  const appid = toAppid(body?.appid);
+  if (!Number.isInteger(appid) || appid <= 0) {
     return jsonError("appid is required.", 400);
   }
-  const name = typeof body?.name === "string" ? body.name : null;
+  const name = capName(body?.name);
 
   try {
     await ensureDismissalsSchema(env);
@@ -2768,13 +2949,15 @@ async function handlePostDismissal(request, env, ctx) {
  * parsed off the tail of the URL path (this route is dispatched by prefix,
  * see the fetch() router below). */
 async function handleDeleteDismissal(request, env, ctx, appid) {
+  const unsafe = rejectCrossSite(request);
+  if (unsafe) return unsafe;
   if (!env.FPM_DB) {
     return new Response(JSON.stringify({ restored: false }), {
       status: 200,
       headers: { "content-type": "application/json" },
     });
   }
-  if (!Number.isFinite(appid)) {
+  if (!Number.isInteger(appid) || appid <= 0) {
     return jsonError("appid is required.", 400);
   }
 
@@ -2787,6 +2970,122 @@ async function handleDeleteDismissal(request, env, ctx, appid) {
     });
   } catch {
     return new Response(JSON.stringify({ restored: false }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// /api/marks (Increment 12.5) – "I played this / I finished this". The pair
+// /api/dismissals already has, with one deliberate difference: THERE IS NO
+// SERVER-SIDE EXCLUSION JOIN ANYWHERE. A dismissal removes a row from every
+// lane's pool; a mark only ever annotates a row that is already there
+// (SPEC.md §2, §7.3). Fail-soft posture identical to the dismissals routes
+// above – a missing FPM_DB or a D1 throw answers 200 with an honest
+// empty/false body rather than a 500, and the PAGE is responsible for showing
+// that a write did not stick (increment 12's review caught "said nothing at
+// all" four ways; public/index.html reverts the toggle and says so).
+// ---------------------------------------------------------------------------
+
+async function handleGetMarks(request, env, ctx) {
+  if (!env.FPM_DB) {
+    return new Response(JSON.stringify({ marks: [] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  try {
+    await ensureMarksSchema(env);
+    const marks = await listMarks(env);
+    return new Response(JSON.stringify({ marks }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  } catch {
+    return new Response(JSON.stringify({ marks: [] }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+}
+
+/**
+ * POST /api/marks – a FULL-STATE UPSERT, NOT A TOGGLE. The body carries the
+ * state the user wants (`{appid, name, played, finished}`), so a double-click,
+ * a retry or a second tab is idempotent and cannot flip the mark to the
+ * opposite of what was pressed. The `finished => played` invariant is applied
+ * by normaliseMark on the way in, so the impossible row cannot be stored even
+ * if something else posts `{played: 0, finished: 1}`.
+ */
+async function handlePostMark(request, env, ctx) {
+  const unsafe = rejectUnsafeWrite(request);
+  if (unsafe) return unsafe;
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    body = null;
+  }
+  // A whole positive appid only. This table is the one thing here that cannot
+  // be re-fetched from anywhere, so a junk row in it is permanent - and the
+  // client's steamUrl was already validating more strictly than the server.
+  const appid = toAppid(body?.appid);
+  if (!Number.isInteger(appid) || appid <= 0) {
+    return jsonError("appid is required.", 400);
+  }
+  const name = capName(body?.name);
+  const state = normaliseMark(body);
+
+  if (!env.FPM_DB) {
+    return new Response(JSON.stringify({ saved: false, ...state }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  try {
+    await ensureMarksSchema(env);
+    const stored = await setMark(env, appid, name, state);
+    // The STORED state is echoed, not the requested one, so the page renders
+    // what the database actually holds – the invariant is visible to the
+    // caller rather than something it has to know about.
+    return new Response(JSON.stringify({ saved: true, ...stored }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  } catch {
+    return new Response(JSON.stringify({ saved: false, ...state }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+}
+
+/** DELETE /api/marks/:appid – clears the mark. This is the toggles' third
+ * state and it REMOVES an assertion; it does not assert "never played". A
+ * no-op, not an error, if no mark exists. */
+async function handleDeleteMark(request, env, ctx, appid) {
+  const unsafe = rejectCrossSite(request);
+  if (unsafe) return unsafe;
+  if (!Number.isInteger(appid) || appid <= 0) {
+    return jsonError("appid is required.", 400);
+  }
+  if (!env.FPM_DB) {
+    return new Response(JSON.stringify({ cleared: false }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  try {
+    await ensureMarksSchema(env);
+    await removeMark(env, appid);
+    return new Response(JSON.stringify({ cleared: true }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  } catch {
+    return new Response(JSON.stringify({ cleared: false }), {
       status: 200,
       headers: { "content-type": "application/json" },
     });
@@ -2834,9 +3133,25 @@ export default {
       if (request.method === "POST") return handlePostDismissal(request, env, ctx);
       return handleGetDismissals(request, env, ctx);
     }
+    // THE VERB IS PART OF THE ROUTE. Both `/:appid` routes below dispatch by
+    // path PREFIX, and until increment 12.5's security review they ran the
+    // DELETE handler on ANY method - so a plain
+    // `<img src="http://localhost:8787/api/marks/440">` on any page open in
+    // the browser destroyed a mark, with no JS, no CORS and no preflight.
+    // A GET is not allowed to be a write.
     if (url.pathname.startsWith("/api/dismissals/")) {
-      const appid = Number(url.pathname.slice("/api/dismissals/".length));
+      if (request.method !== "DELETE") return jsonError("method not allowed", 405);
+      const appid = toAppid(url.pathname.slice("/api/dismissals/".length));
       return handleDeleteDismissal(request, env, ctx, appid);
+    }
+    if (url.pathname === "/api/marks") {
+      if (request.method === "POST") return handlePostMark(request, env, ctx);
+      return handleGetMarks(request, env, ctx);
+    }
+    if (url.pathname.startsWith("/api/marks/")) {
+      if (request.method !== "DELETE") return jsonError("method not allowed", 405);
+      const appid = toAppid(url.pathname.slice("/api/marks/".length));
+      return handleDeleteMark(request, env, ctx, appid);
     }
     if (url.pathname.startsWith("/api/")) {
       return jsonError("not implemented", 501);

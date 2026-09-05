@@ -143,6 +143,23 @@
   footer { margin-top: 2.5rem; border-top: 1px solid var(--line); padding-top: 1rem; color: var(--muted); font-size: 0.88rem; }
   footer ul { margin: 0.5rem 0 0; padding-left: 1.1rem; }
   footer summary { cursor: pointer; }
+  /* Increment 12.5. The two mark toggles are SECONDARY WEIGHT on the card -
+     smaller than "View on Steam", never competing with the reason line, and
+     never adding a fourth line to a card (SPEC-12 §10b.1 keeps ten cards
+     scannable). An active toggle is bold and carries a tick, because colour
+     alone is not enough on a text button. */
+  .pick-actions button[aria-pressed="true"] { font-weight: 600; }
+  details.tocheck { margin: 0.8rem 0; }
+  details.tocheck > summary { cursor: pointer; font-weight: 600; font-size: 0.9rem; }
+  .tocheck-why { color: var(--muted); font-size: 0.85rem; margin: 0.3rem 0; }
+  .tocheck-list { margin: 0.3rem 0; padding-left: 1.2rem; }
+  .tocheck-list li { margin-bottom: 0.25rem; font-size: 0.9rem; }
+  .tocheck-list .rank { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .row-marks button {
+    background: none; border: none; color: var(--accent); cursor: pointer;
+    font-size: 0.75rem; padding: 0 0 0 0.4rem;
+  }
+  .row-marks button[aria-pressed="true"] { font-weight: 600; }
   .dismissed-list { margin-top: 0.6rem; }
   .dismissed-list li { margin-bottom: 0.2rem; }
 </style>
@@ -171,6 +188,9 @@
   <div class="filters" id="filters">
     <label>Search by name
       <input type="search" id="f-search" placeholder="Type a game name…" />
+    </label>
+    <label>Play state
+      <select id="f-playstate"></select>
     </label>
     <label>Ownership
       <select id="f-ownership">
@@ -210,6 +230,11 @@
     <div class="tagchips" id="f-tags"></div>
   </div>
 
+  <details class="tocheck" id="tocheck">
+    <summary id="tocheck-summary">Games to check</summary>
+    <p class="tocheck-why">Owned games Steam has no record of, in rank order. These are the only ones in your way – marking one takes a click and it never comes back.</p>
+    <ul class="tocheck-list" id="tocheck-list"></ul>
+  </details>
   <p class="browse-count" id="browse-count"></p>
   <table id="browse-table">
     <thead><tr id="browse-head"></tr></thead>
@@ -231,6 +256,7 @@
     similarityLensEnabled, similarityDisabledReason,
     LIBRARY_STATE_FETCH_FAILED,
     isRenderablePayload, unavailableMessage, RANK_UNAVAILABLE_LEAD,
+    PLAY_STATES, PLAY_STATE_ALL, applyMark, gamesToCheck, GAMES_TO_CHECK_WINDOW,
   } from "./rankFilters.js";
 
   // -------------------------------------------------------------------------
@@ -427,9 +453,17 @@
     view.href = steamUrl(row.appid);
     view.target = "_blank";
     view.rel = "noopener";
+    // INCREMENT 12.5. The two toggles, at secondary weight, in the actions row
+    // that already exists. They are ON THE CARD rather than behind a "Mark…"
+    // menu because the 297 problem is DISCOVERED on the front page - that is
+    // literally how this increment got triggered, with Portal sitting at pick
+    // #6 saying "never played". A menu would cost an extra click on the one
+    // interaction this whole increment exists to make cheap.
+    const played = markButton(row, "played");
+    const finished = markButton(row, "finished");
     const dismiss = el("button", null, "Not interested");
     dismiss.addEventListener("click", () => dismissRow(row));
-    actions.append(view, dismiss);
+    actions.append(view, played, finished, dismiss);
     facts.append(actions);
     body.append(facts);
 
@@ -525,10 +559,16 @@
             mark.title = confidenceTitle(row);
             td.append(mark);
           }
+          // Increment 12.5: the same two toggles per row, at row weight. The
+          // "Yours" column beside them reads from the same `playedFragment`
+          // the card's status line uses, so a mark can never say one thing in
+          // the table and another on the card.
+          const marks = el("span", "row-marks");
+          marks.append(markButton(row, "played"), markButton(row, "finished"));
           const dismiss = el("button", null, "Not interested");
           dismiss.style.cssText = "background:none;border:none;color:#2a6df5;cursor:pointer;font-size:0.75rem;padding:0 0 0 0.4rem;";
           dismiss.addEventListener("click", () => dismissRow(row));
-          td.append(dismiss);
+          td.append(marks, dismiss);
         } else {
           td.textContent = String(col.cell(row, i));
         }
@@ -545,6 +585,43 @@
 
     const more = $("browse-more");
     more.hidden = filtered.length <= state.browseShown;
+  }
+
+  /**
+   * "Games to check" - what turns 297 into a finite job.
+   *
+   * MEASURED, NOT ASSUMED (2026-09-05, live): of the 297 owned games Steam has
+   * no record of, FIVE are in the top 50, sixteen in the top 200 and 62 in the
+   * top 1,000. An unmarked game costs exactly one thing - it can appear as a
+   * pick for a game already played - so the work is bounded by the top of the
+   * ranking, not by the size of the library. James ruled the window at 50.
+   *
+   * It reads the CURRENT LENS's rank order, so "in your way" means in your way
+   * on the list you are actually looking at.
+   */
+  function renderGamesToCheck() {
+    const all = rows();
+    const list = gamesToCheck(all);
+    $("tocheck-summary").textContent = `Games to check (${formatCount(list.length)} in your top ${GAMES_TO_CHECK_WINDOW})`;
+    const host = $("tocheck-list");
+    host.replaceChildren();
+    if (list.length === 0) {
+      host.append(el("li", null, `Nothing to check – every owned game in your top ${GAMES_TO_CHECK_WINDOW} has a play record or a mark.`));
+      return;
+    }
+    for (const row of list) {
+      const li = el("li");
+      li.append(el("span", "rank", `#${all.indexOf(row) + 1}  `));
+      const link = el("a", null, row.title);
+      link.href = steamUrl(row.appid);
+      link.target = "_blank";
+      link.rel = "noopener";
+      li.append(link);
+      const marks = el("span", "row-marks");
+      marks.append(markButton(row, "played"), markButton(row, "finished"));
+      li.append(marks);
+      host.append(li);
+    }
   }
 
   function renderTagChips() {
@@ -650,6 +727,7 @@
     renderPicks();
     renderTagChips();
     renderBrowse();
+    renderGamesToCheck();
     renderFooter();
   }
 
@@ -681,6 +759,136 @@
     }
   }
 
+  // -------------------------------------------------------------------------
+  // Increment 12.5 - the two marks.
+  //
+  // WHY A MARK IS NOT A DISMISSAL, IN THE ONE PLACE A READER WILL WONDER.
+  // "Not interested" removes the row from the pool server-side, so the card
+  // goes and the next pick slides in. A mark changes NOTHING about the
+  // ranking (SPEC.md §2) - the row stays exactly where it is, and only its
+  // status line and its toggles change. That difference is the whole reason
+  // marks live in their own table and never touch /api/rank's pool.
+  // -------------------------------------------------------------------------
+
+  /** One toggle. `which` is "played" or "finished". */
+  function markButton(row, which) {
+    const on = which === "finished" ? row.finished === true : row.played === true;
+    const label = which === "finished" ? "Finished" : "Played";
+    const btn = el("button", null, on ? `✓ ${label}` : label);
+    btn.type = "button";
+    btn.setAttribute("aria-pressed", String(on));
+    btn.title = on ? "Click to clear" : `Tell the app you ${which === "finished" ? "finished" : "have played"} this`;
+    btn.addEventListener("click", () => toggleMark(row, which));
+    return btn;
+  }
+
+  /**
+   * Press a toggle. THE STATE SENT IS ALWAYS THE FULL STATE, never a "flip
+   * this" - POST /api/marks is an upsert, so a double-click or a retry cannot
+   * land the opposite of what was pressed.
+   *
+   * Pressing "Finished" sets both, because you cannot finish a game you never
+   * played; pressing an active "Played" on a finished game clears both. The
+   * server normalises the same invariant, so the two can never disagree.
+   */
+  function toggleMark(row, which) {
+    const playedNow = row.played === true;
+    const finishedNow = row.finished === true;
+    // "STEAM MEASURED IT" IS NOT "THE USER SAID SO". `row.played` is true for
+    // both, and re-asserting it on the way out of "Finished" would write a
+    // played:1 James never claimed into the one table that cannot be rebuilt
+    // from anywhere - invisible on screen, because Steam's evidence outranks a
+    // mark in derivePlayed, but GET /api/marks would report it as a mark.
+    // Un-marking a game Steam already measured clears the row instead.
+    const steamMeasured = typeof row.playedSource === "string" && row.playedSource.startsWith("steam-");
+    const assertedPlayed = playedNow && !steamMeasured;
+    if (which === "finished") {
+      const finished = !finishedNow;
+      return writeMark(row, { played: finished || assertedPlayed ? 1 : 0, finished: finished ? 1 : 0 });
+    }
+    const played = !playedNow;
+    return writeMark(row, { played: played ? 1 : 0, finished: played ? (finishedNow ? 1 : 0) : 0 });
+  }
+
+  /**
+   * Write it, then repaint from what the SERVER SAYS IT STORED.
+   *
+   * A FAILED WRITE MUST SAY SO. Increment 12's review caught this class four
+   * separate ways - an action that silently did nothing while the page implied
+   * it had worked - and this is the same defect one lane over: James would
+   * believe a game is marked when it is not, and would find it back in his
+   * picks tomorrow with no explanation. POST /api/marks fail-softs at HTTP 200
+   * with `{saved:false}`, so `res.ok` is NOT the test; the body is.
+   */
+  async function writeMark(row, wanted) {
+    const clearing = wanted.played === 0 && wanted.finished === 0;
+    let stored = null;
+    try {
+      const res = clearing
+        ? await fetch(`/api/marks/${encodeURIComponent(row.appid)}`, { method: "DELETE" })
+        : await fetch("/api/marks", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ appid: row.appid, name: row.title, ...wanted }),
+          });
+      const body = res.ok ? await res.json() : null;
+      if (clearing) stored = body?.cleared === true ? { played: 0, finished: 0 } : null;
+      else stored = body?.saved === true ? { played: body.played, finished: body.finished } : null;
+    } catch {
+      stored = null;
+    }
+
+    if (stored === null) {
+      // Nothing was mutated locally, so there is nothing to roll back - the
+      // toggles simply re-render in their unchanged state, under a sentence
+      // that says the write did not land.
+      renderAll();
+      showMarkFailure(row, clearing);
+      return;
+    }
+
+    // Repaint every lens's copy of this row, so switching lens does not show a
+    // stale mark. `applyMark` re-derives `playedSource` under the same
+    // precedence the server uses - Steam's evidence always outranks a mark.
+    for (const [, p] of state.payloads) {
+      p.rank = p.rank.map((r) => (r.appid === row.appid ? applyMark(r, stored) : r));
+    }
+    renderAll();
+  }
+
+  /**
+   * The visible failure. Wording matches the undo path's sentence, so the page
+   * has one voice for "that did not work".
+   *
+   * IT MUST NAME THE STATE THE GAME IS ACTUALLY IN, and that differs by path.
+   * Nothing is mutated on a failure, so a failed CLEAR leaves the game marked
+   * and the toggle correctly repaints as pressed - saying "is not marked"
+   * under a pressed button is the button and the sentence contradicting each
+   * other with the sentence being the false one, which is exactly the class of
+   * lie increment 12 spent its review removing.
+   */
+  function showMarkFailure(row, clearing) {
+    raiseToast(el("div", "toast", clearing
+      ? `Couldn't clear that – ${row.title} is still marked.`
+      : `Couldn't save that – ${row.title} is not marked.`));
+  }
+
+  /**
+   * Put one thing in the single shared toast host, for 8 seconds.
+   *
+   * ONE TIMER, because there is one host. Each toast used to arm its own
+   * unconditional `setTimeout(...replaceChildren...)`, so dismissing a game
+   * within 8 seconds of a failed mark write let the older timer wipe the
+   * dismissal toast - and its Undo button - out from under the user.
+   */
+  let toastTimer = null;
+  function raiseToast(node) {
+    const host = $("toast");
+    clearTimeout(toastTimer);
+    host.replaceChildren(node);
+    toastTimer = setTimeout(() => { if (host.firstChild === node) host.replaceChildren(); }, 8000);
+  }
+
   /** "Not interested". The card goes immediately and the next pick slides in
    * without a reload; /api/rank already excludes dismissed rows server-side,
    * so a reload keeps it gone (SPEC.md §4.7). */
@@ -706,7 +914,6 @@
 
   function showToast(row, origin) {
     const host = $("toast");
-    host.replaceChildren();
     const line = el("div", "toast", `Dismissed. ${row.title} won't come back. `);
     const undo = el("button", null, "Undo");
     undo.addEventListener("click", async () => {
@@ -755,8 +962,7 @@
       renderAll();
     });
     line.append(undo);
-    host.append(line);
-    setTimeout(() => { if (host.firstChild === line) host.replaceChildren(); }, 8000);
+    raiseToast(line);
   }
 
   // -------------------------------------------------------------------------
@@ -807,6 +1013,7 @@
       clearTimeout(searchTimer);
       searchTimer = setTimeout(applySearch, 150);
     });
+    $("f-playstate").addEventListener("change", change(() => { state.filters.playState = $("f-playstate").value; }));
     $("f-ownership").addEventListener("change", change(() => { state.filters.ownership = $("f-ownership").value; }));
     $("f-played").addEventListener("change", change(() => { state.filters.hidePlayed = $("f-played").checked; }));
     $("f-sale").addEventListener("change", change(() => { state.filters.onSaleOnly = $("f-sale").checked; }));
@@ -827,6 +1034,17 @@
   }
 
   function restoreControlsFromState() {
+    // Built from PLAY_STATES rather than hand-written <option>s, so the four
+    // labels James ruled on live in one tested place.
+    const playstate = $("f-playstate");
+    if (playstate.childElementCount === 0) {
+      for (const { value, label } of PLAY_STATES) {
+        const option = el("option", null, label);
+        option.value = value;
+        playstate.append(option);
+      }
+    }
+    playstate.value = state.filters.playState || PLAY_STATE_ALL;
     $("f-search").value = state.filters.search;
     $("f-ownership").value = state.filters.ownership || OWNERSHIP_ALL;
     $("f-played").checked = state.filters.hidePlayed;
