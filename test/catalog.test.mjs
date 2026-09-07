@@ -50,7 +50,11 @@ import {
   fetchItadPricesBatch,
   selectPriceBatch,
   recordPriceResult,
+  recordPriceState,
   resolvePriceBatch,
+  resolvePriceStateBatch,
+  selectPriceStateBatch,
+  readCatalogVersion,
   runFpmSyncPipeline,
   startFpmSync,
   isFpmSyncRunning,
@@ -1293,15 +1297,25 @@ test("selectPriceBatch: owned rows are never selected — a price is never displ
   assert.deepEqual(rows, []);
 });
 
-test("selectPriceBatch: an unclassified or unmatched row is never selected — same gating as selectHltbBatch", async () => {
+test("selectPriceBatch: an unclassified row is never selected, but an unmatched one now IS – the dead main_hours gate is gone", async () => {
+  // INCREMENT 13, JAMES'S RULING 4. This test used to assert that a row with
+  // no `main_hours` was skipped, because selectPriceBatch carried
+  // `WHERE main_hours IS NOT NULL`. That column belongs to the RETIRED
+  // /api/fpm lane, whose HowLongToBeat fill increment 10 ruling 5 removed from
+  // every new metric - so the gate was silently excluding 3,627 catalogue rows
+  // from ever being price-checked at all, which is most of the "never checked"
+  // population the PRD mistook for ITAD having no data.
+  //
+  // The app_type gate stays: an unclassified row is still not a known game and
+  // still must not be priced.
   const env = makeEnv();
   await ensureCatalogSchema(env);
   await upsertCatalogRows(env, [catalogRowFromBulk(bulkRow({ appid: 1 })), catalogRowFromBulk(bulkRow({ appid: 2 }))], 1000);
-  await markAllGame(env, [1]); // appid 1 classified but never HLTB-matched; appid 2 not even classified
-  await recordHltbResult(env, 2, { mainHours: 5, matchMethod: "name", checkedAtMs: 1000 }); // matched but not classified
+  await markAllGame(env, [1]); // appid 1 is a classified game with NO main_hours
+  await recordHltbResult(env, 2, { mainHours: 5, matchMethod: "name", checkedAtMs: 1000 }); // matched but never classified
 
   const rows = await selectPriceBatch(env, { limit: 10, staleCutoffMs: 500 });
-  assert.deepEqual(rows, []);
+  assert.deepEqual(rows.map((r) => r.appid), [1], "the classified row with no HLTB match is now eligible");
 });
 
 test("selectPriceBatch: a checked row (priced or not) is retried once price_checked_at is older than FPM_PRICE_TTL_HOURS, not before", async () => {
@@ -1345,6 +1359,127 @@ test("recordPriceResult: a 'no price' result stamps price_checked_at with every 
   assert.equal(row.price_checked_at, 5000, "checked-but-priceless is distinguishable from never-checked (price_checked_at IS NULL)");
 });
 
+// ---------------------------------------------------------------------------
+// BLOCKER CR-1 (increment 13 review): the sale lane must not be able to undo
+// the fill's classification over the six-hourly TTL cycle. Three tests, one
+// per guard, plus the positive case that must keep working.
+// ---------------------------------------------------------------------------
+
+test("CR-1: fetchItadPricesBatch DROPS a $0.00 entry - a zero from ITAD is not a price", async () => {
+  // ITAD reports free-to-play games at amount 0, and `nondeals=true` is what
+  // makes those entries start arriving. Kept, a zero flows through as a real
+  // price and the card reads "$0.00" over a row that said "Free to play".
+  globalThis.fetch = async () =>
+    jsonResponse([
+      { id: "itad-free", deals: [{ shop: { id: 61 }, price: { amount: 0, amountInt: 0 }, regular: { amount: 0 }, cut: 0 }] },
+      { id: "itad-paid", deals: [{ shop: { id: 61 }, price: { amount: 9.99, amountInt: 999 }, regular: { amount: 19.99 }, cut: 50 }] },
+    ]);
+
+  const result = await fetchItadPricesBatch(makeEnv({ ITAD_API_KEY: "k" }), ["itad-free", "itad-paid"]);
+  assert.equal(result.status, "ok");
+  assert.equal(result.priceByItadId.has("itad-free"), false, "the zero-price entry is absent, exactly as an omitted id is");
+  assert.equal(result.priceByItadId.get("itad-paid").price, 9.99);
+});
+
+test("CR-1: a 'free' row SURVIVES an ITAD refresh offering $0.00 - the state is never reclassified", async () => {
+  const env = makeEnv();
+  await ensureCatalogSchema(env);
+  await upsertCatalogRows(env, [catalogRowFromBulk(bulkRow({ appid: 1, name: "Dota 2" }))], 1000);
+  // The fill classified it from Steam's own is_free, which is the ONLY thing
+  // allowed to establish `free`.
+  await recordPriceState(env, 1, { state: "free" }, "getitems", 1000);
+
+  // Now the six-hourly sale lane runs and ITAD hands back a zero anyway.
+  await recordPriceResult(env, 1, { price: 0, priceCents: 0, regular: 0, cut: 0, itadId: "itad-free", checkedAtMs: 9000 });
+
+  const row = await env.FPM_DB.prepare("SELECT * FROM fpm_catalog WHERE appid = 1").first();
+  assert.equal(row.price_state, "free", "still free - the sale lane cannot reclassify");
+  assert.equal(row.price, null, "and no $0.00 was written for statusLine to render");
+});
+
+test("CR-1: 'delisted' and 'region' rows are equally untouchable by the sale lane", async () => {
+  const env = makeEnv();
+  await ensureCatalogSchema(env);
+  await upsertCatalogRows(env, [1, 2].map((appid) => catalogRowFromBulk(bulkRow({ appid }))), 1000);
+  await recordPriceState(env, 1, { state: "delisted" }, "getitems", 1000);
+  await recordPriceState(env, 2, { state: "region" }, "getitems", 1000);
+
+  for (const appid of [1, 2]) {
+    await recordPriceResult(env, appid, { price: 4.99, priceCents: 499, regular: 9.99, cut: 50, itadId: "x", checkedAtMs: 9000 });
+  }
+
+  const rows = (await env.FPM_DB.prepare("SELECT appid, price_state, price, price_checked_at, itad_id FROM fpm_catalog ORDER BY appid").all()).results;
+  assert.deepEqual(rows.map((r) => r.price_state), ["delisted", "region"]);
+  assert.deepEqual(rows.map((r) => r.price), [null, null]);
+  // CR-15: the guard blocks the PRICE, never the cursor. Both rows must still
+  // be stamped, or selectPriceBatch re-selects them on every sync forever.
+  assert.deepEqual(rows.map((r) => r.price_checked_at), [9000, 9000], "the cursor advanced even though the price was refused");
+  assert.deepEqual(rows.map((r) => r.itad_id), ["x", "x"], "and the resolved itad id was still recorded");
+});
+
+test("CR-15: a guarded row is stamped, reported as NOT priced, and never re-selected by selectPriceBatch", async () => {
+  // The defect: the guard sat on the same UPDATE that wrote price_checked_at,
+  // so up to 772 live rows (ruling 13's bundle-only `unknown`s, all carrying
+  // an itad_id) were re-selected on every sync and never advanced.
+  const env = makeEnv();
+  await ensureCatalogSchema(env);
+  await upsertCatalogRows(env, [catalogRowFromBulk(bulkRow({ appid: 1 }))], 1000);
+  await recordPriceState(env, 1, { state: "unknown" }, "getitems", 1000);
+
+  const landed = await recordPriceResult(env, 1, { price: 6.4, priceCents: 640, regular: 12.8, cut: 50, itadId: "itad-bundle", checkedAtMs: 9000 });
+  assert.equal(landed, false, "recordPriceResult reports the write as blocked, so the sync counter cannot over-report it");
+
+  const row = await env.FPM_DB.prepare("SELECT * FROM fpm_catalog WHERE appid = 1").first();
+  assert.equal(row.price_state, "unknown");
+  assert.equal(row.price, null);
+  assert.equal(row.price_checked_at, 9000);
+
+  // The cursor is what selectPriceBatch reads. Before the fix this returned
+  // the row again with a stale-cutoff any later than 9000.
+  const due = await selectPriceBatch(env, { limit: 10, staleCutoffMs: 8000 });
+  assert.deepEqual(due, [], "the row is no longer due - the cursor moved");
+});
+
+test("CR-15: a landing write still reports true, so `priced` counts real writes", async () => {
+  const env = makeEnv();
+  await ensureCatalogSchema(env);
+  await upsertCatalogRows(env, [catalogRowFromBulk(bulkRow({ appid: 1 }))], 1000);
+  await recordPriceState(env, 1, { state: "priced", price: 19.99, priceCents: 1999, regular: 19.99, cut: 0 }, "getitems", 1000);
+
+  const landed = await recordPriceResult(env, 1, { price: 9.99, priceCents: 999, regular: 19.99, cut: 50, itadId: "itad-a", checkedAtMs: 9000 });
+  assert.equal(landed, true);
+});
+
+test("CR-1: a genuine deal on a 'priced' row STILL LANDS - the guard blocks reclassification, not refreshes", async () => {
+  const env = makeEnv();
+  await ensureCatalogSchema(env);
+  await upsertCatalogRows(env, [catalogRowFromBulk(bulkRow({ appid: 1 }))], 1000);
+  await recordPriceState(env, 1, { state: "priced", price: 19.99, priceCents: 1999, regular: 19.99, cut: 0 }, "getitems", 1000);
+
+  await recordPriceResult(env, 1, { price: 9.99, priceCents: 999, regular: 19.99, cut: 50, itadId: "itad-a", checkedAtMs: 9000 });
+
+  const row = await env.FPM_DB.prepare("SELECT * FROM fpm_catalog WHERE appid = 1").first();
+  assert.equal(row.price, 9.99, "the sale price landed");
+  assert.equal(row.cut, 50);
+  assert.equal(row.price_state, "priced");
+  assert.equal(row.price_checked_at, 9000);
+});
+
+test("CR-7: a deal with no `regular` LEAVES the fill-won list price alone rather than erasing it", async () => {
+  // The residual of gate 9: hasDeal is true on a price alone, so binding a
+  // NULL `regular` straight in would blank the list price the fill won.
+  const env = makeEnv();
+  await ensureCatalogSchema(env);
+  await upsertCatalogRows(env, [catalogRowFromBulk(bulkRow({ appid: 1 }))], 1000);
+  await recordPriceState(env, 1, { state: "priced", price: 29.99, priceCents: 2999, regular: 29.99, cut: 0 }, "getitems", 1000);
+
+  await recordPriceResult(env, 1, { price: 14.99, priceCents: 1499, regular: null, cut: 50, itadId: "itad-a", checkedAtMs: 9000 });
+
+  const row = await env.FPM_DB.prepare("SELECT * FROM fpm_catalog WHERE appid = 1").first();
+  assert.equal(row.price, 14.99);
+  assert.equal(row.regular, 29.99, "the list price survived");
+});
+
 test("resolvePriceBatch: priced and priceless items both write through, itad-id resolution failures counted as priceless too", async () => {
   const env = makeEnv({ ITAD_API_KEY: "k" });
   await ensureCatalogSchema(env);
@@ -1370,7 +1505,7 @@ test("resolvePriceBatch: priced and priceless items both write through, itad-id 
   const items = [{ appid: 1, name: "Priced" }, { appid: 2, name: "No live deal" }, { appid: 3, name: "No ITAD id" }];
   const result = await resolvePriceBatch(env, items);
 
-  assert.deepEqual(result, { attempted: 3, priced: 1, noPrice: 2, gaveUp: 0 });
+  assert.deepEqual(result, { attempted: 3, priced: 1, noPrice: 2, stateGuarded: 0, gaveUp: 0 });
   const row1 = await env.FPM_DB.prepare("SELECT price, itad_id, price_checked_at FROM fpm_catalog WHERE appid=1").first();
   assert.equal(row1.price, 9.99);
   assert.equal(row1.itad_id, "itad-1");
@@ -1450,7 +1585,107 @@ test("resolvePriceBatch: with zero items, resolves immediately without touching 
     throw new Error("must not be called");
   };
   const result = await resolvePriceBatch(makeEnv({ ITAD_API_KEY: "k" }), []);
-  assert.deepEqual(result, { attempted: 0, priced: 0, noPrice: 0, gaveUp: 0 });
+  assert.deepEqual(result, { attempted: 0, priced: 0, noPrice: 0, stateGuarded: 0, gaveUp: 0 });
+});
+
+// ---------------------------------------------------------------------------
+// TC-7: resolvePriceStateBatch's RESILIENCE. Its increment-8.5 sibling
+// resolvePriceBatch has exactly these three tests above; the increment-13 one
+// that actually ran the 18,306-row fill had none. Same shape: retry the SAME
+// chunk on a bad response, give up after FPM_PRICE_MAX_CONSECUTIVE_BAD, and
+// leave anything unattempted with `price_state` still NULL so the next run's
+// cursor picks it straight back up.
+// ---------------------------------------------------------------------------
+
+function storeItemsResponse(items) {
+  return new Response(JSON.stringify({ response: { store_items: items } }), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+test("TC-7: resolvePriceStateBatch retries the SAME chunk on a bad response, never advancing past it", async () => {
+  const env = makeEnv();
+  await ensureCatalogSchema(env);
+  await upsertCatalogRows(env, [1, 2].map((appid) => catalogRowFromBulk(bulkRow({ appid }))), 1000);
+
+  let calls = 0;
+  const requested = [];
+  globalThis.fetch = async (url) => {
+    calls++;
+    requested.push(JSON.parse(new URL(url).searchParams.get("input_json")).ids.map((i) => i.appid));
+    if (calls === 1) return new Response("upstream is unhappy", { status: 503 });
+    if (calls === 2) { throw new Error("network down"); }
+    return storeItemsResponse([
+      { id: 1, success: 1, visible: true, is_free: true },
+      { id: 2, success: 15, visible: false },
+    ]);
+  };
+
+  const tally = await resolvePriceStateBatch(env, [{ appid: 1, name: "A" }, { appid: 2, name: "B" }], { nowMs: 7000 });
+  assert.equal(calls, 3, "two bad responses, then the same chunk again");
+  assert.deepEqual(requested, [[1, 2], [1, 2], [1, 2]], "the SAME appids every time - it never advanced on a bad response");
+  assert.deepEqual(
+    { attempted: tally.attempted, free: tally.free, delisted: tally.delisted, gaveUp: tally.gaveUp },
+    { attempted: 2, free: 1, delisted: 1, gaveUp: 0 },
+  );
+});
+
+test("TC-7: resolvePriceStateBatch gives up after FPM_PRICE_MAX_CONSECUTIVE_BAD, leaving price_state NULL for the next run", async () => {
+  const env = makeEnv();
+  await ensureCatalogSchema(env);
+  await upsertCatalogRows(env, [1, 2].map((appid) => catalogRowFromBulk(bulkRow({ appid }))), 1000);
+
+  let calls = 0;
+  globalThis.fetch = async () => { calls++; return new Response("nope", { status: 500 }); };
+
+  const items = [{ appid: 1, name: "A" }, { appid: 2, name: "B" }];
+  const tally = await resolvePriceStateBatch(env, items, { nowMs: 7000 });
+  assert.equal(calls, FPM_PRICE_MAX_CONSECUTIVE_BAD, "it stops asking rather than hammering a failing upstream");
+  assert.equal(tally.attempted, 0);
+  assert.equal(tally.gaveUp, 2);
+
+  // THE RESUMABILITY PROPERTY, which is gate 7: nothing was stamped, so the
+  // cursor still selects the same rows.
+  const rows = (await env.FPM_DB.prepare("SELECT appid, price_state FROM fpm_catalog ORDER BY appid").all()).results;
+  assert.ok(rows.every((r) => r.price_state == null), "no row was written, so nothing is lost and nothing is skipped");
+  assert.deepEqual((await selectPriceStateBatch(env, { limit: 10 })).map((r) => r.appid), [1, 2]);
+});
+
+test("TC-7: every row in a chunk is written THROUGH as it is decided, including rows GetItems did not return", async () => {
+  // James's ruling 12: one write per row, not batched, so a kill loses at most
+  // one row. And a row the response simply omits is still decided - `unknown`,
+  // stamped - rather than left NULL, or the fill would spin on it forever.
+  const env = makeEnv();
+  await ensureCatalogSchema(env);
+  await upsertCatalogRows(env, [1, 2, 3, 4].map((appid) => catalogRowFromBulk(bulkRow({ appid }))), 1000);
+
+  globalThis.fetch = async () =>
+    storeItemsResponse([
+      { id: 1, success: 1, visible: true, purchase_options: [{ packageid: 9, included_game_count: 1, final_price_in_cents: "1995", original_price_in_cents: "3995", discount_pct: 50 }] },
+      { id: 2, success: 1, visible: true, is_free: true },
+      { id: 3, success: 15, visible: false, unvailable_for_country_restriction: true },
+      // appid 4 is simply not in the response.
+    ]);
+
+  const tally = await resolvePriceStateBatch(env, [1, 2, 3, 4].map((appid) => ({ appid, name: `G${appid}` })), { nowMs: 7000 });
+  assert.deepEqual(tally, { attempted: 4, priced: 1, free: 1, delisted: 0, region: 1, unknown: 1, gaveUp: 0 });
+
+  const rows = (await env.FPM_DB.prepare(
+    "SELECT appid, price_state, price, regular, cut, price_source, price_checked_at FROM fpm_catalog ORDER BY appid").all()).results;
+  assert.deepEqual(rows.map((r) => r.price_state), ["priced", "free", "region", "unknown"]);
+  assert.deepEqual(rows.map((r) => r.price), [19.95, null, null, null], "a non-priced state clears the number rather than keeping a stale one");
+  assert.equal(rows[0].regular, 39.95);
+  assert.equal(rows[0].cut, 50);
+  assert.ok(rows.every((r) => r.price_checked_at === 7000), "EVERY row is stamped, including the one that was never returned");
+  assert.ok(rows.every((r) => r.price_source === "getitems"));
+  assert.deepEqual(await selectPriceStateBatch(env, { limit: 10 }), [], "and the cursor is empty - nothing repeats next run");
+});
+
+test("TC-7: resolvePriceStateBatch with zero items resolves immediately without touching fetch", async () => {
+  globalThis.fetch = async () => { throw new Error("must not be called"); };
+  const tally = await resolvePriceStateBatch(makeEnv(), []);
+  assert.deepEqual(tally, { attempted: 0, priced: 0, free: 0, delisted: 0, region: 0, unknown: 0, gaveUp: 0 });
 });
 
 // ---------------------------------------------------------------------------
@@ -1575,6 +1810,38 @@ test("runFpmSyncPipeline: with ITAD_API_KEY set, also price-checks newly-matched
   assert.equal(lastRun.priceAttempted, 1);
   assert.equal(lastRun.priced, 1);
   assert.equal(lastRun.noPrice, 0);
+});
+
+test("13 GATE 4 / TC-6: runFpmSyncPipeline BUMPS THE VERSION, so a sync invalidates every cache tier", async () => {
+  // The last of gate 4's four invalidation paths, and it was tested by nothing.
+  // A sync writes to fpm_catalog; if the stamp does not move, the snapshot in
+  // KV and in every warm isolate goes on describing the pre-sync catalogue for
+  // up to the six-hour TTL.
+  const env = makeEnv();
+  await ensureCatalogSchema(env);
+  const before = await readCatalogVersion(env);
+
+  globalThis.fetch = async (url) => {
+    const u = new URL(url);
+    const spyTagsRes = spyAppdetailsBranch(url);
+    if (spyTagsRes) return spyTagsRes;
+    if (u.hostname === "steamspy.com" && u.searchParams.get("page") === "0") {
+      return new Response(JSON.stringify({
+        1: bulkRow({ appid: 1, name: "A Game", owners: "1,000,000 .. 2,000,000", positive: 100, negative: 0 }),
+      }), { status: 200 });
+    }
+    const appdetailsRes = appdetailsBranch(url);
+    if (appdetailsRes) return appdetailsRes;
+    return makeHltbFetch({ searchResultsByQuery: {} })(url);
+  };
+
+  await runFpmSyncPipeline(env, makeCtx(), {
+    loadOwnedAppIds: async () => new Set(),
+    loadDealAppIds: async () => [],
+  });
+  const after = await readCatalogVersion(env);
+  assert.notEqual(after, null, "a sync always leaves a stamp, even on a database that had none");
+  assert.notEqual(after, before, "and it is a NEW one, so no tier can keep serving the pre-sync catalogue");
 });
 
 test("runFpmSyncPipeline: without ITAD_API_KEY, the price step is skipped entirely — no ITAD calls, existing behaviour unchanged", async () => {

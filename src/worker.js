@@ -59,7 +59,6 @@ import {
   experienceFpm,
   getCatalogStats,
   selectMatchedCatalogRows,
-  selectRankCatalogRows,
   startFpmSync,
   isFpmSyncRunning,
   getLastSyncStats,
@@ -68,10 +67,11 @@ import {
   requestFpmAutoContinueStop,
 } from "./catalog.js";
 import { ensureSettingsSchema, getAllSettings, putSettings } from "./settings.js";
+import { meterEnv } from "./d1meter.js";
+import { loadRankCatalogue } from "./catalogCache.js";
 import {
   SUPPRESS_LOW_CONFIDENCE_KEY,
   blendRankScore,
-  ensureRankExclusions,
   isLowConfidenceSuppressed,
   normaliseSimilarities,
   profileWithoutGame,
@@ -2390,6 +2390,16 @@ async function buildRankSpyData(env, ownedAppids, catalogTagsByAppid, catalogRow
 async function handleRank(request, env, ctx) {
   if (!env.FPM_DB) return rankUnavailableResponse("FPM_DB not configured");
 
+  // THE METER, INSTALLED ONCE, HERE (SPEC.md §4.1, gates 1 and 3). Every D1
+  // call this request makes now runs through a counting wrapper, and nothing
+  // downstream needs to know: the loaders below still take a plain `env` and
+  // still call `env.FPM_DB.prepare(...)`. Reassigning the parameter is the
+  // whole installation - that is what keeps the seam one line rather than a
+  // change at every call site, and it is why a call site added later cannot
+  // forget to be counted.
+  const meter = meterEnv(env);
+  env = meter.env;
+
   const url = new URL(request.url);
   const refresh = url.searchParams.get("refresh") === "1";
   const ownedMode = parseOwnedMode(url.searchParams.get("owned"));
@@ -2409,10 +2419,19 @@ async function handleRank(request, env, ctx) {
   // pays a one-time ~18.3k-row pass; every call after is a no-op.
   let catalogRows;
   let exclusionFill;
+  let catalogue;
   try {
     await ensureCatalogSchema(env);
-    exclusionFill = await ensureRankExclusions(env);
-    catalogRows = await selectRankCatalogRows(env);
+    // THE SEAM (SPEC.md §4.1, gate 2). `ensureRankExclusions(env)` +
+    // `selectRankCatalogRows(env)` became one call. Both moved for the same
+    // reason - they are catalogue-wide, user-independent work that was being
+    // repeated on every page load - and they now run together, on the rebuild
+    // path, at most a few times a day. Nothing below this line changed: the
+    // funnel, the IDF corpus, the profile, similarity, the blend and the sort
+    // all still run per request over exactly these rows.
+    catalogue = await loadRankCatalogue(env, ctx, refresh);
+    catalogRows = catalogue.rows;
+    exclusionFill = catalogue.exclusionFill;
   } catch {
     return rankUnavailableResponse();
   }
@@ -2492,6 +2511,12 @@ async function handleRank(request, env, ctx) {
     priced: 0,
     pricedOwned: 0,
     lowConfidenceOwnedSpared: 0,
+    // Increment 13 (SPEC.md §6). These six MUST partition `ranked` exactly and
+    // sum back to it - same discipline as every other funnel line above, and
+    // gate 8 asserts it rather than trusting it. `unchecked` is NULL
+    // price_state: never evaluated under the GetItems method, which is a
+    // different fact from `unknown` (evaluated, and no source could say).
+    price: { priced: 0, free: 0, delisted: 0, region: 0, unknown: 0, unchecked: 0 },
   };
 
   const eligible = [];
@@ -2692,6 +2717,20 @@ async function handleRank(request, env, ctx) {
       funnel.priced++;
       if (entry.owned) funnel.pricedOwned++;
     }
+    const priceState = row.price_state;
+    if (priceState == null) funnel.price.unchecked++;
+    // `Object.hasOwn`, NOT `in` (increment 13 review - the server-side twin of
+    // SEC-7, found while pinning gate 8's partition). `in` walks the prototype
+    // chain, so a stored `price_state` of `"constructor"` or `"toString"`
+    // answered TRUE and then did `funnel.price["constructor"]++`, which puts a
+    // NaN-valued own property on the funnel - a NEW KEY in a response whose key
+    // set gate 8 asserts is exhaustive. The vocabulary is closed and this now
+    // checks it as closed.
+    else if (Object.hasOwn(funnel.price, priceState)) funnel.price[priceState]++;
+    // A state outside the closed vocabulary would silently break the
+    // partition, so it is charged to `unknown` rather than dropped - the
+    // arithmetic stays honest even if a future writer invents a value.
+    else funnel.price.unknown++;
 
     return {
       appid: row.appid,
@@ -2735,6 +2774,11 @@ async function handleRank(request, env, ctx) {
       regular: row.regular ?? null,
       cut: row.cut ?? null,
       priceCheckedAt: row.price_checked_at ?? null,
+      // Increment 13. The state is what the card renders from now, not the
+      // absence of a number: `free` / `delisted` / `region` each have a
+      // sentence, `unknown` keeps "Price not known", and NULL - never checked
+      // under this method - keeps it too. Always present, null when unfilled.
+      priceState: row.price_state ?? null,
       atHistoricalLow,
       reviewCount,
       reviewPercent: reviewCount > 0 ? Math.round((row.positive / reviewCount) * 100) : null,
@@ -2792,6 +2836,19 @@ async function handleRank(request, env, ctx) {
         ? "Steam library unavailable – the taste profile is empty, so similarity is 0 on every row and the similarity lens is showing experience value alone."
         : null,
       funnel,
+      // ALWAYS PRESENT, per this project's own convention, so the exhaustive
+      // key set cannot change shape between calls - and because a cost number
+      // that only appears when you ask for it is a cost number nobody reads.
+      // `rowsRead` counts rows SCANNED, which is what Cloudflare bills;
+      // `unmetered` counts calls D1 gives no meta for (none on this path).
+      d1: {
+        queries: meter.stats.queries,
+        rowsRead: meter.stats.rowsRead,
+        rowsWritten: meter.stats.rowsWritten,
+        unmetered: meter.stats.unmetered,
+        cacheState: catalogue.cacheState,
+        snapshotAgeMs: catalogue.ageMs,
+      },
       count: view.length,
       rank: view,
     }),

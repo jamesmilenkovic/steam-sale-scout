@@ -561,16 +561,63 @@ export function ownedCell(row) {
   return playedFragment(row) ?? OWNED_PREFIX;
 }
 
+/** What each `price_state` says on the card. Ruled by James at increment 13's
+ * checkpoint 01, 2026-09-06, BEFORE any of it was built.
+ *
+ * THE SHORTER VARIANTS WERE OFFERED AND REJECTED. "Delisted" is three
+ * syllables against eight and it is jargon; this page's standing gate is that
+ * a stranger understands it without being told, so the long plain sentence
+ * wins. "Not in AU" lost to "Not sold in Australia" for the same reason.
+ *
+ * `free` IS NEVER INFERRED FROM A PRICE OF ZERO. It is written only when
+ * Steam's own `is_free` said so (src/storePrices.js) - the same null-versus-
+ * zero discipline that caught increment 12's `hoursPlayed` and 12.5's "never
+ * played". ITAD, for comparison, reports free-to-play games as $0.00 and
+ * cannot tell them apart from a game it has no price for, which is one of the
+ * reasons it lost the probe. */
+const PRICE_STATE_LINES = Object.assign(Object.create(null), {
+  free: "Free to play",
+  delisted: "Not sold on Steam any more",
+  region: "Not sold in Australia",
+});
+
 export function statusLine(row) {
   if (row?.owned === true) {
     const fragment = playedFragment(row);
     return fragment == null ? OWNED_PREFIX : `${OWNED_PREFIX} ${EN} ${fragment}`;
   }
+
+  // A real number always wins. A row can carry a price AND a state, and the
+  // price is the more specific fact.
   const price = row?.price;
-  if (price == null) return "Price not known";
-  const cut = Number(row?.cut ?? 0);
-  if (cut > 0) return `${formatPrice(price)} ${EN} ${Math.round(cut)}% off`;
-  return formatPrice(price);
+  if (price != null) {
+    const cut = Number(row?.cut ?? 0);
+    if (cut > 0) return `${formatPrice(price)} ${EN} ${Math.round(cut)}% off`;
+    return formatPrice(price);
+  }
+
+  // A NULL-PROTOTYPE LOOKUP, BECAUSE THE KEY COMES OFF THE WIRE (increment 13
+  // review, SEC-7). `priceState` is server-supplied, and a bare bracket lookup
+  // on a plain object literal answers `"constructor"`, `"toString"` and
+  // friends with an inherited member - so `priceState: "constructor"` would
+  // put a function's source on the card. The table has no prototype now, so
+  // only the three keys written above can ever match.
+  const named = PRICE_STATE_LINES[row?.priceState];
+  if (typeof named === "string") return named;
+
+  // "PRICE NOT KNOWN" SURVIVES ON PURPOSE, AND THIS IS THE HONESTY LINE.
+  // It is the right sentence for a row we genuinely cannot answer for, and
+  // increment 13's job was to stop saying it 11,922 times, not to find a
+  // nicer phrase for the same ignorance. It now renders on 956 ranked rows -
+  // `unknown` (checked, and Steam, ITAD and the storefront all declined to
+  // say) and NULL (never checked) alike, because the reader's situation is
+  // identical in both and only the fill cares about the difference.
+  //
+  // The most-read example: Half-Life 2: Episode Two is pick #3 on the default
+  // lens and has no standalone price - Valve folded the episodes into
+  // Half-Life 2. Showing Half-Life 2's price there would be the app asserting
+  // something untrue about a different product, which James rejected outright.
+  return "Price not known";
 }
 
 /**

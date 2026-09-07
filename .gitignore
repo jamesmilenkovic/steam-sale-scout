@@ -2,3 +2,9 @@ node_modules
 .dev.vars
 .wrangler
 .DS_Store
+
+# Working scratch. Increments 9 and 10 committed their probe scripts here, so
+# the directory still holds tracked files; this rule stops NEW scratch joining
+# them by way of a `git add -A` (increment 13 review, SEC-12). Anything worth
+# keeping is added deliberately with `git add -f`.
+scratchpad/

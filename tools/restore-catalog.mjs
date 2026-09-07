@@ -90,8 +90,35 @@ actual.experience_scored = Number(execFileSync("sqlite3", [target,
 actual.tagged = Number(execFileSync("sqlite3", [target,
   "select count(*) from fpm_catalog where tags is not null"], { encoding: "utf8" }).trim());
 
+// A FRESH VERSION STAMP, ALWAYS (increment 13, SPEC.md §5). The catalogue
+// snapshot in KV is keyed on `catalog_meta.catalog_version`. Without a fresh
+// stamp a restored database could present the SAME version as a snapshot still
+// sitting in KV, and the page would keep serving a cached catalogue describing
+// a database that no longer exists.
+//
+// TWO THINGS FROM THE INCREMENT 13 REVIEW MAKE THIS ACTUALLY TRUE, AND IT WAS
+// NOT BEFORE (SEC-6, CR-2). First, `catalog_meta` is no longer in the backup
+// at all, so a restore cannot resurrect an old stamp even by accident - this
+// write is the only thing that sets it. Second, src/catalogCache.js now
+// REBUILDS on a version mismatch instead of serving its memo once; before that
+// fix a warm isolate would hand the pre-restore catalogue to the next visitor,
+// which is precisely what this comment used to claim it prevented.
+//
+// Local-only, so a plain sqlite3 write is the right tool; the app reads the
+// same row through D1.
+const restoredVersion = `${Date.now().toString(36)}-restored`;
+execFileSync("sqlite3", [target], {
+  input:
+    "CREATE TABLE IF NOT EXISTS catalog_meta (key TEXT PRIMARY KEY, value TEXT, updated_at INTEGER);\n" +
+    "INSERT INTO catalog_meta (key, value, updated_at) VALUES ('catalog_version', '" +
+    restoredVersion + "', " + Date.now() + ")\n" +
+    "  ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at;\n",
+  encoding: "utf8",
+});
+
 let bad = 0;
 console.log(`restored to ${target}`);
+console.log(`  catalogue snapshot version reset to ${restoredVersion} - the next page load rebuilds`);
 for (const [k, want] of Object.entries(expect)) {
   const got = actual[k];
   const ok = got === want;

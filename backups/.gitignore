@@ -1,0 +1,9 @@
+# DENY BY DEFAULT (increment 13 review, SEC-10). This repository is PUBLIC and
+# this directory is where the project's database ends up, so the rule is not
+# "hide the private file we know about" - it is "nothing here is published
+# unless it is named below". Naming one filename meant the NEXT private
+# artifact written here would have been tracked by default.
+*
+!.gitignore
+!README.md
+!catalog.sql.gz

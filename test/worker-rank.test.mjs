@@ -19,6 +19,7 @@ import { ensureCatalogSchema } from "../src/catalog.js";
 import { ensureSettingsSchema, putSettings } from "../src/settings.js";
 import { ensureDismissalsSchema, addDismissal } from "../src/dismissals.js";
 import { RANK_PRESETS, SUPPRESS_LOW_CONFIDENCE_KEY } from "../src/rank.js";
+import { __resetCatalogMemoForTests } from "../src/catalogCache.js";
 
 const originalCaches = globalThis.caches;
 let offlineGuard = makeOfflineFetchGuard("worker-rank");
@@ -96,7 +97,7 @@ function seedLibrary(cache, games) {
 
 const CATALOG_COLUMNS = [
   "appid", "name", "owners", "positive", "negative", "wilson", "app_type",
-  "price", "price_cents", "regular", "cut", "price_checked_at", "tags", "source_owned",
+  "price", "price_cents", "regular", "cut", "price_checked_at", "price_state", "tags", "source_owned",
   "experience_score", "game_score", "has_ending", "hours_to_value", "hours_to_good",
   "experience_reason", "experience_confidence", "experience_checked_at",
 ];
@@ -109,7 +110,12 @@ async function seedCatalog(env, rows) {
   for (const row of rows) {
     const full = {
       owners: 100000, positive: 5000, negative: 100, wilson: 0.95, app_type: "game",
-      price: null, price_cents: null, regular: null, cut: null, price_checked_at: 1,
+      // TC-2: `price_state` was NOT in this list, so every worker test saw NULL
+      // and increment 13's entire state wiring - the funnel's price block, the
+      // API field, gate 8's partition - was dead in test. It defaults to
+      // `unknown` (checked, nothing to say) rather than NULL, so a test that
+      // does not care about prices still lands in a REAL state.
+      price: null, price_cents: null, regular: null, cut: null, price_checked_at: 1, price_state: "unknown",
       tags: JSON.stringify({ Puzzle: 100, Story: 50 }), source_owned: 0,
       game_score: 90, has_ending: 1, hours_to_value: 4, hours_to_good: 0,
       experience_reason: "A reason line.", experience_confidence: "high", experience_checked_at: 1,
@@ -127,6 +133,12 @@ async function callRank(env, ctx, query = "") {
 test.beforeEach(() => {
   offlineGuard = makeOfflineFetchGuard("worker-rank");
   globalThis.fetch = offlineGuard;
+  // TC-1/TC-2: the catalogue snapshot memo is MODULE scope, so without this a
+  // test inherits whatever the previous test's database put there. This file
+  // never reset it and escaped only because the version stamp is random - and
+  // "the last test's catalogue" is the exact failure `memo.db === db` exists
+  // to prevent, so it must not be what makes this file pass.
+  __resetCatalogMemoForTests();
 });
 
 test.afterEach(() => {
@@ -154,17 +166,28 @@ test("gate 8: /api/rank's response key set is EXACTLY this, top level and per ro
   assert.equal(response.status, 200);
   assert.equal(response.headers.get("content-type"), "application/json");
 
+  // Increment 13 adds exactly ONE top-level key, `d1`, and it is the cost
+  // meter this increment is gated on (SPEC.md §4.1). Always present, never
+  // conditional - a cost number that only appears when you ask for it is a
+  // cost number nobody reads.
   assert.deepEqual(Object.keys(body).sort(), [
-    "available", "count", "exclusionFill", "funnel", "normaliser", "notice",
+    "available", "count", "d1", "exclusionFill", "funnel", "normaliser", "notice",
     "ownedMode", "preset", "profileAvailable", "profileGames", "rank", "sort",
     "suppressLowConfidence", "weights", "windowMonths",
+  ]);
+  assert.deepEqual(Object.keys(body.d1).sort(), [
+    "cacheState", "queries", "rowsRead", "rowsWritten", "snapshotAgeMs", "unmetered",
   ]);
   assert.deepEqual(Object.keys(body.weights).sort(), ["ws", "wsale", "we"].sort());
   assert.deepEqual(Object.keys(body.exclusionFill).sort(), ["checked", "excluded", "ok"]);
   assert.deepEqual(Object.keys(body.funnel).sort(), [
     "catalogTotal", "checkedNoScore", "dismissed", "endingUnknown", "endless",
-    "lowConfidenceOwnedSpared", "lowConfidenceSuppressed", "nonGame", "owned", "priced",
+    "lowConfidenceOwnedSpared", "lowConfidenceSuppressed", "nonGame", "owned", "price", "priced",
     "pricedOwned", "rankExcluded", "ranked", "tagless", "unscored",
+  ]);
+  // Increment 13's price block. Six states, closed vocabulary.
+  assert.deepEqual(Object.keys(body.funnel.price).sort(), [
+    "delisted", "free", "priced", "region", "unchecked", "unknown",
   ]);
   // Increment 12.5 adds exactly FOUR keys, and they are annotations rather
   // than inputs: `played`, `finished`, `playedSource`, `lastPlayedAt`. Nothing
@@ -173,9 +196,128 @@ test("gate 8: /api/rank's response key set is EXACTLY this, top level and per ro
     "appid", "atHistoricalLow", "base", "confidence", "cut", "experienceFpm",
     "experienceScore", "finished", "gameScore", "hasEnding", "hoursPlayed", "hoursToGood",
     "hoursToValue", "lastPlayedAt", "owned", "playedSource", "played", "price", "priceCents",
-    "priceCheckedAt", "rankScore", "regular", "reviewCount", "reviewPercent", "similarity",
+    "priceCheckedAt", "priceState", "rankScore", "regular", "reviewCount", "reviewPercent", "similarity",
     "similarityNorm", "tagNames", "title", "why",
   ].sort());
+});
+
+test("13 GATE 8 / TC-2: the six price states PARTITION the ranked pool exactly", async () => {
+  // TC-2. The key-set test above used to say this was "asserted as arithmetic
+  // further down". It was not asserted anywhere - and it could not have been,
+  // because `price_state` was missing from the seed helper's column list, so
+  // every worker test saw NULL and five of the six counters were structurally
+  // unreachable. Three mutations to the counting survived.
+  //
+  // Gate 8's claim is that the block is a PARTITION: every ranked row is
+  // counted once and in exactly one state. A partition that does not sum is
+  // a funnel that is quietly dropping rows, which is the failure this whole
+  // block of counters exists to make impossible.
+  const env = makeEnv();
+  const ctx = makeCtx();
+  globalThis.caches = { default: makeMockCache() };
+  seedLibrary(caches.default, []);
+  await seedCatalog(env, [
+    { appid: 1, name: "Priced", experience_score: 90, price_state: "priced", price: 9.99, price_cents: 999, cut: 0 },
+    { appid: 2, name: "Priced on sale", experience_score: 90, price_state: "priced", price: 4.99, price_cents: 499, regular: 9.99, cut: 50 },
+    { appid: 3, name: "Free one", experience_score: 90, price_state: "free" },
+    { appid: 4, name: "Free two", experience_score: 90, price_state: "free" },
+    { appid: 5, name: "Delisted", experience_score: 90, price_state: "delisted" },
+    { appid: 6, name: "Region", experience_score: 90, price_state: "region" },
+    { appid: 7, name: "Unknown", experience_score: 90, price_state: "unknown" },
+    { appid: 8, name: "Never checked", experience_score: 90, price_state: null, price_checked_at: null },
+    // Not in the ranked pool at all, and so in NONE of the six counters.
+    { appid: 9, name: "Not a game", experience_score: 90, app_type: "dlc", price_state: "priced", price: 1 },
+    { appid: 10, name: "Unscored", experience_score: null, experience_checked_at: null, price_state: "priced", price: 1 },
+  ]);
+
+  const { body } = await callRank(env, ctx);
+  const p = body.funnel.price;
+
+  assert.deepEqual(p, { priced: 2, free: 2, delisted: 1, region: 1, unknown: 1, unchecked: 1 },
+    "each state counted once, off the row's own price_state");
+  const sum = p.priced + p.free + p.delisted + p.region + p.unknown + p.unchecked;
+  assert.equal(sum, body.funnel.ranked, "THE PARTITION: the six states sum to `ranked`, exactly");
+  assert.equal(body.funnel.ranked, 8, "and the two ineligible rows are in none of them");
+  assert.equal(body.funnel.nonGame, 1);
+  assert.equal(body.funnel.unscored, 1);
+});
+
+test("13 GATE 8 / TC-2: `unchecked` counts NULL, and an INVENTED state still keeps the partition summing", async () => {
+  // NULL means "never checked under this method" and `unknown` means "checked,
+  // and the source could not say". They are different facts and the increment's
+  // honesty line depends on not conflating them - so `unchecked` counts NULL
+  // and nothing else.
+  //
+  // A state outside the closed vocabulary is charged to `unknown` rather than
+  // dropped, which is what keeps the partition summing even if a future writer
+  // invents a value. That branch existed and nothing tested it.
+  const env = makeEnv();
+  const ctx = makeCtx();
+  globalThis.caches = { default: makeMockCache() };
+  seedLibrary(caches.default, []);
+  await seedCatalog(env, [
+    { appid: 1, name: "Never checked", experience_score: 90, price_state: null },
+    { appid: 2, name: "Checked, no answer", experience_score: 90, price_state: "unknown" },
+    { appid: 3, name: "Not in the vocabulary", experience_score: 90, price_state: "some-new-state" },
+  ]);
+
+  const { body } = await callRank(env, ctx);
+  const p = body.funnel.price;
+  assert.equal(p.unchecked, 1, "only the NULL row - `unchecked` is the fill's cursor, not a catch-all");
+  assert.equal(p.unknown, 2, "the invented state is charged to `unknown` rather than dropped");
+  assert.equal(p.priced + p.free + p.delisted + p.region + p.unknown + p.unchecked, body.funnel.ranked,
+    "and the partition still sums, which is the point of that branch");
+  // The ROW keeps its real value; only the counter folds it in.
+  assert.equal(body.rank.find((r) => r.appid === 3).priceState, "some-new-state");
+});
+
+test("13 GATE 8 / TC-2: a price_state of `constructor` cannot add a key to the funnel", async () => {
+  // The server-side twin of SEC-7, found while pinning the partition. The
+  // counter used `priceState in funnel.price`, and `in` walks the prototype
+  // chain - so a stored `"constructor"` answered TRUE and did
+  // `funnel.price["constructor"]++`, putting a NaN-valued OWN property on the
+  // funnel. That is a new key in a response whose key set gate 8 asserts is
+  // exhaustive, and NaN in a block whose whole job is to add up.
+  const env = makeEnv();
+  const ctx = makeCtx();
+  globalThis.caches = { default: makeMockCache() };
+  seedLibrary(caches.default, []);
+  await seedCatalog(env, [
+    { appid: 1, name: "Prototype pollution", experience_score: 90, price_state: "constructor" },
+    { appid: 2, name: "Also inherited", experience_score: 90, price_state: "toString" },
+    { appid: 3, name: "Normal", experience_score: 90, price_state: "free" },
+  ]);
+
+  const { body } = await callRank(env, ctx);
+  assert.deepEqual(Object.keys(body.funnel.price).sort(), [
+    "delisted", "free", "priced", "region", "unchecked", "unknown",
+  ], "six keys, still, and no `constructor` among them");
+  const p = body.funnel.price;
+  assert.equal(p.unknown, 2, "both inherited names are charged to `unknown`");
+  assert.equal(p.free, 1);
+  assert.equal(p.priced + p.free + p.delisted + p.region + p.unknown + p.unchecked, body.funnel.ranked);
+  assert.ok(Object.values(p).every(Number.isInteger), "no NaN reached a counter");
+});
+
+test("13 TC-2: price_state reaches the API row, per state", async () => {
+  // The field the card renders from. Nothing pinned it end to end.
+  const env = makeEnv();
+  const ctx = makeCtx();
+  globalThis.caches = { default: makeMockCache() };
+  seedLibrary(caches.default, []);
+  await seedCatalog(env, [
+    { appid: 1, name: "Free game", experience_score: 90, price_state: "free" },
+    { appid: 2, name: "Delisted game", experience_score: 90, price_state: "delisted" },
+    { appid: 3, name: "Region game", experience_score: 90, price_state: "region" },
+    { appid: 4, name: "Never checked", experience_score: 90, price_state: null },
+  ]);
+
+  const { body } = await callRank(env, ctx);
+  const byAppid = new Map(body.rank.map((r) => [r.appid, r.priceState]));
+  assert.equal(byAppid.get(1), "free");
+  assert.equal(byAppid.get(2), "delisted");
+  assert.equal(byAppid.get(3), "region");
+  assert.equal(byAppid.get(4), null, "never checked comes through as null, not as a string");
 });
 
 // ---------------------------------------------------------------------------
@@ -534,6 +676,47 @@ test("§10.7 a tagless row is RANKED with S = 0, not dropped — deliberately un
   }
   // experience_score is the headline, so a tagless 95 still beats a tagged 50.
   assert.equal(body.rank[0].appid, 1);
+});
+
+// ---------------------------------------------------------------------------
+// 13 TC-14 / GATE 5 – THE CACHE MUST NOT BE ABLE TO MOVE THE RANKING.
+// SPEC.md §7 item 5 is the one refusal that would reopen increment 11, and
+// until this test existed nothing compared a ranked ROW across cache tiers -
+// only appid lists and row counts. Wiping every tag and price out of the
+// cached rows moved the ranking and left the whole suite green.
+// ---------------------------------------------------------------------------
+
+test("13 TC-14 / GATE 5: /api/rank is identical across the rebuild and memory tiers - appid AND rankScore, all three lenses", async () => {
+  const env = makeEnv();
+  const ctx = makeCtx();
+  globalThis.caches = { default: makeMockCache() };
+  seedLibrary(caches.default, []);
+
+  // Varied tags, scores and prices, so a snapshot that lost any of them would
+  // produce a different order or a different score rather than the same one.
+  await seedCatalog(env, [
+    { appid: 400, name: "Portal", experience_score: 98, tags: JSON.stringify({ Puzzle: 200, Comedy: 90 }), price: 9.95, price_cents: 995, regular: 19.9, cut: 50, price_state: "priced" },
+    { appid: 620, name: "Portal 2", experience_score: 96, tags: JSON.stringify({ Puzzle: 180, Coop: 120 }), price: 14.95, price_cents: 1495, regular: 14.95, cut: 0, price_state: "priced" },
+    { appid: 700, name: "Undertale", experience_score: 94, tags: JSON.stringify({ Story: 200, RPG: 140 }), price_state: "free" },
+    { appid: 800, name: "Inscryption", experience_score: 92, tags: JSON.stringify({ Cards: 150, Horror: 80 }), price: 24.95, price_cents: 2495, regular: 34.95, cut: 29, price_state: "priced" },
+    { appid: 900, name: "Chicory", experience_score: 90, tags: JSON.stringify({ Story: 90, Puzzle: 60 }), price_state: "unknown" },
+  ]);
+
+  for (const preset of ["default", "sale", "similarity"]) {
+    // A fresh isolate for each lens, so the first call is a genuine rebuild.
+    __resetCatalogMemoForTests();
+    const cold = (await callRank(env, ctx, `?preset=${preset}`)).body;
+    assert.equal(cold.d1.cacheState, "rebuild", `${preset}: the first call must read D1`);
+
+    const warm = (await callRank(env, ctx, `?preset=${preset}`)).body;
+    assert.equal(warm.d1.cacheState, "memory", `${preset}: the second call must be served from the snapshot`);
+
+    assert.deepEqual(warm.rank.map((r) => r.appid), cold.rank.map((r) => r.appid), `${preset}: the cache moved the ORDER`);
+    assert.deepEqual(warm.rank.map((r) => r.rankScore), cold.rank.map((r) => r.rankScore), `${preset}: the cache moved a SCORE`);
+    // And every other rendered field with it - a wiped tag or a lost price is
+    // the mutation this exists to catch, and it shows up here first.
+    assert.deepEqual(warm.rank, cold.rank, `${preset}: a cached row differs from the row D1 holds`);
+  }
 });
 
 // ---------------------------------------------------------------------------

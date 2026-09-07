@@ -48,12 +48,22 @@ function requireSqlite3() {
   }
 }
 
+/** TC-12: the two tools are READ ONCE, HERE, at module load - not copied off
+ * disk inside each test. Copying at test time means a coder saving one of these
+ * files while the suite runs produces a half-written copy and a spurious
+ * failure, which happened twice during the coverage audit. A snapshot taken at
+ * import is the same file for every test in the run, whatever happens on disk
+ * afterwards. */
+const TOOL_SOURCES = Object.fromEntries(
+  ["backup-catalog.mjs", "restore-catalog.mjs"].map((f) => [f, fs.readFileSync(path.join(REPO, "tools", f), "utf8")]),
+);
+
 /** A throwaway copy of the two tools, with a D1 state directory beside them. */
 function makeFakeRepo(sql) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sss-backup-"));
   fs.mkdirSync(path.join(dir, "tools"), { recursive: true });
-  for (const f of ["backup-catalog.mjs", "restore-catalog.mjs"]) {
-    fs.copyFileSync(path.join(REPO, "tools", f), path.join(dir, "tools", f));
+  for (const [f, source] of Object.entries(TOOL_SOURCES)) {
+    fs.writeFileSync(path.join(dir, "tools", f), source, "utf8");
   }
   const state = path.join(dir, ".wrangler/state/v3/d1/miniflare-D1DatabaseObject");
   fs.mkdirSync(state, { recursive: true });
@@ -89,34 +99,119 @@ create table game_marks (appid integer primary key, name text, played integer no
 insert into game_marks values (400, 'Portal', 1, 1, 1, 2), (440, 'Team Fortress 2', 1, 0, 1, 2);
 `;
 
-test("backup + restore round-trips a database that HAS game_marks", () => {
+test("SEC-6: game_marks is NOT in the committed dump - James's play history never leaves the machine", () => {
   requireSqlite3();
+  // THE RULING THIS TEST EXISTS FOR (James, 2026-09-06). The repository is
+  // PUBLIC and `backups/catalog.sql.gz` is committed on every backup, so
+  // anything in it is published. `game_marks` is which games James has played
+  // and finished. The table was empty when this was found, so nothing leaked -
+  // it would have started publishing the moment he marked a game.
+  const { dir } = makeFakeRepo(BASE_SQL + MARKS_SQL);
+
+  run(dir, "backup-catalog.mjs");
+  const { text, tables } = headerOf(dir);
+  assert.equal(tables, "fpm_catalog=2 settings=1 dismissals=1", "the committed dump names three tables and no more");
+  assert.doesNotMatch(text, /game_marks/, "the string does not appear ANYWHERE in the committed dump");
+  assert.doesNotMatch(text, /catalog_meta/, "nor does the version stamp, which is regenerable and must not be restorable");
+  assert.doesNotMatch(text, /Portal.*1,\s*1/, "and no mark row survived into it");
+});
+
+test("SEC-6: game_marks IS backed up, locally, to an untracked file beside the committed one", () => {
+  requireSqlite3();
+  // The other half of the ruling. `game_marks` is still the only genuinely
+  // unrecoverable table the project owns - Steam has no "mark as played" and
+  // never returns one - so it is dumped, just not committed.
   const { dir } = makeFakeRepo(BASE_SQL + MARKS_SQL);
 
   const out = run(dir, "backup-catalog.mjs");
-  assert.match(out, /game_marks\s+2 rows/);
-  assert.equal(headerOf(dir).tables, "fpm_catalog=2 settings=1 dismissals=1 game_marks=2");
+  assert.match(out, /game_marks\s+2 rows -> backups\/private-marks\.sql \(LOCAL ONLY, not committed\)/);
 
+  const priv = fs.readFileSync(path.join(dir, "backups/private-marks.sql"), "utf8");
+  assert.match(priv, /NEVER COMMIT THIS FILE/);
+  assert.match(priv, /-- tables: game_marks=2/);
+
+  // And it restores: load it into a throwaway and read the rows back.
+  const check = path.join(dir, "marks-check.sqlite");
+  execFileSync("sqlite3", [check], { input: priv, encoding: "utf8" });
+  const marks = execFileSync("sqlite3", [check,
+    "select appid || ':' || played || finished from game_marks order by appid"], { encoding: "utf8" }).trim();
+  assert.equal(marks, "400:11\n440:10", "the unrecoverable rows came back exactly");
+});
+
+test("SEC-10: backups/.gitignore is DENY-BY-DEFAULT, so a future private artifact is not tracked by accident", () => {
+  // It used to name `private-marks.sql` and nothing else, which protects the
+  // one file we already knew about and publishes every one we do not. The
+  // repository is public and this directory is where the database lands.
+  const ignore = fs.readFileSync(path.join(REPO, "backups/.gitignore"), "utf8");
+  const rules = ignore.split("\n").map((l) => l.trim()).filter((l) => l && !l.startsWith("#"));
+
+  assert.equal(rules[0], "*", "the first rule must exclude everything");
+  assert.deepEqual(
+    rules.slice(1).sort(),
+    ["!.gitignore", "!README.md", "!catalog.sql.gz"],
+    "and the allow-list is exactly the three public files - anything else added here must be a deliberate decision",
+  );
+  assert.equal(rules.includes("!private-marks.sql"), false, "the play-history dump is never re-admitted");
+});
+
+test("SEC-11: a table matched by `.dump`'s LIKE WILDCARD is REFUSED, not quietly published", () => {
+  requireSqlite3();
+  // sqlite3's `.dump <arg>` treats the argument as a LIKE pattern, and `_` is
+  // a single-character wildcard. So `.dump fpm_catalog` also matches a table
+  // called `fpmXcatalog`, and the privacy guarantee rested on nothing being
+  // named that way. Here one is, carrying something private, and the backup
+  // must refuse to write the committed file at all.
+  const { dir } = makeFakeRepo(BASE_SQL + `
+create table fpmXcatalog (appid integer primary key, secret text);
+insert into fpmXcatalog values (1, 'private');
+`);
+
+  assert.throws(() => run(dir, "backup-catalog.mjs"), /REFUSING TO WRITE THE COMMITTED BACKUP[\s\S]*fpmXcatalog/);
+  assert.equal(
+    fs.existsSync(path.join(dir, "backups/catalog.sql.gz")),
+    false,
+    "and nothing was written - a refused backup must not leave a published file behind",
+  );
+});
+
+test("TC-18: the FILE THAT IS ACTUALLY COMMITTED carries no play history and no version stamp", () => {
+  // Every other privacy test here runs against a synthetic dump in a temp
+  // directory. This one reads the real, tracked `backups/catalog.sql.gz` -
+  // the bytes that are published when James commits - because that is the
+  // artifact the ruling is about, and a guard that only holds for a fixture
+  // is not the guarantee.
+  const text = gunzipSync(fs.readFileSync(path.join(REPO, "backups/catalog.sql.gz"))).toString("utf8");
+
+  assert.match(text, /CREATE TABLE fpm_catalog/, "sanity: this is the real catalogue dump, so the assertions below are not vacuous");
+  assert.doesNotMatch(text, /game_marks/, "the committed backup names James's play history NOWHERE");
+  assert.doesNotMatch(text, /catalog_meta/, "nor the snapshot version stamp, which must not be restorable");
+});
+
+test("the committed dump still carries the EXPENSIVE tables - this is a real off-machine backup", () => {
+  requireSqlite3();
+  const { dir } = makeFakeRepo(BASE_SQL + MARKS_SQL);
+  run(dir, "backup-catalog.mjs");
   const restored = run(dir, "restore-catalog.mjs", ["--into", path.join(dir, "check.sqlite")]);
   assert.match(restored, /all counts match the backup header/);
   assert.doesNotMatch(restored, /FAIL/);
-  const marks = execFileSync("sqlite3", [path.join(dir, "check.sqlite"),
-    "select appid || ':' || played || finished from game_marks order by appid"], { encoding: "utf8" }).trim();
-  assert.equal(marks, "400:11\n440:10", "the unrecoverable rows came back exactly");
+  const scored = execFileSync("sqlite3", [path.join(dir, "check.sqlite"),
+    "select count(*) from fpm_catalog where experience_score is not null"], { encoding: "utf8" }).trim();
+  assert.equal(scored, "1", "the LLM judgement is what the committed dump is for");
 });
 
 test("SEC-3: backup SUCCEEDS against a database with NO game_marks table, and still writes the expensive rows", () => {
   requireSqlite3();
   // The regression: `game_marks` is created lazily, so this is the state of
   // every database that has not served a marks request – and before the fix
-  // the backup threw here and wrote nothing at all.
+  // the backup threw here and wrote nothing at all. It is now in the PRIVATE
+  // list rather than the optional one, and absence must still not be an error.
   const { dir } = makeFakeRepo(BASE_SQL);
 
   const out = run(dir, "backup-catalog.mjs");
   assert.match(out, /fpm_catalog\s+2 rows/);
-  assert.match(out, /game_marks\s+0 rows\s+\(no such table in this database\)/);
-  assert.equal(headerOf(dir).tables, "fpm_catalog=2 settings=1 dismissals=1 game_marks=0",
-    "an absent optional table is reported as zero, not left out of the header");
+  assert.match(out, /game_marks\s+0 rows -> \(no such table in this database\)/);
+  assert.equal(fs.existsSync(path.join(dir, "backups/private-marks.sql")), false, "no private dump is written for a table that does not exist");
+  assert.equal(headerOf(dir).tables, "fpm_catalog=2 settings=1 dismissals=1");
   assert.match(headerOf(dir).text, /-- experience_scored: 1/);
 
   // And the other direction: that dump restores and verifies.
@@ -126,6 +221,49 @@ test("SEC-3: backup SUCCEEDS against a database with NO game_marks table, and st
   const rows = execFileSync("sqlite3", [path.join(dir, "check.sqlite"),
     "select count(*) from fpm_catalog"], { encoding: "utf8" }).trim();
   assert.equal(rows, "2", "the LLM-scored rows survived a backup taken with no game_marks table");
+});
+
+test("13 GATE 4 / TC-6: a restore MINTS A FRESH VERSION STAMP, so the next page load cannot be served a pre-restore catalogue", async () => {
+  requireSqlite3();
+  // One of gate 4's four invalidation paths, and it was tested by nothing. The
+  // KV snapshot is keyed on `catalog_meta.catalog_version`; a restore replaces
+  // every row in the database, so without a fresh stamp the restored database
+  // presents the SAME version as a snapshot still sitting in KV and the page
+  // keeps serving a catalogue describing a database that no longer exists.
+  //
+  // `catalog_meta` is deliberately NOT in the backup any more (SEC-6), so this
+  // write is the only thing that sets the stamp. Both halves are asserted.
+  const { dir } = makeFakeRepo(BASE_SQL + `
+    create table catalog_meta (key text primary key, value text, updated_at integer);
+    insert into catalog_meta values ('catalog_version', 'the-PRE-restore-stamp', 1);
+  `);
+  run(dir, "backup-catalog.mjs");
+  assert.doesNotMatch(headerOf(dir).text, /the-PRE-restore-stamp/, "the old stamp is not even in the dump");
+
+  const target = path.join(dir, "check.sqlite");
+  const out = run(dir, "restore-catalog.mjs", ["--into", target]);
+  assert.match(out, /catalogue snapshot version reset to .+ - the next page load rebuilds/);
+
+  const stamp = execFileSync("sqlite3", [target,
+    "select value from catalog_meta where key = 'catalog_version'"], { encoding: "utf8" }).trim();
+  assert.notEqual(stamp, "the-PRE-restore-stamp", "the restored database does not present the old version");
+  assert.match(stamp, /-restored$/, "it presents a freshly minted one, marked as coming from a restore");
+});
+
+test("13 TC-6: the stamp is minted even when the dump has no catalog_meta at all", async () => {
+  requireSqlite3();
+  // The normal case now: no `catalog_meta` in the backup, so the restored
+  // database has no such table until the restore script creates it. A restore
+  // that left the table absent would make `readCatalogVersion` return null, and
+  // the cache would treat every request as first-boot.
+  const { dir } = makeFakeRepo(BASE_SQL);
+  run(dir, "backup-catalog.mjs");
+  const target = path.join(dir, "check.sqlite");
+  run(dir, "restore-catalog.mjs", ["--into", target]);
+
+  const stamp = execFileSync("sqlite3", [target,
+    "select value from catalog_meta where key = 'catalog_version'"], { encoding: "utf8" }).trim();
+  assert.match(stamp, /-restored$/, "the table was created and stamped, not left missing");
 });
 
 test("a REQUIRED table is still a hard stop – the backup refuses to write a half-catalogue", () => {

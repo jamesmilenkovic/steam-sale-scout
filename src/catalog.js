@@ -61,6 +61,7 @@ import { qualifiesForFpmFloor, hltbInit, enqueueHltbFetch, getCachedHltb, hltbLe
 import { parseOwnersMidpoint, getCachedSpy, awaitSpySlot } from "./spyQueue.js";
 import { quality } from "./score.js";
 import { chunk } from "./deals.js";
+import { classifyStoreItem, fetchStoreItemsBatch, STORE_ITEMS_BATCH_SIZE } from "./storePrices.js";
 
 const STEAMSPY_ALL_URL = "https://steamspy.com/api.php";
 
@@ -432,23 +433,167 @@ const ALTER_TABLE_STATEMENTS = [
   "ALTER TABLE fpm_catalog ADD COLUMN experience_rubric TEXT",
   "ALTER TABLE fpm_catalog ADD COLUMN rank_exclude_reason TEXT",
   "ALTER TABLE fpm_catalog ADD COLUMN rank_exclude_checked_at INTEGER",
+  // Increment 13. `price_state` is BOTH the display state and the fill's
+  // cursor: NULL means "never checked under the GetItems method", which is a
+  // different fact from `unknown` ("checked, and the source could not say").
+  // Conflating those two is the null-versus-zero mistake this project has now
+  // caught three times (increment 12's hoursPlayed, 12.5's "never played",
+  // and the 12,412 rows ITAD answered for that we recorded as silence).
+  "ALTER TABLE fpm_catalog ADD COLUMN price_state TEXT",
+  "ALTER TABLE fpm_catalog ADD COLUMN price_source TEXT",
 ];
 
-/** Create the catalog table if it doesn't exist yet, and add any columns a
+/** The catalogue snapshot's version stamp lives here, plus anything else
+ * catalogue-wide and tiny. One row, read on the cache path only. */
+const CREATE_CATALOG_META_SQL = `CREATE TABLE IF NOT EXISTS catalog_meta (
+  key        TEXT PRIMARY KEY,
+  value      TEXT,
+  updated_at INTEGER
+)`;
+
+/** The catalog_meta row holding the current stamp. */
+export const CATALOG_VERSION_KEY = "catalog_version";
+
+/** A stamp that two different databases can never collide on: the clock plus
+ * randomness. A pure timestamp would let a restored copy of yesterday's
+ * database present the same version as today's live one. */
+export function newCatalogVersion(nowMs = Date.now()) {
+  return `${nowMs.toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/**
+ * Record that the catalogue changed. Called at the end of every sync step that
+ * writes to fpm_catalog, and by tools/restore-catalog.mjs after a restore.
+ * Never throws - a failed bump means a stale snapshot for at most the TTL,
+ * which is a far smaller problem than a failed sync.
+ * @returns {Promise<string|null>} the new version, or null if it could not be written.
+ */
+export async function bumpCatalogVersion(env, nowMs = Date.now()) {
+  const version = newCatalogVersion(nowMs);
+  try {
+    await env.FPM_DB.prepare(
+      `INSERT INTO catalog_meta (key, value, updated_at) VALUES (?, ?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+    )
+      .bind(CATALOG_VERSION_KEY, version, nowMs)
+      .run();
+    return version;
+  } catch {
+    return null;
+  }
+}
+
+/** The current stamp, or null if there is none or it cannot be read. One D1
+ * row read - the only D1 the catalogue costs on a warm request. */
+export async function readCatalogVersion(env) {
+  try {
+    const result = await env.FPM_DB.prepare(
+      "SELECT value FROM catalog_meta WHERE key = ?",
+    )
+      .bind(CATALOG_VERSION_KEY)
+      .all();
+    return result.results?.[0]?.value ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/** ensureRankExclusions runs `WHERE rank_exclude_checked_at IS NULL` and,
+ * before this index, that was a full 18,306-row scan on EVERY request that
+ * returned ZERO rows - half of the 36,620 this increment exists to remove.
+ * The index makes the same predicate answerable without reading the table. */
+const CREATE_EXCLUSION_INDEX_SQL =
+  "CREATE INDEX IF NOT EXISTS idx_catalog_rank_exclude_unchecked ON fpm_catalog (rank_exclude_checked_at)";
+
+/** The column each ALTER above adds, derived from the statement itself so the
+ * list stays ONE list - a parallel array of names would be a second place to
+ * forget. The shape is fixed and asserted by the tests; anything unparseable
+ * falls through to being attempted, which is exactly the old behaviour. */
+function alterColumnName(sql) {
+  const m = /ADD COLUMN\s+(\w+)/i.exec(sql);
+  return m ? m[1] : null;
+}
+
+/**
+ * Create the catalog table if it doesn't exist yet, and add any columns a
  * pre-existing install is missing (Increment 7.8's app_type/type_checked_at
- * — see ALTER_TABLE_STATEMENTS above). Coder's call (per SPEC.md, "CREATE
- * TABLE IF NOT EXISTS on the sync path — Coder's call, local-only app") over
+ * - see ALTER_TABLE_STATEMENTS above). Coder's call (per SPEC.md, "CREATE
+ * TABLE IF NOT EXISTS on the sync path - Coder's call, local-only app") over
  * `wrangler d1 migrations`: this is a single-table, single-environment,
- * local-only app — a migrations directory would be pure ceremony here. Safe
- * to call on every request (idempotent, cheap, never loses existing rows). */
+ * local-only app - a migrations directory would be pure ceremony here.
+ *
+ * ASK FIRST, ALTER ONLY WHAT IS MISSING (increment 13, James's ruling 8).
+ * HOW a column is added has not changed and must not: it is still
+ * `ALTER TABLE ... ADD COLUMN`, still the same list, still wrapped in a
+ * try/catch. What changed is HOW OFTEN. This used to fire the CREATE plus all
+ * 23 ALTERs on EVERY request, catching and discarding 23 duplicate-column
+ * errors each time to re-establish that columns added in increment 7.8 still
+ * existed - 24 statements per page load to do nothing.
+ *
+ * Now it asks `PRAGMA table_info` first, which D1 answers for **zero row
+ * reads**, and alters only what that answer says is absent. A warm request
+ * costs ONE statement instead of twenty-four. It is also strictly safer than
+ * the memo I tried first: there is no cached "already done" flag to go stale
+ * after a restore, and two tests holding two different databases in one
+ * process cannot contaminate each other, because nothing is remembered
+ * between calls at all.
+ *
+ * THE TRY/CATCH STAYS. If the PRAGMA is ever unavailable or the name cannot
+ * be parsed out of a statement, every ALTER is attempted exactly as before and
+ * a duplicate-column error is swallowed exactly as before. This can only ever
+ * do less work, never different work.
+ */
 export async function ensureCatalogSchema(env) {
-  await env.FPM_DB.prepare(CREATE_TABLE_SQL).run();
+  const db = env.FPM_DB;
+
+  let existing = await catalogColumnNames(db);
+  if (existing.size === 0) {
+    // No table, or no PRAGMA. Either way the create is safe and idempotent.
+    await db.prepare(CREATE_TABLE_SQL).run();
+    existing = await catalogColumnNames(db);
+  }
+
   for (const sql of ALTER_TABLE_STATEMENTS) {
+    const column = alterColumnName(sql);
+    if (column && existing.has(column)) continue;
     try {
-      await env.FPM_DB.prepare(sql).run();
+      await db.prepare(sql).run();
     } catch {
-      // Column already exists — expected on every call after the first.
+      // Column already exists - expected whenever the PRAGMA could not answer.
     }
+  }
+
+  // Same discipline for the two increment-13 objects: ask, then only build.
+  // Both PRAGMAs read zero rows, so a warm request costs three statements and
+  // nothing on the row-read bill.
+  if ((await catalogColumnNames(db, "catalog_meta")).size === 0) {
+    await db.prepare(CREATE_CATALOG_META_SQL).run();
+  }
+  if (!(await catalogIndexNames(db)).has("idx_catalog_rank_exclude_unchecked")) {
+    await db.prepare(CREATE_EXCLUSION_INDEX_SQL).run();
+  }
+}
+
+/** Column names currently on `fpm_catalog`, as a Set. An empty Set means
+ * "the table is not there, or the database could not tell us" - both of which
+ * the caller handles by doing the full create-and-alter pass. Never throws. */
+async function catalogColumnNames(db, table = "fpm_catalog") {
+  try {
+    const result = await db.prepare(`PRAGMA table_info(${table})`).all();
+    return new Set((result.results || []).map((row) => row.name));
+  } catch {
+    return new Set();
+  }
+}
+
+/** Index names on `fpm_catalog`, as a Set. Empty on any failure, which makes
+ * the caller fall back to `CREATE INDEX IF NOT EXISTS` - safe either way. */
+async function catalogIndexNames(db) {
+  try {
+    const result = await db.prepare("PRAGMA index_list(fpm_catalog)").all();
+    return new Set((result.results || []).map((row) => row.name));
+  } catch {
+    return new Set();
   }
 }
 
@@ -788,15 +933,21 @@ export async function selectMatchedCatalogRows(env) {
  * twice. `main_hours`/`match_method` are NOT – ruling 5 retired HLTB hours
  * from every new metric, so carrying them here would just invite a consumer.
  *
- * COST NOTE for increment 13 (SPEC.md gate 8): this is a full-catalogue read
- * on every /api/rank request, ~18.3k rows, exactly as handleFpm's read
- * already is. Caching the user-independent part is increment 13's job
- * (src/catalog.js:493), deliberately not fixed here – the row count is
- * recorded as gate input, not optimised away. */
+ * INCREMENT 13 CHANGED TWO THINGS HERE. `price_state` joins the list, because
+ * the page has to render a reason rather than a blank; and this read is no
+ * longer on the request path at all - src/catalogCache.js's loadRankCatalogue
+ * wraps it, and it now runs at most a few times a day rather than 18,306 rows
+ * per page load.
+ *
+ * ANY CHANGE TO THIS COLUMN LIST MUST BUMP CATALOG_SNAPSHOT_VERSION in
+ * src/catalogCache.js. A snapshot written before the shape changed must not be
+ * readable after it - the exact trap increment 12.5 added a version segment to
+ * `libraryCacheKey` for. */
 export async function selectRankCatalogRows(env) {
   const result = await env.FPM_DB.prepare(
     `SELECT appid, name, owners, positive, negative, wilson, app_type,
             price, price_cents, regular, cut, price_checked_at,
+            price_state,
             tags, source_owned,
             experience_score, game_score, has_ending, hours_to_value, hours_to_good,
             experience_reason, experience_confidence, experience_checked_at,
@@ -1937,6 +2088,14 @@ export async function fetchItadPricesBatch(env, itadIds) {
   url.searchParams.set("key", env.ITAD_API_KEY);
   url.searchParams.set("country", ITAD_COUNTRY);
   url.searchParams.set("shops", String(ITAD_SHOP_ID_STEAM));
+  // THE ONE PARAMETER THAT WAS THE WHOLE DEFECT (increment 13, ruling 14).
+  // Without `nondeals`, /games/prices/v2 returns ONLY games with a live
+  // discount. Measured over a 200-row sample: 19 rows priced without it, 156
+  // with it. That is why 12,412 rows where ITAD had resolved an id were
+  // written back as "no price" - ITAD was never silent, this call never asked.
+  // It also repairs the routine sale refresh, which is the lane that would
+  // otherwise keep overwriting a good list price with nothing.
+  url.searchParams.set("nondeals", "true");
 
   let res;
   try {
@@ -1967,6 +2126,16 @@ export async function fetchItadPricesBatch(env, itadIds) {
   for (const entry of json) {
     const dealEntry = (entry.deals || []).find((d) => d.shop?.id === ITAD_SHOP_ID_STEAM);
     if (!dealEntry) continue;
+    // A ZERO FROM ITAD IS NOT A PRICE (increment 13 review, blocker CR-1).
+    // ITAD reports free-to-play games at `amount: 0`, and `nondeals=true`
+    // above is precisely what makes those entries start arriving - the probe
+    // saw it (02-probe-verdict.md: 174 against 156, once its zero-price rows
+    // were counted generously). Left in, a zero flows through
+    // recordPriceResult as a real price and statusLine's "a real number always
+    // wins" branch renders `$0.00` over a row that read "Free to play" the day
+    // before. Free is a STATE here, established by Steam's own `is_free`
+    // (src/storePrices.js), never by a number.
+    if (dealEntry.price?.amount === 0) continue;
     priceByItadId.set(entry.id, {
       price: dealEntry.price?.amount ?? null,
       priceCents: dealEntry.price?.amountInt ?? null,
@@ -2002,8 +2171,7 @@ export async function fetchItadPricesBatch(env, itadIds) {
 export async function selectPriceBatch(env, { limit, staleCutoffMs }) {
   const result = await env.FPM_DB.prepare(
     `SELECT appid, name FROM fpm_catalog
-     WHERE main_hours IS NOT NULL
-       AND app_type = 'game'
+     WHERE app_type = 'game'
        AND source_owned = 0
        AND (price_checked_at IS NULL OR price_checked_at < ?)
      ORDER BY source_deal DESC, owners DESC, (positive + negative) DESC
@@ -2014,17 +2182,97 @@ export async function selectPriceBatch(env, { limit, staleCutoffMs }) {
   return result.results || [];
 }
 
-/** Write back one price-check result. Every field null (with itadId
- * possibly also null) records a checked-but-priceless row — ITAD genuinely
- * has no live Steam deal for it right now (or no ITAD id could even be
- * resolved) — retried on the normal FPM_PRICE_TTL_HOURS cycle, same
- * "checked, no result" convention as recordHltbResult/recordAppType. */
+/** THE SALE LANE MAY REFRESH A PRICE. IT MAY NOT RECLASSIFY A ROW.
+ *
+ * Two guards, both from the increment 13 review (blocker CR-1, minor CR-7):
+ *
+ * 1. The `price_state` filter. This lane only ever learns "there is a live
+ *    Steam deal". It has no way to learn that a game is free, delisted, or
+ *    refused classification in Australia - only src/storePrices.js can say
+ *    that, from fields ITAD does not carry. So a row already standing at
+ *    `free`, `delisted`, `region` or `unknown` is LEFT ALONE. Without this the
+ *    six-hourly refresh walks a correct `free` row back to `priced`, which is
+ *    gate 9's failure mode on a different column.
+ * 2. `regular = COALESCE(?, regular)`. A deal entry can carry a price and no
+ *    list price, and binding NULL straight in would erase the list price the
+ *    increment 13 fill won - the residual of gate 9 itself.
+ *
+ * AND WHY THE DEAL PATH IS TWO STATEMENTS, NOT ONE (round-2 review, CR-15).
+ * The guard above used to sit on the SAME update that stamped
+ * `price_checked_at`. `price_checked_at` is `selectPriceBatch`'s cursor, so a
+ * guarded row never advanced it: up to 772 live rows (the bundle-only
+ * `unknown`s of ruling 13, plus two `region` and one `delisted`, all carrying
+ * an `itad_id`) were re-selected on every sync, forever, and never written.
+ * The cursor stamp is therefore UNGUARDED and always runs; only the price
+ * columns and the state carry the guard. Two round trips per dealing row
+ * instead of one, on a background lane, to make the cursor honest.
+ */
+const RECORD_PRICE_CHECKED_SQL =
+  `UPDATE fpm_catalog SET itad_id = ?, price_checked_at = ? WHERE appid = ?`;
+
+/** The guarded half: the price columns and the state, which a non-`priced`
+ * row refuses. A no-op here is the guard working, not a failure - and
+ * `meta.changes` is how the caller tells the two apart. */
+const RECORD_PRICE_DEAL_SQL =
+  `UPDATE fpm_catalog SET price = ?, price_cents = ?, regular = COALESCE(?, regular), cut = ?,
+     price_state = 'priced'
+   WHERE appid = ? AND (price_state IS NULL OR price_state = 'priced')`;
+
+/** THE NO-DEAL PATH, AND IT IS THE FIX GATE 9 EXISTS FOR. The sale ended; the
+ * game did not stop having a price. So `cut` goes to 0 and `price` falls back
+ * to the list price already stored in `regular` - which is where increment
+ * 13's fill put it. `regular` itself is never written here at all. */
+const RECORD_PRICE_NO_DEAL_SQL = `UPDATE fpm_catalog SET
+   price = regular,
+   price_cents = CASE WHEN regular IS NULL THEN NULL ELSE CAST(ROUND(regular * 100) AS INTEGER) END,
+   cut = CASE WHEN regular IS NULL THEN NULL ELSE 0 END,
+   itad_id = ?,
+   price_checked_at = ?
+ WHERE appid = ?`;
+
+/**
+ * Write back one price-check result from the ITAD sale lane.
+ *
+ * THE DEFECT THIS FUNCTION USED TO CARRY, AND WHY IT MATTERED (SPEC.md gate 9,
+ * ruling 4). It used to write `regular = NULL` whenever a check found no live
+ * deal - which is most checks, because most games are not on sale. Increment
+ * 13's fill wins a list price for ~11,400 ranked rows, and the very next
+ * routine sale refresh would have erased every one of them, silently, weeks
+ * later. Fixing the fetch without fixing this would have looked like it worked
+ * and then undone itself.
+ *
+ * So there are now two paths and they say different things:
+ *   - a live deal   -> price/regular/cut all move, state becomes `priced`
+ *   - no live deal  -> `regular` is LEFT ALONE, `price` reverts to it, `cut` 0
+ *
+ * Both stamp `price_checked_at`, so the TTL cycle is byte-identical.
+ *
+ * AND NEITHER PATH RECLASSIFIES A ROW. `priced` is set only on a row that was
+ * already `priced` or was never classified - see RECORD_PRICE_DEAL_SQL's
+ * guard. That is the increment 13 review's blocker CR-1: this lane is a price
+ * refresher, not a classifier, and the six-hourly cycle must not be able to
+ * walk a `free` row to `$0.00` over the course of a week.
+ *
+ * @returns {Promise<boolean>} whether the PRICE landed. False means either
+ * there was no deal to write, or the row's `price_state` refused it - and the
+ * caller must not count that row as priced (CR-15's secondary defect: it did).
+ */
 export async function recordPriceResult(env, appid, { price, priceCents, regular, cut, itadId, checkedAtMs }) {
-  await env.FPM_DB.prepare(
-    "UPDATE fpm_catalog SET price = ?, price_cents = ?, regular = ?, cut = ?, itad_id = ?, price_checked_at = ? WHERE appid = ?",
-  )
-    .bind(price ?? null, priceCents ?? null, regular ?? null, cut ?? null, itadId ?? null, checkedAtMs, appid)
+  const hasDeal = price != null || regular != null;
+  if (!hasDeal) {
+    await env.FPM_DB.prepare(RECORD_PRICE_NO_DEAL_SQL).bind(itadId ?? null, checkedAtMs, appid).run();
+    return false;
+  }
+  // The cursor first, unguarded, so the row advances whatever the guard says.
+  await env.FPM_DB.prepare(RECORD_PRICE_CHECKED_SQL).bind(itadId ?? null, checkedAtMs, appid).run();
+  const result = await env.FPM_DB.prepare(RECORD_PRICE_DEAL_SQL)
+    .bind(price ?? null, priceCents ?? null, regular ?? null, cut ?? null, appid)
     .run();
+  // A binding that does not report `changes` cannot be read as "blocked" -
+  // the guard is the only thing that makes this a no-op, so an absent count
+  // is treated as a write. The value is a counter, never a control flow.
+  const changes = result?.meta?.changes;
+  return changes == null || Number(changes) > 0;
 }
 
 /**
@@ -2042,14 +2290,19 @@ export async function recordPriceResult(env, appid, { price, priceCents, regular
  * @param {object} env - needs env.FPM_DB and env.ITAD_API_KEY.
  * @param {Array<{appid: number, name: string}>} items
  * @param {number} [nowMs]
- * @returns {Promise<{attempted: number, priced: number, noPrice: number, gaveUp: number}>}
+ * @returns {Promise<{attempted: number, priced: number, noPrice: number, stateGuarded: number, gaveUp: number}>}
+ * `stateGuarded` is rows where ITAD offered a price and the row's own
+ * `price_state` refused it (CR-15). It is logged by the sync pipeline but is
+ * deliberately NOT added to `lastSyncStats`: /api/fpm-status's key set is
+ * frozen for this increment (gate 11 allows exactly one route to change).
  */
 export async function resolvePriceBatch(env, items, nowMs = Date.now()) {
-  if (!items || items.length === 0) return { attempted: 0, priced: 0, noPrice: 0, gaveUp: 0 };
+  if (!items || items.length === 0) return { attempted: 0, priced: 0, noPrice: 0, stateGuarded: 0, gaveUp: 0 };
 
   let attempted = 0;
   let priced = 0;
   let noPrice = 0;
+  let stateGuarded = 0;
   let backoff = priceBackoffBaseMs;
   let lastFetchAt = 0;
   let consecutiveBad = 0;
@@ -2071,7 +2324,7 @@ export async function resolvePriceBatch(env, items, nowMs = Date.now()) {
       }
       consecutiveBad++;
       if (consecutiveBad >= FPM_PRICE_MAX_CONSECUTIVE_BAD) {
-        return { attempted, priced, noPrice, gaveUp: items.length - attempted };
+        return { attempted, priced, noPrice, stateGuarded, gaveUp: items.length - attempted };
       }
       await sleep(Math.max(backoff, idResult.retryAfterMs || 0));
       backoff = Math.min(backoff * 2, priceBackoffMaxMs);
@@ -2094,7 +2347,7 @@ export async function resolvePriceBatch(env, items, nowMs = Date.now()) {
         }
         consecutiveBad++;
         if (consecutiveBad >= FPM_PRICE_MAX_CONSECUTIVE_BAD) {
-          return { attempted, priced, noPrice, gaveUp: items.length - attempted };
+          return { attempted, priced, noPrice, stateGuarded, gaveUp: items.length - attempted };
         }
         await sleep(Math.max(backoff, priceResult.retryAfterMs || 0));
         backoff = Math.min(backoff * 2, priceBackoffMaxMs);
@@ -2106,8 +2359,14 @@ export async function resolvePriceBatch(env, items, nowMs = Date.now()) {
       const priceEntry = itadId != null ? priceResult.priceByItadId.get(itadId) : undefined;
       attempted++;
       if (priceEntry) {
-        await recordPriceResult(env, item.appid, { ...priceEntry, itadId, checkedAtMs: nowMs });
-        priced++;
+        // CR-15: `priced` counts writes that LANDED. A row standing at `free`,
+        // `delisted`, `region` or `unknown` refuses the price - it is still
+        // checked and still stamped, but nothing was written to it, and
+        // counting it as priced over-reported the sync for the whole of
+        // increment 13's first round.
+        const landed = await recordPriceResult(env, item.appid, { ...priceEntry, itadId, checkedAtMs: nowMs });
+        if (landed) priced++;
+        else stateGuarded++;
       } else {
         await recordPriceResult(env, item.appid, { price: null, priceCents: null, regular: null, cut: null, itadId, checkedAtMs: nowMs });
         noPrice++;
@@ -2115,7 +2374,175 @@ export async function resolvePriceBatch(env, items, nowMs = Date.now()) {
     }
   }
 
-  return { attempted, priced, noPrice, gaveUp: 0 };
+  return { attempted, priced, noPrice, stateGuarded, gaveUp: 0 };
+}
+
+// ---------------------------------------------------------------------------
+// Price STATE fill (Increment 13) - the seventh instance of this file's
+// resumable-batch shape, and the one that finally gives every catalogue row an
+// answer instead of a blank.
+//
+// WHY A NEW CURSOR RATHER THAN REUSING `price_checked_at` (SPEC.md §4.2).
+// 12,413 rows already carry a `price_checked_at` stamp written under the old
+// ITAD-deals-only method. Reusing that column would mean either fighting the
+// TTL logic or wiping a column the routine sale refresh depends on.
+// `price_state IS NULL` is a clean cursor: it guarantees every row is
+// evaluated exactly once under the new method, and it leaves the existing
+// refresh cycle byte-identical.
+//
+// WRITES ARE ONE ROW AT A TIME, DELIBERATELY (James's ruling 12). Batching 100
+// writes per round trip measured 44 s against 203 s and was REFUSED: 160
+// seconds is not worth weakening the kill-and-resume property gate 7 has to
+// prove. A kill mid-batch must lose at most one row.
+// ---------------------------------------------------------------------------
+
+/** Rows per GetItems call. */
+export const FPM_PRICE_STATE_BATCH = 500;
+
+/**
+ * Up to `limit` rows that have never been evaluated under the GetItems method.
+ *
+ * NO `main_hours` GATE, AND THAT IS THE POINT. Its sibling selectPriceBatch
+ * carried `WHERE main_hours IS NOT NULL` - a column belonging to the retired
+ * /api/fpm lane, whose HLTB fill increment 10 ruling 5 retired from every new
+ * metric. 3,627 catalogue rows have no `main_hours`, so they were never
+ * eligible for a price check at all, which is most of the "never checked"
+ * population. This selection gates on nothing but the cursor.
+ *
+ * NO `source_owned` GATE EITHER. An owned row shows "In your library" instead
+ * of a price, so its price is never rendered - but its STATE still has to be
+ * known, because SPEC.md §6's funnel block must partition the ranked pool
+ * exactly and an unclassified owned row would put a hole in it.
+ *
+ * ORDER IS `appid` ASC, which is stable across runs - so a kill and resume
+ * picks up where it stopped rather than re-shuffling the queue.
+ */
+export async function selectPriceStateBatch(env, { limit }) {
+  const result = await env.FPM_DB.prepare(
+    `SELECT appid, name FROM fpm_catalog
+     WHERE price_state IS NULL
+     ORDER BY appid
+     LIMIT ?`,
+  )
+    .bind(limit)
+    .all();
+  return result.results || [];
+}
+
+const RECORD_PRICE_STATE_PRICED_SQL =
+  `UPDATE fpm_catalog SET price = ?, price_cents = ?, regular = ?, cut = ?,
+     price_state = 'priced', price_source = ?, price_checked_at = ?
+   WHERE appid = ?`;
+
+/** A row with no price of its own does not get its price columns cleared. The
+ * state is what changed, and a stale number would be worse than none - but so
+ * would silently keeping one, so the columns are set to NULL for every
+ * non-priced state. The state column is what the page reads. */
+const RECORD_PRICE_STATE_UNPRICED_SQL =
+  `UPDATE fpm_catalog SET price = NULL, price_cents = NULL, regular = NULL, cut = NULL,
+     price_state = ?, price_source = ?, price_checked_at = ?
+   WHERE appid = ?`;
+
+/**
+ * Write one row's verdict through to D1. Called once per row, immediately, so
+ * a kill loses at most this row.
+ * @param {object} env
+ * @param {number} appid
+ * @param {{state: string, price: number|null, priceCents: number|null, regular: number|null, cut: number|null}} verdict
+ * @param {string} source
+ * @param {number} checkedAtMs
+ */
+export async function recordPriceState(env, appid, verdict, source, checkedAtMs) {
+  if (verdict.state === "priced") {
+    await env.FPM_DB.prepare(RECORD_PRICE_STATE_PRICED_SQL)
+      .bind(verdict.price, verdict.priceCents, verdict.regular, verdict.cut, source, checkedAtMs, appid)
+      .run();
+    return;
+  }
+  await env.FPM_DB.prepare(RECORD_PRICE_STATE_UNPRICED_SQL)
+    .bind(verdict.state, source, checkedAtMs, appid)
+    .run();
+}
+
+/**
+ * Classify a batch of rows against GetItems, chunked at
+ * STORE_ITEMS_BATCH_SIZE, writing every row through as it is decided.
+ *
+ * RESUMABILITY, WHICH IS THE SAME DISCIPLINE INCREMENTS 9 AND 10 USED: a bad
+ * response backs off and retries the SAME chunk rather than advancing;
+ * FPM_PRICE_MAX_CONSECUTIVE_BAD bad responses in a row abandons the run; and
+ * nothing in an unattempted chunk has `price_state` written, so the next run's
+ * selection picks up the exact same rows. Never throws.
+ *
+ * @param {object} env - needs env.FPM_DB.
+ * @param {Array<{appid: number, name: string}>} items
+ * @param {{nowMs?: number, onProgress?: Function}} [options]
+ * @returns {Promise<{attempted: number, priced: number, free: number, delisted: number, region: number, unknown: number, gaveUp: number}>}
+ */
+export async function resolvePriceStateBatch(env, items, options = {}) {
+  const nowMs = options.nowMs ?? Date.now();
+  const tally = { attempted: 0, priced: 0, free: 0, delisted: 0, region: 0, unknown: 0, gaveUp: 0 };
+  if (!items || items.length === 0) return tally;
+
+  let backoff = priceBackoffBaseMs;
+  let lastFetchAt = 0;
+  let consecutiveBad = 0;
+
+  // A PRICE WRITE BUMPS THE VERSION, AND IT BELONGS HERE RATHER THAN IN THE
+  // CALLER (increment 13 review, SEC-1). SPEC.md gate 4's promise is "a price
+  // write bumps the version and the next request rebuilds", and it was FALSE
+  // for the only new price writer: tools/fill-prices.mjs is a driver outside
+  // runFpmSyncPipeline, which is the only thing that bumps. KV survives the
+  // wrangler restart the tool asks for, so the next request would have found
+  // an unchanged stamp and served pre-fill rows for up to the six-hour TTL.
+  // Putting the bump inside the function that does the writing means a future
+  // caller cannot forget it. `attempted > 0` because a run that wrote nothing
+  // changed nothing, and an unnecessary bump costs the whole catalogue a
+  // rebuild. bumpCatalogVersion never throws.
+  //
+  // AND IT IS IN A `finally` (round-2 review, SEC-8). The give-up return below
+  // fires AFTER chunks have already been written through, so a run that wrote
+  // 8,000 rows and then abandoned used to leave the stamp unmoved - SEC-1's
+  // exact failure mode surviving on the error path, for up to the six-hour
+  // TTL. Every exit from this loop now bumps if anything was written.
+  try {
+    for (const chunkItems of chunk(items, STORE_ITEMS_BATCH_SIZE)) {
+      const appids = chunkItems.map((item) => item.appid);
+
+      let result;
+      for (;;) {
+        const wait = computeCatalogWaitMs(lastFetchAt, Date.now(), pricePacingMs);
+        if (wait > 0) await sleep(wait);
+        lastFetchAt = Date.now();
+
+        result = await fetchStoreItemsBatch(appids);
+        if (result.status === "ok") {
+          consecutiveBad = 0;
+          backoff = priceBackoffBaseMs;
+          break;
+        }
+        consecutiveBad++;
+        if (consecutiveBad >= FPM_PRICE_MAX_CONSECUTIVE_BAD) {
+          tally.gaveUp = items.length - tally.attempted;
+          return tally;
+        }
+        await sleep(backoff);
+        backoff = Math.min(backoff * 2, priceBackoffMaxMs);
+      }
+
+      for (const item of chunkItems) {
+        const verdict = classifyStoreItem(result.itemsByAppid.get(item.appid));
+        await recordPriceState(env, item.appid, verdict, "getitems", nowMs);
+        tally.attempted++;
+        tally[verdict.state]++;
+      }
+      if (options.onProgress) options.onProgress(tally);
+    }
+  } finally {
+    if (tally.attempted > 0) await bumpCatalogVersion(env);
+  }
+
+  return tally;
 }
 
 // ---------------------------------------------------------------------------
@@ -3473,7 +3900,7 @@ export async function runFpmSyncPipeline(env, ctx, deps) {
   const batch = await selectHltbBatch(env, { limit: FPM_SYNC_BATCH, staleCutoffMs: hltbStaleCutoffMs });
   const hltbResult = await resolveHltbBatch(env, ctx, batch);
 
-  let priceResult = { attempted: 0, priced: 0, noPrice: 0, gaveUp: 0 };
+  let priceResult = { attempted: 0, priced: 0, noPrice: 0, stateGuarded: 0, gaveUp: 0 };
   if (env.ITAD_API_KEY) {
     const priceStaleCutoffMs = Date.now() - FPM_PRICE_TTL_MS;
     const priceBatch = await selectPriceBatch(env, { limit: FPM_PRICE_SYNC_BATCH, staleCutoffMs: priceStaleCutoffMs });
@@ -3542,7 +3969,8 @@ export async function runFpmSyncPipeline(env, ctx, deps) {
       ` · tags: ${tagsResult.tagged} tagged (${tagsResult.kvSeeded} kv-seeded), ${tagsResult.empty} empty, ${tagsResult.skipped} skipped, ${tagsResult.gaveUp} gave up,` +
       ` ${tagsResult.kvFailed} kv-read failures, ${tagsResult.writeFailed} d1-write failures` +
       ` · hltb: ${hltbResult.cacheHits} cache hits, ${hltbResult.resolved} resolved, ${hltbResult.gaveUp} gave up` +
-      ` · price: ${priceResult.priced} priced, ${priceResult.noPrice} no-price, ${priceResult.gaveUp} gave up` +
+      ` · price: ${priceResult.priced} priced, ${priceResult.noPrice} no-price,` +
+      ` ${priceResult.stateGuarded} state-guarded, ${priceResult.gaveUp} gave up` +
       (experienceResult.tokenMissing
         ? ` · experience: skipped (helper IS running, EXPERIENCE_HELPER_TOKEN not set)`
         : experienceResult.helperUnavailable && experienceResult.attempted === 0
@@ -3552,6 +3980,15 @@ export async function runFpmSyncPipeline(env, ctx, deps) {
           ` ${experienceResult.skippedRows} skipped, ${experienceResult.gaveUp} gave up,` +
           ` ${experienceResult.writeFailed} d1-write failures`),
   );
+
+  // INVALIDATE THE CATALOGUE SNAPSHOT (Increment 13, SPEC.md §4.1). Bumped
+  // here, once, at the end of the whole pipeline, rather than inside each of
+  // the seven write steps above - one call that cannot be forgotten by the
+  // eighth step somebody adds later. A bump when nothing actually changed
+  // costs exactly one extra rebuild, which is the cheap direction to be wrong
+  // in; a MISSED bump serves a stale catalogue for up to the TTL, which is
+  // the expensive one. Never throws (see bumpCatalogVersion).
+  await bumpCatalogVersion(env);
 }
 
 /**

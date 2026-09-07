@@ -1,7 +1,38 @@
 # Catalogue backups
 
-`catalog.sql.gz` is a gzipped SQL dump of the three durable D1 tables:
-`fpm_catalog`, `settings`, `dismissals`. It is **tracked in git on purpose**.
+`catalog.sql.gz` is a gzipped SQL dump of three D1 tables - `fpm_catalog`, `settings`,
+`dismissals` - and it is **tracked in git on purpose**.
+
+`private-marks.sql` is a plain SQL dump of **`game_marks`**, and it is **untracked on purpose**.
+It never leaves this machine.
+
+## THIS REPOSITORY IS PUBLIC, SO THE SPLIT MATTERS
+
+James's ruling, 2026-09-06, on increment 13's security review (SEC-6). The committed dump is
+published to the internet on every backup, and `game_marks` is his **play history** - which games he
+has played and which he has finished. It is simultaneously the most private table the project owns
+and the only genuinely unrecoverable one (Steam has no "mark as played" and never returns one), so
+the two facts are split rather than traded:
+
+| | Backed up? | Committed? |
+|---|---|---|
+| `fpm_catalog` - the LLM scores, the tags, prices | yes, `catalog.sql.gz` | **yes** |
+| `settings`, `dismissals` | yes, `catalog.sql.gz` | **yes** |
+| **`game_marks`** - play history | yes, `private-marks.sql` | **NO** - `backups/.gitignore` |
+| `catalog_meta` - the snapshot version stamp | **no** | no |
+
+`catalog_meta` is dropped outright rather than kept locally. The stamp is regenerated in one write
+by `npm run restore`, and backing it up creates a restore path that can resurrect a stale-version
+match - a restored database presenting the same version as a snapshot still sitting in KV. That is
+the exact hazard increment 13's blocker CR-2 exists to make impossible, and there is no reason to
+build a second door into it.
+
+The verified fact, taken after the change: `gunzip -c backups/catalog.sql.gz | grep game_marks`
+returns nothing. The table was empty when this was found, so nothing has ever leaked - it would have
+started publishing the moment a game was marked.
+
+There is a test for each half of this in `test/backup-restore.test.mjs`, including one asserting the
+string `game_marks` appears nowhere in the committed dump.
 
 ## Why this exists
 
@@ -40,10 +71,14 @@ forever and nobody prunes them.
 ## Use it
 
 ```
-npm run backup                              # overwrite the dump, then commit it
+npm run backup                              # writes BOTH dumps; commit only catalog.sql.gz
 npm run restore -- --into /tmp/check.sqlite # verify, touching nothing real
 npm run restore -- --force                  # really replace the live database
 ```
+
+`npm run backup` prints which file each table went to, and prints a line telling you not to commit
+the private one. `npm run restore` covers the committed dump only; the marks dump is plain SQL and
+goes back in with `sqlite3 <db> < backups/private-marks.sql`.
 
 `npm run restore` with no arguments **refuses** and tells you both options. The
 accident it guards against is running restore when you meant backup, and
@@ -67,9 +102,9 @@ restored 058cd7f72fc2e83dc85f3b651350781bcbc71589d83f0c602ebbc74e22e8bbc2
 
 Identical. Re-run that check whenever the schema changes.
 
-## Not covered by automated tests, deliberately
+## Covered by automated tests since increment 12.5
 
-Both scripts shell out to `sqlite3`. The test suite is provably offline-clean
-and spawns no subprocesses, and adding a test here would break that discipline
-for a tool that is exercised by hand and verified by checksum. Stated as a
-choice rather than left as a gap.
+That section used to say the opposite - that both scripts shell out to `sqlite3` and were therefore
+deliberately left untested. `test/backup-restore.test.mjs` has covered them since increment 12.5,
+copying both tools into a throwaway directory so they never touch the real `.wrangler/` or
+`backups/`. Seven tests, including the privacy split above and the `game_marks`-absent regression.

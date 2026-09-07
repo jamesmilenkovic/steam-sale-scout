@@ -19,8 +19,11 @@ function makeStatement(db, sql, boundArgs) {
     },
     async run() {
       const stmt = db.prepare(sql);
-      stmt.run(...boundArgs);
-      return { success: true, results: [], meta: {} };
+      const info = stmt.run(...boundArgs);
+      // `meta.changes` is real D1's own field, and increment 13's CR-15 fix
+      // reads it: a guarded UPDATE that matches no row is a no-op the caller
+      // has to be able to see. node:sqlite reports it as a BigInt.
+      return { success: true, results: [], meta: { changes: Number(info?.changes ?? 0) } };
     },
     async all() {
       const stmt = db.prepare(sql);

@@ -7,7 +7,7 @@
   "scripts": {
     "dev": "wrangler dev",
     "bridge": "node tools/claude-bridge.mjs",
-    "deploy": "echo 'Deploy deferred to Phase 3 — Steam Sale Scout is local-only through Phase 1 (see SPEC.md). Run: npm run dev' && exit 1",
+    "deploy": "echo 'Deploy refused: NO ROUTE AUTHENTICATES. Every route serves your Steam library, playtimes, dismissals, settings and play history to anyone who asks, and three of them accept writes. Steam OpenID and per-user keys are the blocker - see DEPLOY-BLOCKERS.md. Run: npm run dev' && exit 1",
     "test": "node --test",
     "backup": "node tools/backup-catalog.mjs",
     "restore": "node tools/restore-catalog.mjs"

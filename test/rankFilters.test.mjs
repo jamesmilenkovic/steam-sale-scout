@@ -293,6 +293,82 @@ test("the three lens labels and sub-lines are the ruled copy", () => {
   assert.equal(LENSES[2].subline, "Closest to your taste, whether or not you own it.");
 });
 
+// ---------------------------------------------------------------------------
+// Increment 13 - the six price states, ruled by James at checkpoint 01 before
+// any of them was built.
+// ---------------------------------------------------------------------------
+
+test("13 GATE 8: statusLine renders all six price_state values, and a price always beats a state", () => {
+  // The exhaustive table from SPEC.md §6 as James approved it. Pinned as a
+  // table rather than six separate asserts, so a wording change has to be a
+  // deliberate edit here and cannot be smuggled in.
+  const unowned = { owned: false, price: null, cut: null };
+  const cases = [
+    [{ ...unowned, price: 14.98, cut: 50 }, "$14.98 – 50% off", "priced and discounted"],
+    [{ ...unowned, price: 29.95, cut: 0 }, "$29.95", "priced, no discount"],
+    [{ ...unowned, priceState: "free" }, "Free to play", "free"],
+    [{ ...unowned, priceState: "delisted" }, "Not sold on Steam any more", "delisted"],
+    [{ ...unowned, priceState: "region" }, "Not sold in Australia", "region"],
+    [{ ...unowned, priceState: "unknown" }, "Price not known", "checked, nothing to say"],
+    [{ ...unowned, priceState: null }, "Price not known", "never checked"],
+  ];
+  for (const [row, expected, label] of cases) {
+    assert.equal(statusLine(row), expected, label);
+  }
+});
+
+test("13: a real price wins over any state, and an owned game still shows no price at all", () => {
+  // The two invariants either side of the new table. A row can legitimately
+  // carry a price AND a state - the fill writes both - and the number is the
+  // more specific fact. And price stays suppressed entirely for a game you
+  // own, which increment 12 ruled and this must not disturb.
+  assert.equal(statusLine({ owned: false, price: 5.95, cut: 0, priceState: "priced" }), "$5.95");
+  assert.equal(statusLine({ owned: false, price: 5.95, cut: 0, priceState: "free" }), "$5.95",
+    "a stored price is not overridden by a stale state");
+  assert.equal(statusLine({ owned: true, priceState: "free", price: 5.95 }), "In your library");
+});
+
+test("13: an unrecognised price_state falls back to Price not known rather than printing itself", () => {
+  // Fail-soft on copy: a state outside the closed vocabulary must never reach
+  // the page as raw data.
+  assert.equal(statusLine({ owned: false, price: null, priceState: "on_sale_soon" }), "Price not known");
+});
+
+test("13 SEC-7: an INHERITED property name is not a price state - `constructor` reads Price not known", () => {
+  // `priceState` is server-supplied, and the lookup table was a plain object
+  // literal, so a bare bracket read answered "constructor", "toString",
+  // "valueOf" and friends with an inherited member - putting a function's
+  // source on a card. The table has no prototype now.
+  for (const key of ["constructor", "toString", "valueOf", "hasOwnProperty", "__proto__", "isPrototypeOf"]) {
+    const line = statusLine({ owned: false, price: null, priceState: key });
+    assert.equal(line, "Price not known", `priceState "${key}" must not resolve to an inherited member`);
+  }
+});
+
+test("13: the 991 and the 956 are DIFFERENT COUNTS, and this is which is which", () => {
+  // Two review lanes reported two numbers for the same thing and both were
+  // right. Measured live on 2026-09-06 over the real /api/rank rows:
+  //
+  //   991  ranked rows whose price_state is `unknown`   (the funnel's count)
+  //   956  ranked CARDS that read "Price not known"     (what a reader sees)
+  //   -35  the difference: rows James OWNS, where "In your library" wins
+  //
+  // The funnel counts states; the page renders sentences; owned rows never
+  // show a price line at all. Neither number was asserted anywhere, which is
+  // how they drifted apart in the artifacts.
+  const unknownUnowned = { owned: false, price: null, priceState: "unknown" };
+  const unknownOwned = { owned: true, price: null, priceState: "unknown", hoursPlayed: 3 };
+
+  assert.equal(statusLine(unknownUnowned), "Price not known", "counted in BOTH numbers");
+  assert.equal(statusLine(unknownOwned), "In your library – 3 hours played",
+    "counted in the funnel's 991 and NOT in the page's 956");
+
+  // The same split for a NULL state, which is a different fact from `unknown`
+  // in the funnel and the identical sentence on the card.
+  assert.equal(statusLine({ owned: false, price: null, priceState: null }), "Price not known");
+  assert.equal(statusLine({ owned: true, price: null, priceState: null }), "In your library");
+});
+
 test("no copy anywhere in the module uses an em dash", () => {
   // A house rule James restates on every artifact, and the one typographic
   // mistake that is invisible until it is on screen.
@@ -305,6 +381,10 @@ test("no copy anywhere in the module uses an em dash", () => {
     statusLine({ ...PORTAL_2, finished: true }),
     ...PLAY_STATES.map((s) => s.label),
     statusLine(AMNESIA_BUNKER),
+    statusLine({ owned: false, price: null, priceState: "free" }),
+    statusLine({ owned: false, price: null, priceState: "delisted" }),
+    statusLine({ owned: false, price: null, priceState: "region" }),
+    statusLine({ owned: false, price: null, priceState: "unknown" }),
     lengthLine(DELTARUNE),
     lengthLine(PORTAL_2),
     basisSentence(13924, LIBRARY_STATE_PRESENT),
