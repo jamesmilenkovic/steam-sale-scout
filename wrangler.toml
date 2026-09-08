@@ -2,6 +2,37 @@ name = "steam-sale-scout"
 main = "src/worker.js"
 compatibility_date = "2025-06-01"
 
+# Preview URLs OFF (wayfinder ticket #6). Cloudflare enables them by default
+# whenever a workers.dev route is on, and each one is an EXTRA public hostname
+# in front of the SAME Worker. Ticket #2 §3.2 measured the hazard: preview
+# versions share PRODUCTION bindings, because `preview_id` /
+# `preview_database_id` are documented only for `wrangler dev`, never for an
+# uploaded version. So a preview hostname is a second front door onto the real
+# D1 and the real KV. Turning them off is what makes "the Worker answers on
+# exactly one origin" a true statement, and that statement is what the session
+# cookie's Domain, the Steam OpenID realm/return_to, and the origin allow-list
+# are all keyed to. Turn this back on only together with a decision about which
+# hostnames the allow-list accepts.
+preview_urls = false
+
+# The one declared origin. Ticket #2 §1.5 ruled that the OpenID realm and
+# return_to MUST come from this binding and NEVER from
+# `new URL(request.url).origin`: one Worker is reachable on more than one
+# hostname, so a request-derived realm is partly attacker-influenced. Ticket #6
+# only SETS it. Nothing consumes it yet - the login increment does that, and it
+# should also treat this as an allow-list and reject any request whose Host is
+# not this value.
+#
+# Scheme included, no trailing path. Everything downstream keys to this exact
+# string: the realm, the return_to, the session cookie's Domain, and the origin
+# check on the callback. Changing it means changing all four together.
+#
+# Related and already settled, do not re-open: the session and state cookies
+# must be SameSite=Lax, because the Steam callback arrives as a cross-site
+# top-level navigation and Strict drops the cookie (ticket #2 §2.5).
+[vars]
+PUBLIC_ORIGIN = "https://steam-sale-scout.small-bonus-19ef.workers.dev"
+
 # Static single-page frontend. Requests that don't match a file in ./public
 # fall through to the Worker's fetch handler (e.g. /api/*).
 [assets]
@@ -9,26 +40,30 @@ directory = "./public"
 binding = "ASSETS"
 
 # SteamSpy tag/median/review cache (Increment 3), keyed by appid, 30d/24h TTL
-# (see src/worker.js). `id` is a placeholder – `wrangler dev` simulates KV
-# entirely locally and doesn't validate it against a real Cloudflare account.
-# This project is local-only through Phase 1 (see SPEC.md); a real namespace
-# would need to be created with `wrangler kv namespace create` before deploy.
+# (see src/worker.js). `id` is the REAL namespace, created 2026-09-08 by
+# `wrangler kv namespace create TAG_CACHE` (wayfinder ticket #6). It was a
+# placeholder until then, and `wrangler dev` never noticed, because it
+# simulates KV entirely locally and does not validate the id against a real
+# Cloudflare account. Local dev is unaffected by this value.
 [[kv_namespaces]]
 binding = "TAG_CACHE"
-id = "local-dev-tag-cache-placeholder"
+id = "a53e6e9e7668471dbef6795958685635"
 
 # FPM catalog (Increment 7.7) – the lane's own durable store, so the
 # multi-run HowLongToBeat fill survives `wrangler dev` restarts instead of
-# starting over each time. `database_id` is a placeholder, same convention
-# as TAG_CACHE above: `wrangler dev` simulates D1 entirely locally
-# (state lands under .wrangler/state/v3/d1/), no real Cloudflare account
-# needed. Schema is created on demand (CREATE TABLE IF NOT EXISTS in
-# src/catalog.js), not via `wrangler d1 migrations` – see that file's
-# ensureCatalogSchema for the reasoning.
+# starting over each time. `database_id` is the REAL database, created
+# 2026-09-08 by `wrangler d1 create fpm-catalog` in region OC (wayfinder
+# ticket #6). It was a placeholder until then, same convention as TAG_CACHE
+# above: `wrangler dev` simulates D1 entirely locally (state lands under
+# .wrangler/state/v3/d1/) and ignores this id, so local dev is unaffected.
+# Schema is created on demand (CREATE TABLE IF NOT EXISTS in src/catalog.js),
+# not via `wrangler d1 migrations` – see that file's ensureCatalogSchema for
+# the reasoning. The remote database was seeded with the 18,306 fpm_catalog
+# rows in ticket #6; nothing else was sent to it.
 [[d1_databases]]
 binding = "FPM_DB"
 database_name = "fpm-catalog"
-database_id = "local-dev-fpm-catalog-placeholder"
+database_id = "4ec7c33b-7b10-4a29-b111-857856333524"
 
 # Catalogue snapshot (Increment 13) – the user-independent catalogue rows,
 # written as a manifest plus five chunks of 4,000 rows (the serialised
@@ -37,9 +72,11 @@ database_id = "local-dev-fpm-catalog-placeholder"
 #
 # A SEPARATE NAMESPACE FROM TAG_CACHE, NOT A KEY PREFIX INSIDE IT: the two
 # have completely different lifetimes and value sizes, and at deploy time
-# they should be separately creatable and separately clearable. `id` is a
-# placeholder on the same convention as the two bindings above – `wrangler
-# dev` simulates KV entirely locally.
+# they should be separately creatable and separately clearable. That held.
+# `id` is the REAL namespace, created 2026-09-08 by its own
+# `wrangler kv namespace create CATALOG_CACHE` (wayfinder ticket #6),
+# distinct from TAG_CACHE's id above and separately clearable. Local dev
+# ignores it – `wrangler dev` simulates KV entirely locally.
 [[kv_namespaces]]
 binding = "CATALOG_CACHE"
-id = "local-dev-catalog-cache-placeholder"
+id = "d4f5aadfe7564aca952e0b3deace26a0"
