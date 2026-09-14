@@ -963,11 +963,24 @@ test("gate 1: /api/rank runs the exclusion fill at the top, and reports what it 
   assert.equal(second.funnel.rankExcluded, 1);
 });
 
-test("gate 7: /api/fpm is byte-identical before and after the rank columns exist AND are filled", async () => {
-  // The one zero-diff risk this increment actually creates: two new columns
-  // on the shared table, and a fill that writes to every row of it. If
-  // selectMatchedCatalogRows or the FPM row builder ever picked either
-  // column up, this fires.
+// GATE 7 WAS RETIRED AT INCREMENT 14, WITH ITS SUBJECT – NOT LOST.
+// The gate was "gate 7: /api/fpm is byte-identical before and after the rank
+// columns exist AND are filled". It fetched GET /api/fpm twice around the
+// exclusion fill and asserted the two bodies matched byte for byte. Increment
+// 14 deleted GET /api/fpm, so the gate has no subject left to guard: there is
+// no legacy lane that the new rank columns could leak into.
+//
+// It was deliberately NOT re-pointed at /api/rank. /api/rank READS the rank
+// columns by design, so "byte-identical across the fill" is a different
+// property from the one gate 7 asserted, and it is not even expected to hold.
+// Re-expressing it would have produced a test that looks like continuity but
+// guards nothing.
+//
+// What survives below is gate 7's middle assertion, which was always a
+// standalone rank property rather than a claim about the legacy lane: the
+// exclusion fill really does write to every catalogue row.
+
+test("the rank exclusion fill writes rank_exclude_checked_at to every catalogue row", async () => {
   const env = makeEnv();
   const ctx = makeCtx();
   globalThis.caches = { default: makeMockCache() };
@@ -978,27 +991,9 @@ test("gate 7: /api/fpm is byte-identical before and after the rank columns exist
   ]);
   await env.FPM_DB.prepare("UPDATE fpm_catalog SET main_hours = 5, match_method = 'name'").run();
 
-  // /api/fpm's own enrichment path DOES talk to ITAD/SteamSpy/Steam, so this
-  // one test stubs them all to empty. Nothing in the assertion depends on
-  // what they return — only on the two calls returning the SAME thing.
-  globalThis.fetch = async (input) => {
-    const url = String(input?.url ?? input);
-    if (url.includes("isthereanydeal.com")) return new Response(JSON.stringify({ list: [], hasMore: false }), { headers: { "content-type": "application/json" } });
-    return new Response(JSON.stringify({}), { headers: { "content-type": "application/json" } });
-  };
-
-  const fpmEnv = { ...env, ITAD_API_KEY: "test-itad-key" };
-  const before = await (await worker.fetch(new Request("https://x.test/api/fpm"), fpmEnv, ctx)).text();
-
   await callRank(env, ctx); // fills rank_exclude_reason on every row
   const filled = await env.FPM_DB.prepare("SELECT count(*) AS n FROM fpm_catalog WHERE rank_exclude_checked_at IS NOT NULL").first("n");
   assert.equal(filled, 2, "the fill really did write to both rows");
-
-  const after = await (await worker.fetch(new Request("https://x.test/api/fpm"), fpmEnv, ctx)).text();
-  assert.equal(after, before, "/api/fpm must be byte-identical across the exclusion fill");
-  // And the prologue is STILL in the legacy lane — the new column gates the
-  // new lane only. /api/fpm retires at increment 12 unchanged.
-  assert.ok(after.includes("Black Book: Prologue"));
 });
 
 // ---------------------------------------------------------------------------

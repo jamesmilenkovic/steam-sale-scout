@@ -1,5 +1,10 @@
 # Increment 12.5 – Played and finished
 
+> **Note added 2026-09-14 (increment 14):** this spec refers to routes that no longer exist.
+> `/api/library`, `/api/deals`, `/api/recs`, `/api/best-of` and `GET /api/fpm` were deleted at
+> increment 14 and now answer `501 not implemented`. Nothing below has been rewritten - this
+> file stays the record of what was true when it was approved.
+
 **Scoped:** 2026-09-05 · **Status:** APPROVED by James 2026-09-05 
 **Base:** `experience` @ `ecd500e` (increment 12, stranger gate passed 2026-09-05)
 **PRD:** `PRDs/2-in-progress/2026-07-04-steam-sale-recommender.md` – **Rev 3, Phase 5, increment

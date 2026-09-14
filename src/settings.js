@@ -7,7 +7,8 @@
 // key/value store — it has no opinion on WHAT the valid settings keys or
 // their defaults are; that's entirely the browser's concern (see
 // public/index.html's `persistedSettings` handling), the same way
-// public/filters.js's loadFilters() used to merge a possibly-partial
+// public/filters.js's loadFilters() (deleted at increment 14) used to merge
+// a possibly-partial
 // localStorage value over DEFAULT_FILTERS. Keeping this dumb means a future
 // new setting never needs a server-side change here.
 //

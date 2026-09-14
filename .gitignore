@@ -8,3 +8,8 @@ node_modules
 # them by way of a `git add -A` (increment 13 review, SEC-12). Anything worth
 # keeping is added deliberately with `git add -f`.
 scratchpad/
+
+# Agent worktrees. Each is a full second checkout of this repo at whatever commit
+# the agent branched from, so a `git add -A` here can resurrect files a later
+# increment deleted - increment 14's review caught exactly that (CR-2 / SEC-3).
+.claude/worktrees/

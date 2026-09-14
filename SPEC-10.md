@@ -1,5 +1,10 @@
 # Increment 10 – LLM catalog enrichment (the `experience_score` fill)
 
+> **Note added 2026-09-14 (increment 14):** this spec refers to routes that no longer exist.
+> `/api/library`, `/api/deals`, `/api/recs`, `/api/best-of` and `GET /api/fpm` were deleted at
+> increment 14 and now answer `501 not implemented`. Nothing below has been rewritten - this
+> file stays the record of what was true when it was approved.
+
 **Scoped:** 2026-08-29
 **Base:** `tags` @ `bb669c9` (inc 9), or `main` once `tags` is merged
 **Branch suggestion:** `experience`

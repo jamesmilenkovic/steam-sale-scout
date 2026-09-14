@@ -234,11 +234,13 @@ test("matchHltbEntry: empty entries array returns null", () => {
 
 // ---------------------------------------------------------------------------
 // Qualification — qualifiesForFpmFloor (Increment 7.5). This lane's OWN
-// floor, deliberately NOT hallOfFame.js's qualifiesForHof (10k reviews/95%
+// floor, deliberately NOT hallOfFame.js's qualifiesForHof (deleted at
+// increment 14) of 10k reviews/95%
 // ratio) — the floor matrix below proves a candidate that clears THIS floor
 // but fails the stricter Hall-of-Fame one now qualifies for FPM, while
-// hallOfFame.js's own qualifiesForHof (tested in test/hallOfFame.test.mjs)
-// stays completely untouched.
+// hallOfFame.js's own qualifiesForHof (was tested in
+// test/hallOfFame.test.mjs; both deleted at increment 14) stayed completely
+// untouched.
 // ---------------------------------------------------------------------------
 
 test("FPM_MIN_REVIEWS/FPM_MIN_QUALITY/FPM_MIN_OWNERS default config", () => {

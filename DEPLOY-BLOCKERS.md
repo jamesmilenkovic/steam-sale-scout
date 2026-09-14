@@ -16,14 +16,15 @@ personal data to whoever asks.
 Today's mitigation is entirely environmental and evaporates on deploy: the binding is loopback
 (`127.0.0.1:8787`), no CORS headers are set, and `npm run deploy` hard-exits.
 
+**Thirteen route/method pairs, down from eighteen at increment 13.** Increment 14 deleted
+`/api/library`, `/api/deals`, `/api/recs`, `/api/best-of` and `/api/fpm` outright - see blocker 2,
+now closed. They are gone from the router, not disabled, and answer `501 not implemented`. The five
+rows they held in the table below are gone with them. **This shrinks the surface auth has to cover;
+it closes nothing.** Every row left is still anonymous.
+
 | Route | Method | Authenticates? | What it returns about James |
 |---|---|:--:|---|
-| `/api/library` | GET | **no** | His **entire Steam library**: every appid he owns, every title, playtime in minutes, and last-played timestamps |
 | `/api/rank` | GET | **no** | The ranked catalogue **joined to his library** - which games he owns, hours played, what he has marked played or finished, his settings, and his taste profile's size |
-| `/api/fpm` | GET | **no** | The catalogue joined to his library and owned flags |
-| `/api/deals` | GET | **no** | The deals feed with his owned games excluded - which leaks ownership by omission |
-| `/api/recs` | GET | **no** | Recommendations derived from his top-played games |
-| `/api/best-of` | GET | **no** | As above |
 | `/api/wishlist` | GET | **no** | His Steam wishlist |
 | `/api/settings` | GET | **no** | Every persisted UI setting |
 | `/api/settings` | PUT | **no** | **Writes** them. Anyone can change his settings |
@@ -31,7 +32,7 @@ Today's mitigation is entirely environmental and evaporates on deploy: the bindi
 | `/api/dismissals` | POST | **no** | **Writes** one |
 | `/api/dismissals/:appid` | DELETE | **no** | **Deletes** one |
 | `/api/marks` | GET | **no** | **His play history** - every game he has marked played or finished |
-| `/api/marks/:appid` | PUT | **no** | **Writes** one |
+| `/api/marks` | POST | **no** | **Writes** one |
 | `/api/marks/:appid` | DELETE | **no** | **Deletes** one |
 | `/api/fpm/sync` | POST | **no** | **Starts a multi-hour catalogue sync.** Anyone can start one, repeatedly |
 | `/api/fpm/sync/stop` | POST | **no** | Stops one |
@@ -67,19 +68,26 @@ yet exist.
 
 ---
 
-## Blocker 2 - four retiring routes are still live, and one of them is expensive
+## Blocker 2 - CLOSED at increment 14. The retiring routes are deleted.
 
-Increment 12 marked `/api/fpm`, `/api/recs`, `/api/deals` and `/api/best-of` for deletion. Increment
-13 pushed that to the deploy epic's cleanup rather than doing it mid-probe (§7 item 3). **The honest
-cost of that deferral is recorded here rather than forgotten:**
+**Closed 2026-09-14.** Increment 12 marked `/api/fpm`, `/api/recs`, `/api/deals` and `/api/best-of`
+for deletion and increment 13 deferred it (§7 item 3). Increment 14 carried it out, and took
+`/api/library` with them - five routes, not four. All five are deleted from the router and answer
+`501 not implemented` from the `/api/` catch-all.
 
-- **`/api/fpm` runs its own uncached full-catalogue read** (`selectMatchedCatalogRows`, 14,679 rows).
-  Increment 13 took `/api/rank` from 36,620 D1 row reads per request to 9, so **"a page load costs a
-  bounded number of row reads" is now true**. "The app costs a bounded number of row reads" is
-  **not**, and will not be until these four are gone.
-- All four are anonymous and all four join the library, so they are covered by blocker 1 as well.
-- `public/filters.js` and `public/weight.js` are orphaned front-end modules belonging to the same
-  cleanup.
+- **The uncached full-catalogue read is gone.** `/api/fpm`'s `selectMatchedCatalogRows` call was the
+  last unbounded D1 read in the app. **"The app costs a bounded number of row reads" is now true**,
+  not just "a page load costs a bounded number".
+- **Five anonymous library-joining routes left blocker 1's table**, taking it from eighteen
+  route/method pairs to thirteen.
+- **`public/filters.js` is deleted.** **`public/weight.js` is NOT** - the entry above was wrong to
+  call it orphaned. `src/profile.js` imports `weight`/`recencyMultiplier` from it and `src/rank.js`
+  imports `src/profile.js`, so deleting it would break the ranking. It is misfiled under `public/`,
+  which is what made it look dead. Moving it is a tidy-up, not a cleanup blocker.
+- `src/why.js` and `src/hallOfFame.js` are deleted with the handlers that were their only callers.
+
+`POST /api/fpm/sync`, `GET /api/fpm/sync/status` and `POST /api/fpm/sync/stop` are untouched and
+still live - they fill the catalogue `/api/rank` reads. Their own exposure is blocker 3.
 
 ---
 

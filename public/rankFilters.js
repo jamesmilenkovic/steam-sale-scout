@@ -1,8 +1,8 @@
 // Steam Sale Scout – the answer page's pure logic (Increment 12).
 //
 // Pure, dependency-free ESM so it is imported by both the browser
-// (public/index.html) and `node --test`, mirroring public/filters.js's
-// existing seam. Nothing here touches the DOM, the network or storage.
+// (public/index.html) and `node --test`, mirroring public/filters.js's seam
+// (deleted at increment 14). Nothing here touches the DOM, the network or storage.
 //
 // TWO KINDS OF THING LIVE HERE, DELIBERATELY.
 //
@@ -66,7 +66,8 @@ export const LENSES = Object.freeze([
 ]);
 
 /** How many tag chips the browse filter offers, ranked by how many rows in
- * the ranked pool carry them. Same idea as filters.js's TOP_TAGS_COUNT. */
+ * the ranked pool carry them. Same idea as filters.js's TOP_TAGS_COUNT
+ * (deleted at increment 14). */
 export const TOP_TAGS_COUNT = 30;
 
 /** How many browse rows are put in the DOM at a time (SPEC.md §4.4). The pool

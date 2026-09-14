@@ -1,5 +1,10 @@
 # Increment 11 – New scoring, and the wall comes down
 
+> **Note added 2026-09-14 (increment 14):** this spec refers to routes that no longer exist.
+> `/api/library`, `/api/deals`, `/api/recs`, `/api/best-of` and `GET /api/fpm` were deleted at
+> increment 14 and now answer `501 not implemented`. Nothing below has been rewritten - this
+> file stays the record of what was true when it was approved.
+
 **Scoped:** 2026-09-02 · **Status:** APPROVED by James 2026-09-03 (owned-games amendments 2026-09-02; open question 1 ruled 2026-09-03)
 **Amended:** 2026-09-02, after James's ruling on what owned games are for. Changes are in
 §1, §4.2, §4.3, §7, §8, §10 and gate 5. Every other decision is unchanged.

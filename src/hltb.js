@@ -44,7 +44,8 @@
 //
 // INCREMENT 7.5 (2026-07-12) — FPM lane tuning. Two product-model problems
 // James flagged after a live review of Increment 7: (1) the lane inherited
-// hallOfFame.js's qualifiesForHof floor (10k reviews / 95% positive), which
+// hallOfFame.js's qualifiesForHof floor (deleted at increment 14) of 10k
+// reviews / 95% positive, which
 // only ~9-10 games in the whole pool could ever clear — far too strict for a
 // "quick wins" lane; (2) pure quality÷hours scoring let ultra-short games
 // dominate on brevity alone. This module now owns its OWN qualification
@@ -93,7 +94,8 @@ export const HLTB_CACHE_NEGATIVE_TTL_SECONDS = 7 * 24 * 60 * 60;
 
 // ---------------------------------------------------------------------------
 // Qualification — the FPM lane's OWN floor (Increment 7.5). Deliberately NOT
-// hallOfFame.js's qualifiesForHof (10,000 reviews / 95% positive) — that bar
+// hallOfFame.js's qualifiesForHof (deleted at increment 14) of 10,000
+// reviews / 95% positive — that bar
 // only let ~9-10 games in the whole pool ever reach this lane. These three
 // numbers start at the same values as score.js's Recs-tier floors
 // (MIN_REVIEWS/MIN_QUALITY/MIN_OWNERS) but are copied, not imported — this
@@ -504,7 +506,8 @@ export function funPerHourDisplay(wilsonQuality, mainHours) {
 /**
  * Lane-qualification predicate: a resolved length (compMain > 0, read via
  * the configured FPM_LENGTH_FIELD) AND at least FPM_MIN_LENGTH_HOURS of
- * main-story. The existing Best-of quality floor (qualifiesForHof) is a
+ * main-story. The Best-of quality floor (qualifiesForHof, deleted at
+ * increment 14) was a
  * separate, worker-level concern — this predicate is only about the length
  * signal being present and non-degenerate.
  * @param {{compMain?: number, mainHours?: number}} params

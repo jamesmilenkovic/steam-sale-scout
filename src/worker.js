@@ -1,4 +1,12 @@
-// Steam Sale Scout — Cloudflare Worker.
+// Steam Sale Scout - Cloudflare Worker.
+//
+// INCREMENT 14 DELETED FIVE ROUTES: /api/library, /api/deals, /api/recs,
+// /api/best-of and GET /api/fpm. They are gone from the router, not disabled,
+// and now answer `501 not implemented` from the /api/ catch-all at the bottom
+// of this file. The paragraph below is the historical description of what this
+// file grew from; the routes it still serves are /api/rank, /api/wishlist,
+// /api/settings, /api/dismissals, /api/marks and the /api/fpm/sync trio.
+//
 // Implements /api/library: GetOwnedGames proxy, trimmed response, 24h cache,
 // ?refresh=1 bypass, clear errors. /api/deals (Increment 2): ITAD deals feed,
 // filtered/enriched/owned-excluded. /api/recs (Increment 3): taste-profile
@@ -14,28 +22,21 @@ import {
   BATCH_SIZE,
   BESTOF_FETCH_CAP,
   BESTOF_MAX_PAGES,
-  BESTOF_MIN_CUT,
   BESTOF_PAGE_LIMIT,
   BESTOF_SORT,
-  DEALS_FETCH_CAP,
-  DEALS_PAGE_LIMIT,
   applyHistoricalLow,
   buildOwnedAppIdSet,
   chunk,
-  clampMinCut,
   excludeOwned,
-  filterByMinCut,
   mergeDealPages,
   normalizeDeal,
   parseSteamAppId,
 } from "./deals.js";
 import { TOP_OWNED_GAMES, buildProfile, selectTopOwnedGames, computeIdf, buildTagVector, applyIdf } from "./profile.js";
-import { scoreCandidates, cosineSimilarity } from "./score.js";
-import { buildWhy } from "./why.js";
+import { cosineSimilarity } from "./score.js";
 import { getCachedSpy, enqueueSpyFetch } from "./spyQueue.js";
 import { resolveDeckCompat, DEFAULT_DECK_COMPAT } from "./deckCompat.js";
 import { batteryFriendly } from "./battery.js";
-import { buildHallOfFame, qualifiesForHof } from "./hallOfFame.js";
 import {
   fetchWishlist,
   parseWishlist,
@@ -43,22 +44,11 @@ import {
   sortWishlistLane,
   wishlistWhyLine,
 } from "./wishlist.js";
-import {
-  FPM_POOL_CAP,
-  FPM_FORMULA,
-  FPM_QUALITY_EXP,
-  FPM_BREADTH_WEIGHT,
-  fpmScore,
-  funPerHourDisplay,
-  qualifiesForFpm,
-  sortFpmLane,
-  fpmWhyLine,
-} from "./hltb.js";
+import { FPM_POOL_CAP } from "./hltb.js";
 import {
   ensureCatalogSchema,
   experienceFpm,
   getCatalogStats,
-  selectMatchedCatalogRows,
   startFpmSync,
   isFpmSyncRunning,
   getLastSyncStats,
@@ -84,7 +74,6 @@ import {
   getDismissedAppIdSet,
   addDismissal,
   removeDismissal,
-  excludeDismissed,
 } from "./dismissals.js";
 import {
   ensureMarksSchema,
@@ -212,13 +201,6 @@ function rejectCrossSite(request) {
   return null;
 }
 
-/** Build the jsonError() response for an Error thrown by the ITAD-calling
- * helpers below (each throws with a `.status`, and `.retryAfter` for 429s). */
-function upstreamErrorResponse(err) {
-  const headers = err.retryAfter ? { "retry-after": err.retryAfter } : {};
-  return jsonError(err.message, err.status || 502, headers);
-}
-
 function trimGame(game) {
   return {
     appid: game.appid,
@@ -306,46 +288,6 @@ async function fetchOwnedGames(env) {
   }
 
   return games.map(trimGame);
-}
-
-async function handleLibrary(request, env, ctx) {
-  if (!env.STEAM_API_KEY || !env.STEAM_ID) {
-    return jsonError(
-      "Missing STEAM_API_KEY or STEAM_ID — set them as Worker secrets (see .dev.vars locally).",
-      500,
-    );
-  }
-
-  const url = new URL(request.url);
-  const refresh = url.searchParams.get("refresh") === "1";
-
-  const cache = caches.default;
-  const cacheKey = libraryCacheKey(env);
-
-  if (!refresh) {
-    const cached = await cache.match(cacheKey);
-    if (cached) return cached;
-  }
-
-  let trimmed;
-  try {
-    trimmed = await fetchOwnedGames(env);
-  } catch (err) {
-    return jsonError(err.message, err.status || 502);
-  }
-
-  const responseBody = JSON.stringify({ games: trimmed });
-  const response = new Response(responseBody, {
-    status: 200,
-    headers: {
-      "content-type": "application/json",
-      "cache-control": `public, max-age=${CACHE_TTL_SECONDS}`,
-    },
-  });
-
-  ctx.waitUntil(cache.put(cacheKey, response.clone()));
-
-  return response;
 }
 
 /**
@@ -448,15 +390,10 @@ async function getGameMarks(env) {
 }
 
 // ---------------------------------------------------------------------------
-// /api/deals (Increment 2)
+// /api/deals (Increment 2) - the ROUTE was deleted at increment 14. The ITAD
+// plumbing below it (appid resolution, historical lows, fetchItadJson) was
+// never deals-only and survives: /api/wishlist and buildFpmPool both use it.
 // ---------------------------------------------------------------------------
-
-/** Cache key for a fully-assembled /api/deals response, stable per minCut. */
-function dealsCacheKey(minCut) {
-  return new Request(
-    `https://steam-sale-scout.cache/api/deals?minCut=${minCut}`,
-  );
-}
 
 /** Cache key for one ITAD game id's resolved Steam appid (long-lived — the
  * mapping is effectively static). */
@@ -515,41 +452,6 @@ async function fetchItadJson(url, { method = "GET", body } = {}) {
     e.status = 502;
     throw e;
   }
-}
-
-/**
- * Page through ITAD /deals/v2 (Steam shop, AUD, sorted by cut descending)
- * until exhausted, capped at DEALS_FETCH_CAP. Stops early once a page's
- * last item drops below minCut — since the upstream sort is -cut, every
- * later item would too, so there's no need to keep paginating.
- * @returns {Promise<Array<{list?: Array, hasMore?: boolean}>>} raw pages
- */
-async function fetchDealsPages(env, minCut) {
-  const pages = [];
-  let offset = 0;
-
-  while (offset < DEALS_FETCH_CAP) {
-    const url = new URL(`${ITAD_API_BASE}/deals/v2`);
-    url.searchParams.set("key", env.ITAD_API_KEY);
-    url.searchParams.set("country", ITAD_COUNTRY);
-    url.searchParams.set("shops", String(ITAD_SHOP_ID_STEAM));
-    url.searchParams.set("sort", "-cut");
-    url.searchParams.set("limit", String(DEALS_PAGE_LIMIT));
-    url.searchParams.set("offset", String(offset));
-
-    const page = await fetchItadJson(url);
-    pages.push(page);
-
-    const list = page.list || [];
-    offset += list.length;
-
-    const lastCut = list.length ? (list[list.length - 1].deal?.cut ?? 0) : 0;
-    const exhausted = page.hasMore === false || list.length < DEALS_PAGE_LIMIT;
-    const belowThreshold = list.length > 0 && lastCut < minCut;
-    if (exhausted || belowThreshold) break;
-  }
-
-  return pages;
 }
 
 /**
@@ -652,402 +554,13 @@ async function resolveHistoricalLows(env, ctx, itadIds, refresh) {
   return result;
 }
 
-/** Assemble the post-exclusion deals array: fetch -> filter -> enrich
- * (appid, historical low) -> exclude owned. */
-async function buildDealsFeed(env, ctx, minCut, refresh) {
-  const pages = await fetchDealsPages(env, minCut);
-  const merged = mergeDealPages(pages, DEALS_FETCH_CAP);
-  const filtered = filterByMinCut(merged, minCut);
-
-  const itadIds = filtered.map((item) => item.id);
-  const appIdMap = await resolveAppIds(env, ctx, itadIds, refresh);
-  const lowMap = await resolveHistoricalLows(env, ctx, itadIds, refresh);
-
-  const deals = filtered.map((item) => {
-    const deal = normalizeDeal(item, appIdMap.get(item.id) ?? null);
-    const low = lowMap.get(item.id);
-    return applyHistoricalLow(deal, low ? { price: low } : null);
-  });
-
-  const ownedAppIds = await getOwnedAppIds(env, ctx);
-  return excludeOwned(deals, ownedAppIds);
-}
-
-/**
- * Attach the per-deal signals the Increment 5 filter bar needs (genre/tag
- * chips, Steam Deck badge, battery-friendly badge) to an already-assembled
- * deals array. NOT baked into the 6h dealsCacheKey blob above — SteamSpy tag
- * data is fetched lazily (same partial-cache-is-fine model as /api/recs) and
- * would otherwise freeze an incomplete state into that longer-lived cache.
- *
- * ADDED FETCH SURFACE (flagged for the gate): this is the "how do we enrich
- * Deals" decision SPEC.md's ambiguity list calls out. It reuses the existing
- * SteamSpy tag cache read-only (a KV read per appid, no new network calls —
- * misses just get enqueued to the same background queue /api/recs already
- * drives) plus one new live call: resolveDeckCompat's batched GetItems fetch,
- * which is awaited inline so /api/deals always returns deck data rather than
- * "pending" for it. That fetch is itself KV-cached for 30 days, so only a
- * cold cache pays this cost.
- * @param {object} env
- * @param {object} ctx
- * @param {Array<object>} deals
- * @returns {Promise<Array<object>>}
- */
-async function enrichDeals(env, ctx, deals) {
-  const appids = Array.from(new Set(deals.filter((d) => d.appid != null).map((d) => d.appid)));
-
-  const spyByAppid = new Map();
-  await Promise.all(
-    appids.map(async (appid) => {
-      spyByAppid.set(appid, await getCachedSpy(env, appid));
-    }),
-  );
-  const missingSpy = appids.filter((appid) => !spyByAppid.get(appid).cached);
-  if (missingSpy.length > 0) enqueueSpyFetch(env, ctx, missingSpy);
-
-  const deckByAppid = await resolveDeckCompat(env, appids);
-
-  return deals.map((deal) => {
-    if (deal.appid == null) {
-      return { ...deal, tagNames: [], batteryFriendly: false, deck: DEFAULT_DECK_COMPAT };
-    }
-    const spyEntry = spyByAppid.get(deal.appid);
-    const tags = spyEntry?.cached ? spyEntry.data?.tags || {} : {};
-    return {
-      ...deal,
-      tagNames: Object.keys(tags),
-      batteryFriendly: batteryFriendly(tags),
-      deck: deckByAppid.get(deal.appid) || DEFAULT_DECK_COMPAT,
-    };
-  });
-}
-
-async function handleDeals(request, env, ctx) {
-  if (!env.ITAD_API_KEY) {
-    return jsonError(
-      "Missing ITAD_API_KEY — set it as a Worker secret (see .dev.vars locally).",
-      500,
-    );
-  }
-
-  const url = new URL(request.url);
-  const refresh = url.searchParams.get("refresh") === "1";
-  const minCut = clampMinCut(url.searchParams.get("minCut"));
-
-  const cache = caches.default;
-  const cacheKey = dealsCacheKey(minCut);
-
-  let deals;
-  if (!refresh) {
-    const cached = await cache.match(cacheKey);
-    if (cached) {
-      const body = await cached.clone().json();
-      deals = body.deals;
-    }
-  }
-
-  if (!deals) {
-    try {
-      deals = await buildDealsFeed(env, ctx, minCut, refresh);
-    } catch (err) {
-      return upstreamErrorResponse(err);
-    }
-
-    const response = new Response(JSON.stringify({ deals, minCut }), {
-      status: 200,
-      headers: {
-        "content-type": "application/json",
-        "cache-control": `public, max-age=${DEALS_CACHE_TTL_SECONDS}`,
-      },
-    });
-    ctx.waitUntil(cache.put(cacheKey, response.clone()));
-  }
-
-  // Increment 8: dismissal exclusion is a request-time join, never baked
-  // into the 6h dealsCacheKey blob above — a dismissal must take effect in
-  // the same session, not wait out the cache TTL (same reasoning as owned
-  // status being joined at request time elsewhere in this file).
-  //
-  // AWARENESS NOTE (code review, non-blocking): this join runs AFTER
-  // mergeDealPages' DEALS_FETCH_CAP truncation inside buildDealsFeed above
-  // — a dismissed appid doesn't free a slot in that upstream fetch cap,
-  // only in whatever's downstream of it (nothing, for Deals; there's no
-  // further cap on this response).
-  //
-  // CORRECTION (increment 8.5): the increment-8 version of this note claimed
-  // "DEALS_FETCH_CAP is never reached at real ITAD volumes" — that was
-  // wrong. Live-measured on a real sale day (2026-07-23) at the old cap of
-  // 1000: exactly 1000/1000 fetched with `hasMore=true`, i.e. genuinely
-  // saturated, and a real deep-cut title ("Krater", cut=90%) was sitting
-  // just past the old cap inside a tie-plateau of same-cut% titles — see
-  // DEALS_FETCH_CAP's own doc comment in src/deals.js for the full
-  // measurement and the reasoning for the new 3000 value. This gap is real,
-  // not theoretical, though the higher cap now gives it much more headroom.
-  // The exact same caveat applies to handleRecs below (shares this same
-  // buildDealsFeed cap-then-filter shape and the same DEALS_FETCH_CAP).
-  // handleHof uses a separate cap, BESTOF_FETCH_CAP (unchanged this
-  // increment — no live saturation observed on it, per SPEC.md's "don't
-  // touch on spec alone").
-  const dismissedAppIds = await getDismissedAppIds(env);
-  const undismissed = excludeDismissed(deals, dismissedAppIds);
-  const enriched = await enrichDeals(env, ctx, undismissed);
-
-  return new Response(JSON.stringify({ deals: enriched, minCut }), {
-    status: 200,
-    headers: {
-      "content-type": "application/json",
-      "cache-control": `public, max-age=${DEALS_CACHE_TTL_SECONDS}`,
-    },
-  });
-}
-
 // ---------------------------------------------------------------------------
-// /api/recs (Increment 3)
-// ---------------------------------------------------------------------------
-
-/** Load the trimmed library for /api/recs, reusing /api/library's cache key
- * and TTL. Throws (with `.status`) on upstream failure — recs must refuse to
- * run rather than risk recommending an owned game it couldn't exclude. */
-async function loadLibraryForRecs(env, ctx, refresh) {
-  const cache = caches.default;
-  const cacheKey = libraryCacheKey(env);
-
-  if (!refresh) {
-    const cached = await cache.match(cacheKey);
-    if (cached) {
-      const body = await cached.clone().json();
-      return body.games;
-    }
-  }
-
-  const trimmed = await fetchOwnedGames(env);
-  const response = new Response(JSON.stringify({ games: trimmed }), {
-    status: 200,
-    headers: {
-      "content-type": "application/json",
-      "cache-control": `public, max-age=${CACHE_TTL_SECONDS}`,
-    },
-  });
-  // Await (not waitUntil) so the library is in cache before loadDealsForRecs ->
-  // buildDealsFeed -> getOwnedAppIds reads the same key below; otherwise a
-  // cold-cold cache re-fetches the Steam library a second time for exclusion.
-  await cache.put(cacheKey, response.clone());
-  return trimmed;
-}
-
-/** Load the assembled deals feed for /api/recs, reusing /api/deals' own
- * cache key/TTL for the given minCut so the two routes share one fetch. */
-async function loadDealsForRecs(env, ctx, minCut, refresh) {
-  const cache = caches.default;
-  const cacheKey = dealsCacheKey(minCut);
-
-  if (!refresh) {
-    const cached = await cache.match(cacheKey);
-    if (cached) {
-      const body = await cached.clone().json();
-      return body.deals;
-    }
-  }
-
-  const deals = await buildDealsFeed(env, ctx, minCut, refresh);
-  const response = new Response(JSON.stringify({ deals, minCut }), {
-    status: 200,
-    headers: {
-      "content-type": "application/json",
-      "cache-control": `public, max-age=${DEALS_CACHE_TTL_SECONDS}`,
-    },
-  });
-  ctx.waitUntil(cache.put(cacheKey, response.clone()));
-  return deals;
-}
-
-/**
- * Build the shared candidate pool both /api/recs (scoreCandidates) and
- * /api/best-of (buildHallOfFame) rank over: the taste profile, its IDF map,
- * and every deal candidate with whatever SteamSpy tag/review/owners data is
- * currently cached attached (pending candidates held back, same as before
- * Increment 5's split into this helper). Extracted out of handleRecs
- * unchanged in behaviour — Increment 5 needs the SAME pool for two
- * different rankings (taste-similarity vs. taste-agnostic Hall of Fame)
- * rather than two independent, divergent tag-fetch passes.
- * @param {object} env
- * @param {object} ctx
- * @param {Array<object>} libraryGames
- * @param {Array<object>} deals
- * @param {number} windowMonths
- * @returns {Promise<{candidates: Array<object>, profile: object, contributions: Array<object>, idfMap: object, pendingCount: number, fetched: number, total: number, ready: boolean}>}
- */
-async function buildCandidatePool(env, ctx, libraryGames, deals, windowMonths) {
-  const now = Date.now();
-  const ownedAppids = selectTopOwnedGames(libraryGames, windowMonths, now, TOP_OWNED_GAMES).map(
-    (g) => g.appid,
-  );
-  const dealAppids = deals.filter((d) => d.appid != null).map((d) => d.appid);
-  const neededAppids = Array.from(new Set([...ownedAppids, ...dealAppids]));
-
-  const tagByAppid = new Map();
-  await Promise.all(
-    neededAppids.map(async (appid) => {
-      tagByAppid.set(appid, await getCachedSpy(env, appid));
-    }),
-  );
-
-  const missing = neededAppids.filter((appid) => !tagByAppid.get(appid).cached);
-  if (missing.length > 0) enqueueSpyFetch(env, ctx, missing);
-
-  const spyDataByAppid = new Map(
-    neededAppids.map((appid) => {
-      const entry = tagByAppid.get(appid);
-      return [appid, entry.cached ? entry.data : undefined];
-    }),
-  );
-
-  // IDF corpus (Increment 4): the raw SteamSpy tag sets of every appid in
-  // play (top-200 owned + deal candidates) that's actually been fetched and
-  // has usable tags — pending/tagless entries contribute nothing to
-  // document frequency. Recomputed fresh each request; cheap, it's just a
-  // count over already-cached data.
-  // ASSUMPTION (flagged for the gate): document frequency is counted over the
-  // RAW tag sets, not the post-stoplist/top-15 buildTagVector output. This is
-  // the more literal reading of "cached tag sets"; idf values are then only
-  // ever consulted for tags that survive into a vector, so the broader corpus
-  // scope is harmless. Revisit at the Phase-1 gate if generic tags don't
-  // collapse toward zero weight as expected.
-  const corpusTagSets = neededAppids.map((appid) => spyDataByAppid.get(appid)?.tags).filter(Boolean);
-  const idfMap = computeIdf(corpusTagSets);
-
-  const { profile, contributions } = buildProfile(libraryGames, spyDataByAppid, windowMonths, now, idfMap);
-
-  // Split "not yet fetched" (pendingCount) from "fetched but permanently
-  // tagless / null-appid" (excludedCount, computed inside scoreCandidates —
-  // it only sees cache state, not fetch status). Pending deals are held
-  // back from scoring entirely so they don't inflate excludedCount.
-  let pendingCount = 0;
-  const candidates = [];
-  for (const deal of deals) {
-    if (deal.appid != null && !tagByAppid.get(deal.appid).cached) {
-      pendingCount++;
-      continue;
-    }
-    const spy = deal.appid != null ? spyDataByAppid.get(deal.appid) : undefined;
-    candidates.push({
-      ...deal,
-      tags: spy?.tags || {},
-      reviews: spy?.reviews || {},
-      owners: spy?.owners ?? 0,
-    });
-  }
-
-  const fetched = neededAppids.length - missing.length;
-
-  return {
-    candidates,
-    profile,
-    contributions,
-    idfMap,
-    pendingCount,
-    fetched,
-    total: neededAppids.length,
-    ready: fetched >= neededAppids.length,
-  };
-}
-
-async function handleRecs(request, env, ctx) {
-  if (!env.STEAM_API_KEY || !env.STEAM_ID) {
-    return jsonError(
-      "Recommendations need your Steam library to exclude owned games — missing STEAM_API_KEY or STEAM_ID (see .dev.vars locally). Refusing to run rather than risk recommending something you already own.",
-      500,
-    );
-  }
-  if (!env.ITAD_API_KEY) {
-    return jsonError(
-      "Missing ITAD_API_KEY — recs are computed over the deals feed, which needs it (see .dev.vars locally).",
-      500,
-    );
-  }
-
-  const url = new URL(request.url);
-  const refresh = url.searchParams.get("refresh") === "1";
-  const minCut = clampMinCut(url.searchParams.get("minCut"));
-  const windowMonthsParam = Number(url.searchParams.get("windowMonths"));
-  const windowMonths = windowMonthsParam > 0 ? windowMonthsParam : 12;
-
-  let libraryGames;
-  try {
-    libraryGames = await loadLibraryForRecs(env, ctx, refresh);
-  } catch (err) {
-    return jsonError(
-      `Recommendations need your Steam library to exclude owned games, but the Steam fetch failed (${err.message}). Refusing to run rather than risk recommending something you already own.`,
-      err.status || 502,
-    );
-  }
-
-  let deals;
-  try {
-    deals = await loadDealsForRecs(env, ctx, minCut, refresh);
-  } catch (err) {
-    return upstreamErrorResponse(err);
-  }
-
-  // Increment 8: dismissed appids are excluded before the candidate pool is
-  // even built — same request-time-join reasoning as handleDeals above, and
-  // it means a dismissed game's tag data is never even fetched, not just
-  // hidden from the final list. There's no count-cap anywhere downstream of
-  // this point (scoreCandidates has no top-N slice), so a dismissal here
-  // always promotes the next-best-ranked candidate into recs[0] if the
-  // dismissed one would have outranked it — see handleDeals' AWARENESS NOTE
-  // above for the one upstream cap (DEALS_FETCH_CAP, inside
-  // loadDealsForRecs) this join runs after, same as Deals.
-  const dismissedAppIds = await getDismissedAppIds(env);
-  deals = excludeDismissed(deals, dismissedAppIds);
-
-  const pool = await buildCandidatePool(env, ctx, libraryGames, deals, windowMonths);
-
-  const {
-    recs: scoredRecs,
-    excludedCount,
-    qualityExcludedCount,
-  } = scoreCandidates(pool.profile, pool.candidates, pool.idfMap);
-
-  // Deck compat (Increment 5): only for the appids that actually made it
-  // into recs, not the whole candidate pool — cheaper, and matches spec §2
-  // ("batch-fetch for candidates only").
-  const recAppids = scoredRecs.filter((rec) => rec.appid != null).map((rec) => rec.appid);
-  const deckByAppid = await resolveDeckCompat(env, recAppids);
-
-  const recs = scoredRecs.map((rec) => {
-    const why = buildWhy(pool.profile, rec.tagVector, pool.contributions);
-    const { tags, tagVector, reviews, owners, ...rest } = rec;
-    const totalReviews = (reviews?.positive || 0) + (reviews?.negative || 0);
-    const reviewPercent = totalReviews > 0 ? Math.round((reviews.positive / totalReviews) * 100) : null;
-    return {
-      ...rest,
-      why,
-      reviewPercent,
-      reviewCount: totalReviews,
-      owners,
-      tagNames: Object.keys(tags || {}),
-      batteryFriendly: batteryFriendly(tags),
-      deck: rec.appid != null ? deckByAppid.get(rec.appid) || DEFAULT_DECK_COMPAT : DEFAULT_DECK_COMPAT,
-    };
-  });
-
-  return new Response(
-    JSON.stringify({
-      ready: pool.ready,
-      fetched: pool.fetched,
-      total: pool.total,
-      pendingCount: pool.pendingCount,
-      excludedCount,
-      qualityExcludedCount,
-      recs,
-    }),
-    { status: 200, headers: { "content-type": "application/json" } },
-  );
-}
-
-// ---------------------------------------------------------------------------
-// /api/best-of (Increment 5) — "Best of Steam": taste-agnostic, unanimously
+// /api/best-of (Increment 5) - the ROUTE, its pool loaders and src/hallOfFame.js
+// were all deleted at increment 14. Only fetchBestOfPages below survives, because
+// buildFpmPool calls it for the sync lane's price/cut lookups. The history is
+// kept because it is why that one function sources on a rank-sorted axis.
+//
+// "Best of Steam": taste-agnostic, unanimously
 // excellent games at deep discount. Shares buildCandidatePool with /api/recs
 // (same library/deals loading, same lazily-fetched SteamSpy trio) but ranks
 // with src/hallOfFame.js instead of src/score.js — qualification is on
@@ -1067,17 +580,6 @@ async function handleRecs(request, env, ctx) {
 // Deals path above (fetchDealsPages/buildDealsFeed/loadDealsForRecs) is
 // untouched and still backs /api/deals and /api/recs exactly as before.
 // ---------------------------------------------------------------------------
-
-/** Cache key for the Best-of candidate pool — its own dedicated key, entirely
- * separate from dealsCacheKey() above, so building/refreshing this pool never
- * reads or writes the Deals pool. SPEC.md's prose says "KV cache"; this
- * mirrors loadDealsForRecs's Cache-API pattern instead (own key, same 6h TTL)
- * for consistency with the rest of this file and lower risk — a distinct key
- * still keeps the two pools fully independent, which is the actual
- * requirement. Flagging the deviation here per the build note. */
-function bestOfPoolCacheKey() {
-  return new Request("https://steam-sale-scout.cache/api/best-of/pool");
-}
 
 /**
  * Page through ITAD /deals/v2 (Steam shop, AUD) sorted by BESTOF_SORT
@@ -1113,143 +615,6 @@ async function fetchBestOfPages(env) {
   }
 
   return pages;
-}
-
-/** Assemble the Best-of candidate pool: fetch (rank-sorted) -> merge/cap ->
- * floor at BESTOF_MIN_CUT -> enrich (appid, historical low) -> exclude owned.
- * Same deals-shaped output buildDealsFeed produces, so buildCandidatePool and
- * everything downstream (scoring, response shape) needs no changes. */
-async function buildBestOfPool(env, ctx, refresh) {
-  const pages = await fetchBestOfPages(env);
-  const merged = mergeDealPages(pages, BESTOF_FETCH_CAP);
-  const filtered = filterByMinCut(merged, BESTOF_MIN_CUT);
-
-  const itadIds = filtered.map((item) => item.id);
-  const appIdMap = await resolveAppIds(env, ctx, itadIds, refresh);
-  const lowMap = await resolveHistoricalLows(env, ctx, itadIds, refresh);
-
-  const deals = filtered.map((item) => {
-    const deal = normalizeDeal(item, appIdMap.get(item.id) ?? null);
-    const low = lowMap.get(item.id);
-    return applyHistoricalLow(deal, low ? { price: low } : null);
-  });
-
-  const ownedAppIds = await getOwnedAppIds(env, ctx);
-  return excludeOwned(deals, ownedAppIds);
-}
-
-/** Load the Best-of candidate pool, cached under its own key (6h TTL, same
- * cadence as the Deals pool). ?refresh=1 bypasses and repopulates. */
-async function loadBestOfPool(env, ctx, refresh) {
-  const cache = caches.default;
-  const cacheKey = bestOfPoolCacheKey();
-
-  if (!refresh) {
-    const cached = await cache.match(cacheKey);
-    if (cached) {
-      const body = await cached.clone().json();
-      return body.deals;
-    }
-  }
-
-  const deals = await buildBestOfPool(env, ctx, refresh);
-  const response = new Response(JSON.stringify({ deals }), {
-    status: 200,
-    headers: {
-      "content-type": "application/json",
-      "cache-control": `public, max-age=${DEALS_CACHE_TTL_SECONDS}`,
-    },
-  });
-  ctx.waitUntil(cache.put(cacheKey, response.clone()));
-  return deals;
-}
-
-async function handleHof(request, env, ctx) {
-  if (!env.STEAM_API_KEY || !env.STEAM_ID) {
-    return jsonError(
-      "Best of Steam needs your Steam library to exclude owned games — missing STEAM_API_KEY or STEAM_ID (see .dev.vars locally). Refusing to run rather than risk recommending something you already own.",
-      500,
-    );
-  }
-  if (!env.ITAD_API_KEY) {
-    return jsonError(
-      "Missing ITAD_API_KEY — Best of Steam is computed over the deals feed, which needs it (see .dev.vars locally).",
-      500,
-    );
-  }
-
-  const url = new URL(request.url);
-  const refresh = url.searchParams.get("refresh") === "1";
-  const windowMonthsParam = Number(url.searchParams.get("windowMonths"));
-  const windowMonths = windowMonthsParam > 0 ? windowMonthsParam : 12;
-
-  let libraryGames;
-  try {
-    libraryGames = await loadLibraryForRecs(env, ctx, refresh);
-  } catch (err) {
-    return jsonError(
-      `Best of Steam needs your Steam library to exclude owned games, but the Steam fetch failed (${err.message}). Refusing to run rather than risk recommending something you already own.`,
-      err.status || 502,
-    );
-  }
-
-  // Increment 5.5: Best-of no longer shares the Deals feed (loadDealsForRecs)
-  // — it sources its own pool (see loadBestOfPool above). No minCut param:
-  // the pool's floor is the BESTOF_MIN_CUT config, not a query param.
-  let deals;
-  try {
-    deals = await loadBestOfPool(env, ctx, refresh);
-  } catch (err) {
-    return upstreamErrorResponse(err);
-  }
-
-  // Increment 8: same dismissal join as handleDeals/handleRecs — excluded
-  // before the candidate pool is built, not just filtered out of the final
-  // list. buildHallOfFame has no count-cap either (a qualification filter,
-  // not a top-N slice), so a dismissal here always promotes the next
-  // qualifying candidate into hof[0] if the dismissed one outranked it —
-  // same upstream-cap caveat (BESTOF_FETCH_CAP, inside loadBestOfPool) as
-  // handleDeals' AWARENESS NOTE above.
-  const dismissedAppIds = await getDismissedAppIds(env);
-  deals = excludeDismissed(deals, dismissedAppIds);
-
-  const pool = await buildCandidatePool(env, ctx, libraryGames, deals, windowMonths);
-  const hofCandidates = buildHallOfFame(pool.candidates);
-
-  const hofAppids = hofCandidates.filter((c) => c.appid != null).map((c) => c.appid);
-  const deckByAppid = await resolveDeckCompat(env, hofAppids);
-
-  const hof = hofCandidates.map((candidate) => {
-    const rawTagVector = buildTagVector(candidate.tags);
-    const tagVector = pool.idfMap ? applyIdf(rawTagVector, pool.idfMap) : rawTagVector;
-    const similarity = cosineSimilarity(pool.profile, tagVector);
-
-    const { tags, reviews, owners, ...rest } = candidate;
-    const totalReviews = (reviews?.positive || 0) + (reviews?.negative || 0);
-    const reviewPercent = totalReviews > 0 ? Math.round((reviews.positive / totalReviews) * 100) : null;
-
-    return {
-      ...rest,
-      similarity,
-      reviewPercent,
-      reviewCount: totalReviews,
-      owners,
-      tagNames: Object.keys(tags || {}),
-      batteryFriendly: batteryFriendly(tags),
-      deck: candidate.appid != null ? deckByAppid.get(candidate.appid) || DEFAULT_DECK_COMPAT : DEFAULT_DECK_COMPAT,
-    };
-  });
-
-  return new Response(
-    JSON.stringify({
-      ready: pool.ready,
-      fetched: pool.fetched,
-      total: pool.total,
-      pendingCount: pool.pendingCount,
-      hof,
-    }),
-    { status: 200, headers: { "content-type": "application/json" } },
-  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1686,6 +1051,12 @@ async function handleWishlist(request, env, ctx) {
 // ONE request's own toResolve queue; now the catalog's HLTB fill happens
 // only during an explicit sync, and this route is a fast, static read).
 //
+// INCREMENT 14 DELETED GET /api/fpm AND handleFpm. Everything below about the
+// GET path - scoring overrides, the enrichment cap, app-type gating, ?owned= -
+// is history, not live behaviour. What survives in this section is the pool
+// (fpmPoolCacheKey/buildFpmPool/loadFpmPool), which /api/rank and the sync lane
+// both call, and the /api/fpm/sync trio in the next section.
+//
 // handleFpm below no longer sources or enqueues anything — it reads already-
 // matched, floor-passing rows straight from D1 (selectMatchedCatalogRows)
 // and scores them with the EXACT SAME formula machinery as before
@@ -1814,261 +1185,6 @@ async function loadFpmPool(env, ctx, refresh) {
  * "all" — bad values never 500, mirroring parseFpmFormula/parseFpmScoreParam. */
 function parseOwnedMode(raw) {
   return raw === "hide" || raw === "only" ? raw : "all";
-}
-
-function fpmUnavailableResponse() {
-  return new Response(
-    JSON.stringify({ available: false, notice: "Fun-per-minute unavailable" }),
-    { status: 200, headers: { "content-type": "application/json" } },
-  );
-}
-
-const FPM_VALID_FORMULAS = new Set(["linear", "sqrt", "log"]);
-// Sane bounds for the ?qexp=/?breadth= overrides — generous enough for James
-// to A/B freely, tight enough to keep Math.pow from producing something
-// silly (Infinity/NaN-adjacent) off a garbage query value. Not asserted by
-// SPEC.md as "the" right numbers, just a guardrail; flagged to the PO.
-const FPM_QEXP_MIN = 0;
-const FPM_QEXP_MAX = 10;
-const FPM_BREADTH_MIN = 0;
-const FPM_BREADTH_MAX = 5;
-
-/** `?formula=` override: falls back to FPM_FORMULA on anything not exactly
- * 'linear'/'sqrt'/'log' (missing, typo'd, or otherwise malformed). */
-function parseFpmFormula(raw) {
-  return FPM_VALID_FORMULAS.has(raw) ? raw : FPM_FORMULA;
-}
-
-/** `?qexp=`/`?breadth=` override: falls back to `fallback` on missing,
- * non-numeric, or out-of-[min,max]-range input. Never throws. */
-function parseFpmScoreParam(raw, fallback, min, max) {
-  if (raw == null || raw === "") return fallback;
-  const n = Number(raw);
-  if (!Number.isFinite(n) || n < min || n > max) return fallback;
-  return n;
-}
-
-/** Bound how many catalog rows trigger NEW SteamSpy-queue/GetItems fetches
- * per /api/fpm request — see the section comment's "ENRICHMENT CAP" note. */
-const FPM_ENRICH_CAP = 500;
-
-/** Read-only cache peek for one appid's Deck compat, using the exact same
- * `deck:<appid>` KV key src/deckCompat.js's resolveDeckCompat owns — used
- * (only) for catalog rows beyond FPM_ENRICH_CAP, where we want "already
- * cached data shows up" without triggering a new GetItems fetch. A small,
- * deliberate duplication of that key format rather than adding a new
- * read-only export to deckCompat.js (Coder's call, flagged for the gate). */
-async function peekCachedDeckCompat(env, appid) {
-  const raw = await env.TAG_CACHE.get(`deck:${appid}`);
-  return raw == null ? null : JSON.parse(raw);
-}
-
-/**
- * Attach tagNames/batteryFriendly/deck to already-scored+sorted FPM rows.
- * Tags are a free read (getCachedSpy never fetches) for every row; only the
- * top FPM_ENRICH_CAP rows trigger a NEW SteamSpy-queue enqueue or GetItems
- * batch fetch for a cold appid — see the section comment above.
- */
-async function enrichFpmRows(env, ctx, rows) {
-  const appids = rows.map((r) => r.appid);
-  const enrichTargets = appids.slice(0, FPM_ENRICH_CAP);
-
-  const spyByAppid = new Map();
-  await Promise.all(
-    appids.map(async (appid) => {
-      spyByAppid.set(appid, await getCachedSpy(env, appid));
-    }),
-  );
-  const missingSpy = enrichTargets.filter((appid) => !spyByAppid.get(appid).cached);
-  if (missingSpy.length > 0) enqueueSpyFetch(env, ctx, missingSpy);
-
-  const deckByAppid = await resolveDeckCompat(env, enrichTargets);
-  const restAppids = appids.slice(FPM_ENRICH_CAP);
-  await Promise.all(
-    restAppids.map(async (appid) => {
-      const cached = await peekCachedDeckCompat(env, appid);
-      if (cached) deckByAppid.set(appid, cached);
-    }),
-  );
-
-  return rows.map((row) => {
-    const spyEntry = spyByAppid.get(row.appid);
-    const tags = spyEntry?.cached ? spyEntry.data?.tags || {} : {};
-    return {
-      ...row,
-      tagNames: Object.keys(tags),
-      batteryFriendly: batteryFriendly(tags),
-      deck: deckByAppid.get(row.appid) || DEFAULT_DECK_COMPAT,
-    };
-  });
-}
-
-async function handleFpm(request, env, ctx) {
-  if (!env.STEAM_API_KEY || !env.STEAM_ID || !env.ITAD_API_KEY || !env.FPM_DB) {
-    return fpmUnavailableResponse();
-  }
-
-  const url = new URL(request.url);
-  const refresh = url.searchParams.get("refresh") === "1";
-  const ownedMode = parseOwnedMode(url.searchParams.get("owned"));
-
-  // Scoring overrides (Increment 7.5, unchanged) — parsed up front, only
-  // read at the final per-row score/why-line step below. There is no HLTB
-  // traffic anywhere in this GET path anymore (see the section comment) —
-  // these can never trigger new network activity, only re-rank already-
-  // matched D1 rows.
-  const formula = parseFpmFormula(url.searchParams.get("formula"));
-  const qualityExp = parseFpmScoreParam(url.searchParams.get("qexp"), FPM_QUALITY_EXP, FPM_QEXP_MIN, FPM_QEXP_MAX);
-  const breadthWeight = parseFpmScoreParam(url.searchParams.get("breadth"), FPM_BREADTH_WEIGHT, FPM_BREADTH_MIN, FPM_BREADTH_MAX);
-
-  let catalogRows;
-  let stats;
-  try {
-    await ensureCatalogSchema(env);
-    stats = await getCatalogStats(env);
-    catalogRows = await selectMatchedCatalogRows(env);
-  } catch {
-    return fpmUnavailableResponse();
-  }
-
-  // unmatchedCount mirrors pre-7.7 semantics exactly: checked-but-negative
-  // rows only (match_method='none'), never "not yet checked at all".
-  const rows = [];
-  for (const row of catalogRows) {
-    const mainHours = row.main_hours;
-    // A resolved match below FPM_MIN_LENGTH_HOURS is excluded silently here
-    // (same as before) — it's still "matched" in D1 (see src/catalog.js),
-    // just not shown in this lane.
-    if (!qualifiesForFpm({ compMain: mainHours * 3600, mainHours })) continue;
-
-    const wilsonQuality = row.wilson;
-    const funPerHour = funPerHourDisplay(wilsonQuality, mainHours);
-    const qualityPercent = Math.round(wilsonQuality * 100);
-    const reviewCount = (row.positive || 0) + (row.negative || 0);
-    const reviewPercent = reviewCount > 0 ? Math.round((row.positive / reviewCount) * 100) : null;
-
-    rows.push({
-      appid: row.appid,
-      title: row.name,
-      owners: row.owners,
-      reviewCount,
-      reviewPercent,
-      quality: wilsonQuality,
-      mainHours,
-      matchMethod: row.match_method,
-      fpm: fpmScore(wilsonQuality, mainHours, { reviewCount, formula, qualityExp, breadthWeight }),
-      funPerHour,
-      why: fpmWhyLine(qualityPercent, mainHours, funPerHour, formula),
-      // Increment 8.5: price/discount straight off the D1 catalog row's own
-      // price-backfill columns (src/catalog.js's selectPriceBatch/
-      // resolvePriceBatch) — covers EVERY floor-passing unowned row, not
-      // just whichever appids happened to be in the old BESTOF_FETCH_CAP-
-      // limited loadFpmPool join below. priceCheckedAt distinguishes
-      // "never checked" (null) from "checked, ITAD has no live deal"
-      // (set, price null) — see the priceBlindCount/noPriceCount summary
-      // built below, the fail-soft "no price" state SPEC.md requires.
-      price: row.price ?? null,
-      priceCents: row.price_cents ?? null,
-      regular: row.regular ?? null,
-      cut: row.cut ?? null,
-      priceCheckedAt: row.price_checked_at ?? null,
-    });
-  }
-
-  // Increment 8: dismissal exclusion, applied before annotation/sort/the
-  // FPM_ENRICH_CAP enrichment-fetch cap below (enrichFpmRows) — this is the
-  // one lane where "frees a slot" is server-side-verifiable: a dismissed row
-  // that would have ranked inside the top FPM_ENRICH_CAP now lets the
-  // next-best row take its place, triggering a fresh SteamSpy/GetItems fetch
-  // for it that it wouldn't otherwise have gotten this request. (There's no
-  // FPM_DISPLAY_CAP here — that's a client-side-only lazy-render constant in
-  // public/index.html; this route returns every matched, qualifying row.)
-  const dismissedAppIds = await getDismissedAppIds(env);
-  const undismissedRows = excludeDismissed(rows, dismissedAppIds);
-
-  // Annotation joins at request time (Increment 7.7) — owned status is never
-  // a sourcing decision here, just a live join against the exact same
-  // helper every other lane already uses (getOwnedAppIds, best-effort,
-  // never throws — empty Set on any failure). `refresh` is threaded through
-  // (bug fix, flagged by review): the "Refresh prices/owned" button's label
-  // promises fresh owned status too, not just fresh deal prices — without
-  // this, ?refresh=1 silently left owned status up to 24h stale despite the
-  // button claiming otherwise.
-  //
-  // Increment 8.5: price/discount now come straight off each row's own D1
-  // columns (set above, from the price-backfill catalog job) — this is the
-  // fix for the coverage gap, so loadFpmPool is no longer consulted for
-  // price at all. It's STILL consulted for historicalLow/atHistoricalLow
-  // (out of scope for this increment — SPEC.md's item A is price/discount
-  // only), so its old BESTOF_FETCH_CAP-limited coverage for THAT one field
-  // is unchanged/accepted.
-  const ownedAppIds = await getOwnedAppIds(env, ctx, refresh);
-  let dealPool;
-  try {
-    dealPool = await loadFpmPool(env, ctx, refresh);
-  } catch {
-    dealPool = [];
-  }
-  const dealByAppid = new Map(dealPool.filter((d) => d.appid != null).map((d) => [d.appid, d]));
-
-  let annotated = undismissedRows.map((row) => {
-    const owned = ownedAppIds.has(row.appid);
-    // Badge precedence: Owned wins over discount — an owned game's sale
-    // price is irrelevant, so we don't even look it up in that case.
-    const dealEntry = owned ? undefined : dealByAppid.get(row.appid);
-    return {
-      ...row,
-      owned,
-      price: owned ? null : row.price,
-      priceCents: owned ? null : row.priceCents,
-      regular: owned ? null : row.regular,
-      cut: owned ? null : row.cut,
-      atHistoricalLow: dealEntry?.atHistoricalLow ?? false,
-      historicalLow: dealEntry?.historicalLow ?? null,
-    };
-  });
-
-  // Increment 8.5 (SPEC.md gate a/f — "a visible count in the API
-  // response", never a silent blank): computed over the FULL undismissed
-  // set, BEFORE the ownedMode filter below reassigns/narrows `annotated` —
-  // review fix (round 1): this used to run AFTER the ownedMode filter, so
-  // under `?owned=only` `annotated` had already been narrowed to JUST the
-  // owned rows, `unownedRows` came out empty, and both counts silently read
-  // 0 instead of the real catalog-wide number — exactly the "silent blank"
-  // gate (a) forbids, just wearing a 0 instead of a null. Computing it here,
-  // off the full set, means the counts reflect real catalog coverage
-  // regardless of which `?owned=` view the client requests. Only UNOWNED
-  // rows count, since owned rows are never price-checked at all (see
-  // selectPriceBatch's source_owned gate in src/catalog.js) — counting them
-  // would misrepresent price-backfill coverage as worse than it is.
-  // priceBlindCount (never checked yet) is the metric this increment's fix
-  // drives toward 0; noPriceCount (checked, ITAD genuinely has no live
-  // deal) is an honest, expected residual, not a bug.
-  const unownedRows = annotated.filter((r) => !r.owned);
-  const priceBlindCount = unownedRows.filter((r) => r.price == null && r.priceCheckedAt == null).length;
-  const noPriceCount = unownedRows.filter((r) => r.price == null && r.priceCheckedAt != null).length;
-
-  if (ownedMode === "hide") annotated = annotated.filter((r) => !r.owned);
-  else if (ownedMode === "only") annotated = annotated.filter((r) => r.owned);
-
-  const sorted = sortFpmLane(annotated);
-  const fpm = await enrichFpmRows(env, ctx, sorted);
-
-  return new Response(
-    JSON.stringify({
-      available: true,
-      ready: stats.pending === 0,
-      total: stats.total,
-      matched: stats.matched,
-      pending: stats.pending,
-      unmatchedCount: stats.unmatched,
-      priceBlindCount,
-      noPriceCount,
-      count: fpm.length,
-      fpm,
-    }),
-    { status: 200, headers: { "content-type": "application/json" } },
-  );
 }
 
 // ---------------------------------------------------------------------------
@@ -3152,23 +2268,8 @@ async function handleDeleteMark(request, env, ctx, appid) {
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    if (url.pathname === "/api/library") {
-      return handleLibrary(request, env, ctx);
-    }
-    if (url.pathname === "/api/deals") {
-      return handleDeals(request, env, ctx);
-    }
-    if (url.pathname === "/api/recs") {
-      return handleRecs(request, env, ctx);
-    }
-    if (url.pathname === "/api/best-of") {
-      return handleHof(request, env, ctx);
-    }
     if (url.pathname === "/api/wishlist") {
       return handleWishlist(request, env, ctx);
-    }
-    if (url.pathname === "/api/fpm") {
-      return handleFpm(request, env, ctx);
     }
     if (url.pathname === "/api/rank") {
       return handleRank(request, env, ctx);
