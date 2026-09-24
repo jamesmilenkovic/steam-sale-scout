@@ -16,7 +16,24 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import worker from "../src/worker.js";
+import realWorker from "../src/worker.js";
+import { signedWorker, TEST_STEAM_ID } from "./helpers/session.mjs";
+
+// EVERY CALL IN THIS FILE GOES THROUGH THE DEFAULT-DENY GATE (SPEC.md §7), with
+// a GENUINELY SIGNED session cookie and the matching secret on the env. Nothing
+// is stubbed and the verifier is not bypassed: without this line every
+// `worker.fetch` below would answer 401. See test/helpers/session.mjs.
+const worker = signedWorker(realWorker);
+
+// Increment 15, SPEC.md §11.1/§11.2. THE WISHLIST IS NOW FETCHED AND CACHED FOR
+// WHOEVER IS SIGNED IN, not for `env.STEAM_ID`. So the two per-user cache keys
+// below are built from the SESSION'S id, and the `&v=1` is spelled out as a
+// literal on purpose: a silent version bump must break these tests loudly
+// rather than just miss the cache. Setup only - no assertion changed except the
+// one test listed by name in the handoff.
+const SESSION_STEAM_ID = TEST_STEAM_ID;
+const WISHLIST_RAW_CACHE_KEY = `https://steam-sale-scout.cache/api/wishlist/raw?steamid=${SESSION_STEAM_ID}&v=1`;
+const WISHLIST_PRICES_CACHE_KEY = `https://steam-sale-scout.cache/api/wishlist/resolved?steamid=${SESSION_STEAM_ID}&v=1`;
 import { __setSpyMinIntervalMsForTests, __resetSpyQueueForTests } from "../src/spyQueue.js";
 import { assertNoExperienceLeak } from "./helpers/laneShape.mjs";
 
@@ -82,7 +99,7 @@ function makeMockKv() {
 
 function makeEnv(overrides = {}) {
   return {
-    STEAM_ID: "76561198000000000",
+    OWNER_STEAM_ID: "76561198000000000",
     ITAD_API_KEY: "test-itad-key",
     TAG_CACHE: makeMockKv(),
     ASSETS: { fetch: async () => new Response("not found", { status: 404 }) },
@@ -202,22 +219,51 @@ function makeWishlistFetch({
 // Fail-soft: missing secrets.
 // ---------------------------------------------------------------------------
 
-test("missing STEAM_ID returns 200 {available:false} without calling fetch", async () => {
-  let fetchCalls = 0;
-  globalThis.fetch = async () => {
-    fetchCalls++;
-    throw new Error("fetch should not be called");
-  };
+/**
+ * THIS TEST'S SUBJECT WAS DELETED BY THE SPEC, SO THE TEST WAS RE-POINTED AT
+ * WHAT REPLACED IT RATHER THAN DELETED (SPEC.md §11.3, §13.2).
+ *
+ * It used to be "missing STEAM_ID returns 200 {available:false} without calling
+ * fetch", and it passed because handleWishlist tested `!env.STEAM_ID`. SPEC.md
+ * §11.3 removed that test from the guard on the grounds that it asked the wrong
+ * question: below the default-deny gate a session id ALWAYS exists, so the only
+ * thing the lane can still be missing is its ITAD key (covered by the very next
+ * test, unchanged).
+ *
+ * So the input is kept and the expectation is inverted, which is the strictly
+ * stronger claim: with NO owner id configured at all the lane still works,
+ * because the id it needs now comes off the session. The old assertion could
+ * not tell "re-pointed at the session" from "still reading env and happening to
+ * find nothing"; this one can.
+ */
+test("no OWNER_STEAM_ID no longer stops /api/wishlist - it fetches the SESSION's wishlist", async () => {
   globalThis.caches = { default: makeMockCache() };
 
-  const env = makeEnv({ STEAM_ID: undefined });
+  let wishlistSteamId = null;
+  globalThis.fetch = makeWishlistFetch({
+    wishlistResponse: { response: { items: [{ appid: 400, priority: 1, date_added: 1700000000 }] } },
+    itadIdByAppid: { 400: "itad-400" },
+    pricesByItadId: { "itad-400": { price: 4.99, priceCents: 499, regular: 9.99, cut: 50, expiry: null } },
+    titlesByAppid: { 400: "Portal" },
+    onCall: (u) => {
+      if (u.pathname === "/IWishlistService/GetWishlist/v1/") {
+        wishlistSteamId = u.searchParams.get("steamid");
+      }
+    },
+  });
+
+  const env = makeEnv({ OWNER_STEAM_ID: undefined });
+  env.TAG_CACHE.store.set(deckKey(400), JSON.stringify({ deck: 0, os: 0, frame: 0 }));
+  env.TAG_CACHE.store.set(v2Key(400), JSON.stringify(goodSpyEntry()));
   const ctx = makeCtx();
   const res = await worker.fetch(new Request("https://x/api/wishlist"), env, ctx);
 
   assert.equal(res.status, 200);
   const body = await res.json();
-  assert.equal(body.available, false);
-  assert.equal(fetchCalls, 0);
+  assert.equal(body.available, true, "no owner id must no longer make the lane unavailable");
+  // THE POINT OF THE TEST: the id on the wire is the session's, as a STRING,
+  // byte-identical - and it is one that would lose its last digit as a number.
+  assert.equal(wishlistSteamId, SESSION_STEAM_ID);
 });
 
 test("missing ITAD_API_KEY returns 200 {available:false} without calling fetch", async () => {
@@ -395,11 +441,11 @@ test("happy path: a shallow cut still qualifies when atHistoricalLow is true", a
 // ---------------------------------------------------------------------------
 
 test("raw wishlist cache hit (24h TTL) avoids re-fetching GetWishlist", async () => {
-  const env = makeEnv({ STEAM_ID: "76561198000000002" });
+  const env = makeEnv();
   const cache = makeMockCache();
   globalThis.caches = { default: cache };
 
-  const rawCacheKey = `https://steam-sale-scout.cache/api/wishlist/raw?steamid=${env.STEAM_ID}`;
+  const rawCacheKey = WISHLIST_RAW_CACHE_KEY;
   cache.store.set(rawCacheKey, jsonResponse({ items: [{ appid: 400, priority: 0, dateAdded: 1700000000 }] }));
 
   env.TAG_CACHE.store.set(deckKey(400), JSON.stringify({ deck: 0, os: 0, frame: 0 }));
@@ -426,11 +472,11 @@ test("raw wishlist cache hit (24h TTL) avoids re-fetching GetWishlist", async ()
 });
 
 test("?refresh=1 bypasses the raw wishlist cache, re-hits GetWishlist, and repopulates the cache", async () => {
-  const env = makeEnv({ STEAM_ID: "76561198000000003" });
+  const env = makeEnv();
   const cache = makeMockCache();
   globalThis.caches = { default: cache };
 
-  const rawCacheKey = `https://steam-sale-scout.cache/api/wishlist/raw?steamid=${env.STEAM_ID}`;
+  const rawCacheKey = WISHLIST_RAW_CACHE_KEY;
   cache.store.set(rawCacheKey, jsonResponse({ items: [{ appid: 999, priority: 0, dateAdded: 1600000000 }] }));
 
   env.TAG_CACHE.store.set(deckKey(500), JSON.stringify({ deck: 0, os: 0, frame: 0 }));
@@ -462,7 +508,7 @@ test("?refresh=1 bypasses the raw wishlist cache, re-hits GetWishlist, and repop
 });
 
 test("resolved-price cache hit (6h TTL) returns cached candidates without re-fetching GetWishlist/lookup/prices/historylow", async () => {
-  const env = makeEnv({ STEAM_ID: "76561198000000004" });
+  const env = makeEnv();
   const cache = makeMockCache();
   globalThis.caches = { default: cache };
 
@@ -483,7 +529,7 @@ test("resolved-price cache hit (6h TTL) returns cached candidates without re-fet
       why: "On your wishlist since 14 Nov 2023",
     },
   ];
-  const pricesCacheKey = `https://steam-sale-scout.cache/api/wishlist/resolved?steamid=${env.STEAM_ID}`;
+  const pricesCacheKey = WISHLIST_PRICES_CACHE_KEY;
   cache.store.set(pricesCacheKey, jsonResponse({ candidates: cachedCandidates }));
 
   env.TAG_CACHE.store.set(deckKey(321), JSON.stringify({ deck: 0, os: 0, frame: 0 }));
@@ -562,7 +608,7 @@ test("enrichWishlist genuinely throws (TAG_CACHE.get rejects) after a successful
 // ---------------------------------------------------------------------------
 
 test("second /api/wishlist call reuses the per-appid itad-id cache once the 6h resolved-candidates blob is evicted (itad-id's own TTL is 7d, longer-lived)", async () => {
-  const env = makeEnv({ STEAM_ID: "76561198000000010" });
+  const env = makeEnv();
   const cache = makeMockCache();
   globalThis.caches = { default: cache };
 
@@ -592,7 +638,7 @@ test("second /api/wishlist call reuses the per-appid itad-id cache once the 6h r
   // (7d) per-appid itad-id cache entry survives — a realistic scenario, not
   // a contrived one, since WISHLIST_PRICES_CACHE_TTL_SECONDS (6h) is shorter
   // than APPID_CACHE_TTL_SECONDS (7d).
-  const pricesCacheKey = `https://steam-sale-scout.cache/api/wishlist/resolved?steamid=${env.STEAM_ID}`;
+  const pricesCacheKey = WISHLIST_PRICES_CACHE_KEY;
   cache.store.delete(pricesCacheKey);
 
   const res2 = await worker.fetch(new Request("https://x/api/wishlist"), env, ctx);
@@ -605,7 +651,7 @@ test("second /api/wishlist call reuses the per-appid itad-id cache once the 6h r
 });
 
 test("?refresh=1 bypasses the per-appid itad-id cache too (re-hits lookup/id/shop/61/v1 on every call)", async () => {
-  const env = makeEnv({ STEAM_ID: "76561198000000011" });
+  const env = makeEnv();
   globalThis.caches = { default: makeMockCache() };
 
   env.TAG_CACHE.store.set(deckKey(701), JSON.stringify({ deck: 0, os: 0, frame: 0 }));
@@ -633,7 +679,7 @@ test("?refresh=1 bypasses the per-appid itad-id cache too (re-hits lookup/id/sho
 });
 
 test("second /api/wishlist call reuses the per-appid title cache (GetItems not re-hit, even though enrichWishlist re-runs every call)", async () => {
-  const env = makeEnv({ STEAM_ID: "76561198000000012" });
+  const env = makeEnv();
   globalThis.caches = { default: makeMockCache() };
 
   env.TAG_CACHE.store.set(deckKey(702), JSON.stringify({ deck: 0, os: 0, frame: 0 }));
@@ -669,7 +715,7 @@ test("second /api/wishlist call reuses the per-appid title cache (GetItems not r
 });
 
 test("?refresh=1 bypasses the per-appid title cache too (re-hits GetItems and picks up a renamed title)", async () => {
-  const env = makeEnv({ STEAM_ID: "76561198000000013" });
+  const env = makeEnv();
   globalThis.caches = { default: makeMockCache() };
 
   env.TAG_CACHE.store.set(deckKey(703), JSON.stringify({ deck: 0, os: 0, frame: 0 }));

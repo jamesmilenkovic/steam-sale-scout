@@ -12,7 +12,14 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import worker from "../src/worker.js";
+import realWorker from "../src/worker.js";
+import { signedWorker, TEST_STEAM_ID } from "./helpers/session.mjs";
+
+// EVERY CALL IN THIS FILE GOES THROUGH THE DEFAULT-DENY GATE (SPEC.md §7), with
+// a GENUINELY SIGNED session cookie and the matching secret on the env. Nothing
+// is stubbed and the verifier is not bypassed: without this line every
+// `worker.fetch` below would answer 401. See test/helpers/session.mjs.
+const worker = signedWorker(realWorker);
 import { makeMockD1 } from "./helpers/mockD1.mjs";
 import { SPY_CELESTE, SPY_EMPTY_UNKNOWN_APPID } from "./fixtures/spy-appdetails.mjs";
 import { __setSpyMinIntervalMsForTests, __resetSpyQueueForTests } from "../src/spyQueue.js";
@@ -118,7 +125,11 @@ function jsonResponse(body, status = 200, headers = {}) {
 function makeEnv(overrides = {}) {
   return {
     STEAM_API_KEY: "test-steam-key",
-    STEAM_ID: "76561198000000000",
+    // Increment 15, SPEC.md §11.6: renamed. It is whose app this is, a
+    // deploy-time constant, not who is signed in - and nothing on /api/fpm's
+    // request path reads it any more. The sync pipeline still does, by design
+    // (SPEC.md §11.4).
+    OWNER_STEAM_ID: "76561198000000000",
     ITAD_API_KEY: "test-itad-key",
     TAG_CACHE: makeMockKv(),
     FPM_DB: makeMockD1(),
@@ -128,7 +139,8 @@ function makeEnv(overrides = {}) {
 }
 
 function primeLibrary(cache, env, games) {
-  const key = `https://steam-sale-scout.cache/api/library?steamid=${env.STEAM_ID}&v=2`;
+  // Keyed on the SESSION'S id (SPEC.md §11.1), not on anything from `env`.
+  const key = `https://steam-sale-scout.cache/api/library?steamid=${TEST_STEAM_ID}&v=2`;
   cache.store.set(key, jsonResponse({ games }));
 }
 

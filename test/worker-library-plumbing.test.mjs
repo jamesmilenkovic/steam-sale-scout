@@ -38,7 +38,14 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import worker from "../src/worker.js";
+import realWorker from "../src/worker.js";
+import { signedWorker, TEST_STEAM_ID } from "./helpers/session.mjs";
+
+// EVERY CALL IN THIS FILE GOES THROUGH THE DEFAULT-DENY GATE (SPEC.md §7), with
+// a GENUINELY SIGNED session cookie and the matching secret on the env. Nothing
+// is stubbed and the verifier is not bypassed: without this line every
+// `worker.fetch` below would answer 401. See test/helpers/session.mjs.
+const worker = signedWorker(realWorker);
 import { makeMockD1 } from "./helpers/mockD1.mjs";
 import { makeOfflineFetchGuard } from "./helpers/offlineFetchGuard.mjs";
 import { ensureCatalogSchema } from "../src/catalog.js";
@@ -95,19 +102,26 @@ function makeCtx() {
   };
 }
 
-const STEAM_ID = "76561198000000000";
+// Increment 15, SPEC.md §11.1/§11.2: THE LIBRARY IS NOW FETCHED AND CACHED FOR
+// WHOEVER IS SIGNED IN. Both the cache key and the upstream `steamid` carry the
+// SESSION'S id, not an `env` constant, so this file's one id is the session's.
+// The owner id below still exists on the env because it is a real deploy-time
+// constant (the sync pipeline uses it, SPEC.md §11.4) - it is simply no longer
+// what /api/library or /api/rank read.
+const SESSION_STEAM_ID = TEST_STEAM_ID;
+const OWNER_STEAM_ID = "76561198000000000";
 
 /** The cache key `libraryCacheKey()` builds, spelled out here rather than
  * imported (worker.js exports nothing but `default.fetch`). `v=2` is
  * LIBRARY_CACHE_VERSION, bumped at increment 12.5 when `trimGame` gained
  * `playtime_disconnected`. */
-const LIBRARY_CACHE_KEY = `https://steam-sale-scout.cache/api/library?steamid=${STEAM_ID}&v=2`;
-const LIBRARY_CACHE_KEY_V1 = `https://steam-sale-scout.cache/api/library?steamid=${STEAM_ID}&v=1`;
+const LIBRARY_CACHE_KEY = `https://steam-sale-scout.cache/api/library?steamid=${SESSION_STEAM_ID}&v=2`;
+const LIBRARY_CACHE_KEY_V1 = `https://steam-sale-scout.cache/api/library?steamid=${SESSION_STEAM_ID}&v=1`;
 
 function makeEnv(overrides = {}) {
   return {
     STEAM_API_KEY: "test-steam-key",
-    STEAM_ID,
+    OWNER_STEAM_ID,
     // ITAD_API_KEY deliberately omitted – /api/rank must work without it, and
     // its absence keeps the historical-low pool out of these tests entirely.
     TAG_CACHE: makeMockKv(),
@@ -378,7 +392,7 @@ test("TC-2: the upstream call is GetOwnedGames with include_appinfo and include_
   assert.equal(u.hostname, "api.steampowered.com");
   assert.match(u.pathname, /GetOwnedGames/);
   assert.equal(u.searchParams.get("key"), "test-steam-key");
-  assert.equal(u.searchParams.get("steamid"), STEAM_ID);
+  assert.equal(u.searchParams.get("steamid"), SESSION_STEAM_ID);
   assert.equal(u.searchParams.get("include_appinfo"), "1");
   assert.equal(u.searchParams.get("include_played_free_games"), "1");
 });
@@ -607,7 +621,7 @@ test("TC-2: with NO Steam credentials the upstream is never called, and that is 
   // is reported through profileAvailable/profileGames, NOT as an outage.
   const cache = makeMockCache();
   globalThis.caches = { default: cache };
-  const env = makeEnv({ STEAM_API_KEY: undefined, STEAM_ID: undefined });
+  const env = makeEnv({ STEAM_API_KEY: undefined, OWNER_STEAM_ID: undefined });
   await seedCatalog(env, [{ appid: 440, name: "Team Fortress 2", experience_score: 70 }]);
 
   let fetchCalls = 0;

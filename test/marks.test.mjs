@@ -22,6 +22,13 @@ import {
   derivePlayed,
 } from "../src/marks.js";
 import { makeMockD1 } from "./helpers/mockD1.mjs";
+import { TEST_STEAM_ID } from "./helpers/session.mjs";
+
+// Increment 15, SPEC.md §10: the five D1 functions take the identity
+// explicitly now, so every call in the D1 half below gains one argument. THE
+// ASSERTIONS ARE UNTOUCHED - this is a setup change only. `normaliseMark` and
+// `derivePlayed` are pure and their tests are byte-identical.
+const STEAM_ID = TEST_STEAM_ID;
 
 // ---------------------------------------------------------------------------
 // The real rows, as Steam returns them.
@@ -193,17 +200,17 @@ test("the schema is idempotent and a fresh table lists nothing", async () => {
   const env = makeEnv();
   await ensureMarksSchema(env);
   await ensureMarksSchema(env);
-  assert.deepEqual(await listMarks(env), []);
-  assert.deepEqual([...(await getMarksByAppid(env)).keys()], []);
+  assert.deepEqual(await listMarks(env, STEAM_ID), []);
+  assert.deepEqual([...(await getMarksByAppid(env, STEAM_ID)).keys()], []);
 });
 
 test("setMark is a FULL-STATE UPSERT, not a toggle – pressing twice is idempotent", async () => {
   const env = makeEnv();
   await ensureMarksSchema(env);
 
-  await setMark(env, 400, "Portal", { played: 1, finished: 0 }, 1000);
-  await setMark(env, 400, "Portal", { played: 1, finished: 0 }, 2000);
-  const marks = await listMarks(env);
+  await setMark(env, STEAM_ID, 400, "Portal", { played: 1, finished: 0 }, 1000);
+  await setMark(env, STEAM_ID, 400, "Portal", { played: 1, finished: 0 }, 2000);
+  const marks = await listMarks(env, STEAM_ID);
   assert.equal(marks.length, 1, "a second press must not create a second row");
   assert.deepEqual(
     { appid: marks[0].appid, name: marks[0].name, played: marks[0].played, finished: marks[0].finished },
@@ -216,9 +223,9 @@ test("setMark is a FULL-STATE UPSERT, not a toggle – pressing twice is idempot
 test("the finished => played invariant is enforced ON WRITE, so the impossible row cannot exist", async () => {
   const env = makeEnv();
   await ensureMarksSchema(env);
-  const stored = await setMark(env, 400, "Portal", { played: 0, finished: 1 }, 1000);
+  const stored = await setMark(env, STEAM_ID, 400, "Portal", { played: 0, finished: 1 }, 1000);
   assert.deepEqual(stored, { played: 1, finished: 1 });
-  const row = (await listMarks(env))[0];
+  const row = (await listMarks(env, STEAM_ID))[0];
   assert.equal(row.played, 1, "stored played must be 1 even though the caller sent 0");
   assert.equal(row.finished, 1);
 });
@@ -226,9 +233,11 @@ test("the finished => played invariant is enforced ON WRITE, so the impossible r
 test("marked_at is set once; updated_at moves on every write", async () => {
   const env = makeEnv();
   await ensureMarksSchema(env);
-  await setMark(env, 400, "Portal", { played: 1 }, 1000);
-  await setMark(env, 400, "Portal", { played: 1, finished: 1 }, 5000);
-  const row = await env.FPM_DB.prepare("SELECT * FROM game_marks WHERE appid = 400").first();
+  await setMark(env, STEAM_ID, 400, "Portal", { played: 1 }, 1000);
+  await setMark(env, STEAM_ID, 400, "Portal", { played: 1, finished: 1 }, 5000);
+  const row = await env.FPM_DB.prepare("SELECT * FROM game_marks WHERE steam_id = ? AND appid = 400")
+    .bind(STEAM_ID)
+    .first();
   assert.equal(row.marked_at, 1000, "when you first said something about this game");
   assert.equal(row.updated_at, 5000);
   assert.equal(row.finished, 1);
@@ -237,13 +246,13 @@ test("marked_at is set once; updated_at moves on every write", async () => {
 test("listMarks is newest-updated first; getMarksByAppid is the join shape /api/rank needs", async () => {
   const env = makeEnv();
   await ensureMarksSchema(env);
-  await setMark(env, 400, "Portal", { played: 1 }, 1000);
-  await setMark(env, 620, "Portal 2", { played: 1, finished: 1 }, 3000);
-  await setMark(env, 282140, "SOMA", { played: 1 }, 2000);
+  await setMark(env, STEAM_ID, 400, "Portal", { played: 1 }, 1000);
+  await setMark(env, STEAM_ID, 620, "Portal 2", { played: 1, finished: 1 }, 3000);
+  await setMark(env, STEAM_ID, 282140, "SOMA", { played: 1 }, 2000);
 
-  assert.deepEqual((await listMarks(env)).map((m) => m.appid), [620, 282140, 400]);
+  assert.deepEqual((await listMarks(env, STEAM_ID)).map((m) => m.appid), [620, 282140, 400]);
 
-  const byAppid = await getMarksByAppid(env);
+  const byAppid = await getMarksByAppid(env, STEAM_ID);
   assert.equal(byAppid.size, 3);
   assert.deepEqual({ ...byAppid.get(620) }, { appid: 620, played: 1, finished: 1 });
   assert.equal(byAppid.has(1), false);
@@ -252,12 +261,12 @@ test("listMarks is newest-updated first; getMarksByAppid is the join shape /api/
 test("removeMark clears the assertion and is a no-op, not an error, when there is nothing to clear", async () => {
   const env = makeEnv();
   await ensureMarksSchema(env);
-  await setMark(env, 400, "Portal", { played: 1, finished: 1 }, 1000);
-  await removeMark(env, 400);
-  assert.deepEqual(await listMarks(env), []);
-  await removeMark(env, 400);
-  await removeMark(env, 999999);
-  assert.deepEqual(await listMarks(env), []);
+  await setMark(env, STEAM_ID, 400, "Portal", { played: 1, finished: 1 }, 1000);
+  await removeMark(env, STEAM_ID, 400);
+  assert.deepEqual(await listMarks(env, STEAM_ID), []);
+  await removeMark(env, STEAM_ID, 400);
+  await removeMark(env, STEAM_ID, 999999);
+  assert.deepEqual(await listMarks(env, STEAM_ID), []);
 
   // And clearing is NOT asserting "never played" – the derived answer for a
   // cleared Portal is "no evidence", identical to a game never marked at all.
@@ -267,6 +276,6 @@ test("removeMark clears the assertion and is a no-op, not an error, when there i
 test("a mark is a name snapshot, and a nameless mark is allowed", async () => {
   const env = makeEnv();
   await ensureMarksSchema(env);
-  await setMark(env, 400, null, { played: 1 }, 1000);
-  assert.equal((await listMarks(env))[0].name, null);
+  await setMark(env, STEAM_ID, 400, null, { played: 1 }, 1000);
+  assert.equal((await listMarks(env, STEAM_ID))[0].name, null);
 });

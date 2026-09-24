@@ -41,6 +41,75 @@ for (const pair of tableLine[1].trim().split(/\s+/)) {
   expect[t] = Number(n);
 }
 
+// ---------------------------------------------------------------------------
+// SEC-2 / SEC-8: NO PERSONAL TABLE OUT OF THE COMMITTED DUMP EVER REACHES THE
+// TARGET. THEY ARE DROPPED, NOT REFUSED.
+//
+// THE HAZARD. Increment 15 gave `settings`, `dismissals` and `game_marks` a
+// leading `steam_id TEXT NOT NULL` in a composite primary key. Any dump taken
+// before that carries the OLD shape, and restoring one is silently destructive
+// in the worst way this codebase has: sqlite creates the un-keyed table, the
+// app's own `CREATE TABLE IF NOT EXISTS` then does NOTHING because a table of
+// that name already exists, and every `WHERE steam_id = ?` throws `no such
+// column`. The handlers fail-soft, so the symptom is a 200 with empty data - an
+// app that looks like it is working and shows you nothing.
+//
+// WHY THIS DROPS RATHER THAN REFUSES (increment 15 round 2, SEC-8 / CR-12).
+// The first version of this guard THREW on such a dump. The tracked
+// `backups/catalog.sql.gz` is such a dump, so the guard refused the only
+// off-machine copy of the 18,219 LLM-scored rows - including the `--into`
+// path, which cannot touch the live database at all and is `backups/README.md`
+// 's own verification recipe. The advice it printed was "run npm run backup",
+// which is precisely what someone who has just lost `.wrangler/` cannot do.
+// The blast radius exceeded the hazard: recovery was blocked by a stale
+// `settings` table carrying no ids and no value.
+//
+// Dropping removes the hazard outright rather than trading it for another one.
+// Since SEC-1 the personal tables are not in the committed dump at all - they
+// go to the untracked `backups/private-personal.sql` - so a personal table
+// appearing here is always a legacy artifact, whatever its shape, and it has no
+// business being replayed out of a PUBLIC file into a live database. What the
+// app needs is for those tables to be ABSENT, so its own
+// `CREATE TABLE IF NOT EXISTS` builds them in the current keyed shape on the
+// next request. That is exactly what this leaves behind.
+//
+// THE DROPS RIDE THE SAME sqlite3 INPUT STREAM as the dump itself, appended
+// after its COMMIT. One process, one stream: there is no window in which a
+// completed restore has left an un-keyed table behind.
+//
+// Detection still runs BEFORE the target is resolved or unlinked, so the
+// warning is printed even on the path that refuses to overwrite the live
+// database, and nothing about that refusal's ordering changes.
+const PERSONAL_TABLES = ["settings", "dismissals", "game_marks"];
+const inDump = [];
+const stale = [];
+for (const m of text.matchAll(
+  /CREATE TABLE\s+(?:IF NOT EXISTS\s+)?["'`\[]?([A-Za-z0-9_$]+)["'`\]]?\s*\([^;]*;/gi,
+)) {
+  if (!PERSONAL_TABLES.includes(m[1])) continue;
+  if (!inDump.includes(m[1])) inDump.push(m[1]);
+  if (!/\bsteam_id\b/i.test(m[0]) && !stale.includes(m[1])) stale.push(m[1]);
+}
+if (inDump.length) {
+  console.warn(
+    `NOTE: this dump carries personal table(s) ${inDump.join(", ")}. THEY WILL NOT BE RESTORED.\n` +
+    (stale.length
+      ? `  ${stale.join(", ")} predate${stale.length === 1 ? "s" : ""} increment 15's re-key - no \`steam_id\` column.\n` +
+        `  Restoring that shape would create un-keyed tables the app's CREATE TABLE IF NOT EXISTS then\n` +
+        `  leaves alone, and every read would throw "no such column: steam_id" and fail-soft to empty data.\n`
+      : "") +
+    `  Since SEC-1 the personal tables are not in the committed dump at all - they go to\n` +
+    `  backups/private-personal.sql - so this is a legacy dump. The catalogue restores in full;\n` +
+    `  the personal tables are left ABSENT so the app rebuilds them in the current keyed shape.\n` +
+    `  If you need the rows out of an old dump, load it into a THROWAWAY database by hand\n` +
+    `  (sqlite3 /tmp/old.sqlite < dump.sql) and copy what you want across. Never into the live one.`,
+  );
+  // The header counted rows this restore is deliberately not restoring, so drop
+  // them from the verification rather than reporting an honest 0 as a FAIL.
+  for (const t of inDump) delete expect[t];
+}
+const dropPersonal = inDump.map((t) => `DROP TABLE IF EXISTS "${t}";\n`).join("");
+
 let target;
 if (into) {
   target = path.resolve(into);
@@ -63,7 +132,7 @@ if (into) {
   fs.unlinkSync(target);
 }
 
-execFileSync("sqlite3", [target], { input: text, encoding: "utf8", maxBuffer: 512e6 });
+execFileSync("sqlite3", [target], { input: text + dropPersonal, encoding: "utf8", maxBuffer: 512e6 });
 
 /** Row count for a table the header named, or 0 if the restored database has
  * no such table. A header can honestly say `game_marks=0`: the table is
@@ -119,6 +188,9 @@ execFileSync("sqlite3", [target], {
 let bad = 0;
 console.log(`restored to ${target}`);
 console.log(`  catalogue snapshot version reset to ${restoredVersion} - the next page load rebuilds`);
+for (const t of inDump) {
+  console.log(`  skip ${t.padEnd(18)}       (personal table, dropped - the app recreates it keyed)`);
+}
 for (const [k, want] of Object.entries(expect)) {
   const got = actual[k];
   const ok = got === want;

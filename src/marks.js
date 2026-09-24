@@ -41,13 +41,24 @@
 // Same D1 database as everything else (env.FPM_DB), per the project's single
 // persistence story. Fail-soft posture identical to src/dismissals.js.
 
+// INCREMENT 15, SPEC.md §10 – `steam_id` leads a composite primary key.
+//
+// NOTE WHAT THE HEADER ABOVE SAYS THIS TABLE IS: the only data in this project
+// that cannot be re-fetched from anywhere. That is exactly why it must not be
+// shared. Before this increment one un-keyed row meant one play history for
+// whoever asked; a second signed-in identity would have read and overwritten
+// James's. `steam_id` is TEXT because a SteamID64 does not survive as a
+// JavaScript number – see src/settings.js's header.
+//
+// The `user_id` column this file's own "deliberately not here" list rejected as
+// "untested scaffolding on a single-user app" is now this column, and the
+// reason it is no longer scaffolding is that the app stopped being
+// single-user the moment the allow-list existed.
 const CREATE_MARKS_TABLE_SQL = `CREATE TABLE IF NOT EXISTS game_marks (
-  appid INTEGER PRIMARY KEY,
-  name TEXT,
-  played INTEGER NOT NULL DEFAULT 0,
-  finished INTEGER NOT NULL DEFAULT 0,
-  marked_at INTEGER,
-  updated_at INTEGER
+  steam_id TEXT NOT NULL, appid INTEGER NOT NULL, name TEXT,
+  played INTEGER NOT NULL DEFAULT 0, finished INTEGER NOT NULL DEFAULT 0,
+  marked_at INTEGER, updated_at INTEGER,
+  PRIMARY KEY (steam_id, appid)
 )`;
 
 /** Create the game_marks table if it doesn't exist yet. Safe to call on every
@@ -57,28 +68,44 @@ export async function ensureMarksSchema(env) {
   await env.FPM_DB.prepare(CREATE_MARKS_TABLE_SQL).run();
 }
 
-/** Every mark, most-recently-updated first – backs GET /api/marks.
+/** ONE user's marks, most-recently-updated first – backs GET /api/marks.
+ *
+ * `steamId` comes from the session and never from `env` (SPEC.md §7.3).
+ * @param {object} env - needs env.FPM_DB.
+ * @param {string} steamId - the signed-in user's SteamID64, AS A STRING.
  * @returns {Promise<Array<{appid: number, name: string|null, played: number, finished: number, updated_at: number|null}>>}
  */
-export async function listMarks(env) {
+export async function listMarks(env, steamId) {
   const result = await env.FPM_DB.prepare(
-    "SELECT appid, name, played, finished, updated_at FROM game_marks ORDER BY updated_at DESC",
-  ).all();
+    "SELECT appid, name, played, finished, updated_at FROM game_marks WHERE steam_id = ? ORDER BY updated_at DESC",
+  )
+    .bind(steamId)
+    .all();
   return result.results || [];
 }
 
-/** Marks keyed by appid, as a Map – the shape /api/rank's row build needs to
- * join a mark onto each row in one pass.
+/** ONE user's marks keyed by appid, as a Map – the shape /api/rank's row build
+ * needs to join a mark onto each row in one pass.
+ * @param {object} env - needs env.FPM_DB.
+ * @param {string} steamId - the signed-in user's SteamID64, AS A STRING.
  * @returns {Promise<Map<number, {appid: number, played: number, finished: number}>>}
  */
-export async function getMarksByAppid(env) {
-  const result = await env.FPM_DB.prepare("SELECT appid, played, finished FROM game_marks").all();
+export async function getMarksByAppid(env, steamId) {
+  const result = await env.FPM_DB.prepare(
+    "SELECT appid, played, finished FROM game_marks WHERE steam_id = ?",
+  )
+    .bind(steamId)
+    .all();
   return new Map((result.results || []).map((row) => [row.appid, row]));
 }
 
-const UPSERT_MARK_SQL = `INSERT INTO game_marks (appid, name, played, finished, marked_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?)
-ON CONFLICT(appid) DO UPDATE SET
+// The CONFLICT TARGET names BOTH key columns. `ON CONFLICT(appid)` against the
+// composite key would mean "one play history per game across all users" –
+// i.e. one identity's mark silently overwriting another's, on the one table
+// that cannot be rebuilt from any API.
+const UPSERT_MARK_SQL = `INSERT INTO game_marks (steam_id, appid, name, played, finished, marked_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(steam_id, appid) DO UPDATE SET
   name = excluded.name,
   played = excluded.played,
   finished = excluded.finished,
@@ -104,10 +131,10 @@ export function normaliseMark(input) {
  * what the user pressed. `marked_at` is only set the first time (ON CONFLICT
  * leaves it alone); `updated_at` moves on every write.
  */
-export async function setMark(env, appid, name, state, nowMs = Date.now()) {
+export async function setMark(env, steamId, appid, name, state, nowMs = Date.now()) {
   const { played, finished } = normaliseMark(state);
   await env.FPM_DB.prepare(UPSERT_MARK_SQL)
-    .bind(appid, name ?? null, played, finished, nowMs, nowMs)
+    .bind(steamId, appid, name ?? null, played, finished, nowMs, nowMs)
     .run();
   return { played, finished };
 }
@@ -115,8 +142,10 @@ export async function setMark(env, appid, name, state, nowMs = Date.now()) {
 /** Clear one appid's mark. A no-op (not an error) if it wasn't marked. This
  * is the third state of the two toggles: it removes the assertion, it does
  * NOT assert "never played" (see derivePlayed's header). */
-export async function removeMark(env, appid) {
-  await env.FPM_DB.prepare("DELETE FROM game_marks WHERE appid = ?").bind(appid).run();
+export async function removeMark(env, steamId, appid) {
+  await env.FPM_DB.prepare("DELETE FROM game_marks WHERE steam_id = ? AND appid = ?")
+    .bind(steamId, appid)
+    .run();
 }
 
 // ---------------------------------------------------------------------------

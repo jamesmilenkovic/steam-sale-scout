@@ -5,7 +5,14 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import worker from "../src/worker.js";
+import realWorker from "../src/worker.js";
+import { signedWorker } from "./helpers/session.mjs";
+
+// EVERY CALL IN THIS FILE GOES THROUGH THE DEFAULT-DENY GATE (SPEC.md §7), with
+// a GENUINELY SIGNED session cookie and the matching secret on the env. Nothing
+// is stubbed and the verifier is not bypassed: without this line every
+// `worker.fetch` below would answer 401. See test/helpers/session.mjs.
+const worker = signedWorker(realWorker);
 import { makeMockD1 } from "./helpers/mockD1.mjs";
 
 function makeEnv(overrides = {}) {

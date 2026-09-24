@@ -162,7 +162,44 @@
   .row-marks button[aria-pressed="true"] { font-weight: 600; }
   .dismissed-list { margin-top: 0.6rem; }
   .dismissed-list li { margin-bottom: 0.2rem; }
+
+  /* ---- The signed-out page (SPEC.md §12.2) ----
+     Same variables, same font, same rhythm as the app. This is the FIRST
+     SCREEN A STRANGER SEES, so it explains itself before it asks for
+     anything. No framework, no CDN, no second stylesheet - rule 2 above
+     holds here exactly as it holds everywhere else in this file. */
+  #app[hidden], #signed-out[hidden] { display: none; }
+  .signed-out { max-width: 58ch; }
+  .signed-out .lead { font-size: 1.05rem; margin: 0 0 0.25rem; }
+  .signin {
+    display: inline-block; margin: 1.1rem 0 0.9rem; padding: 0.55rem 1.2rem;
+    background: var(--accent); border: 1px solid var(--accent); border-radius: 6px;
+    color: #fff; font-size: 1rem; font-weight: 600; text-decoration: none;
+  }
+  .signin:hover { text-decoration: underline; }
+  .invite { color: var(--muted); font-size: 0.9rem; margin: 0; }
+
+  /* ---- Who you are, and the way out (SPEC.md §12.5) ----
+     SMALL AND OUT OF THE WAY ON PURPOSE: a 180-day session means this button
+     is used approximately never, and it sits below the footer so it never
+     competes with an answer. It POSTs, never links - a GET logout is fireable
+     from any <img> tag, which is the lesson src/worker.js already records. */
+  .whoami { display: flex; gap: 0.6rem; align-items: baseline; margin-top: 1.25rem; color: var(--muted); font-size: 0.8rem; }
+  /* `display: flex` above beats the UA stylesheet's `[hidden] { display: none }`,
+     the same trap `.more` fell into higher up this file. */
+  .whoami[hidden] { display: none; }
+  .whoami form { margin: 0; }
+  .whoami button {
+    background: none; border: none; padding: 0; cursor: pointer;
+    color: var(--muted); font-size: 0.8rem; text-decoration: underline;
+  }
 </style>
+
+<!-- EVERYTHING THE SIGNED-IN APP IS, in one element, so the signed-out page
+     below can replace the whole screen rather than half of it. Nothing signed-out may
+     be left on screen beside a pitch: stale picks under a "please sign in"
+     line is the page contradicting itself. -->
+<main id="app">
 
 <h1>What should I play next?</h1>
 <p class="basis" id="basis"></p>
@@ -245,6 +282,32 @@
 
 <footer id="footer"></footer>
 
+<!-- SPEC.md §12.5. Filled in from /api/me at boot, hidden until then. It sits
+     outside <footer>, because renderFooter() replaces that element's children
+     wholesale and would wipe the only way out of the app. -->
+<div class="whoami" id="whoami" hidden>
+  <span id="whoami-id"></span>
+  <form method="post" action="/auth/logout"><button type="submit">Sign out</button></form>
+</div>
+
+</main>
+
+<!-- THE SIGNED-OUT PAGE (SPEC.md §12.2). The copy is here in the markup
+     rather than built in script, so what a stranger reads is in the bytes the
+     server delivers and can be read without running anything.
+
+     TWO STATES LIVE IN THIS ONE BLOCK, never three: signed out, and "your
+     session ended" (§12.4). The REFUSED INVITE is NOT one of them - ticket #8
+     put that server-side at the callback and a refused stranger never loads
+     this page at all (§12.6). -->
+<section class="signed-out" id="signed-out" hidden>
+  <h1 id="signed-out-title">What should I play next?</h1>
+  <p class="lead" id="signed-out-lead">Steam Sale Scout ranks your Steam library and your wishlist by what you actually play, so the next game to play – or to buy in a sale – is obvious.</p>
+  <p class="basis" id="signed-out-basis">It reads your Steam library and wishlist, scores about 18,300 games against your own taste, and puts ten of them in front of you. Nothing here is public and nothing is shared.</p>
+  <a class="signin" href="/auth/login">Sign in through Steam</a>
+  <p class="invite" id="signed-out-invite"><strong>Invite only.</strong> This is one person's app, and Steam accounts are let in by hand. If yours is not on the list you will be turned away after you sign in – so ask James for an invite before you make the trip.</p>
+</section>
+
 <script type="module">
   import {
     PICK_COUNT, PICK_STEP, LANDING_PRESET, LENSES, BROWSE_PAGE_SIZE,
@@ -292,6 +355,89 @@
   const rows = () => payload()?.rank ?? [];
 
   // -------------------------------------------------------------------------
+  // THE 401 GUARD, AND THE PAGE IT PAINTS (SPEC.md §12.3, §12.4).
+  //
+  // WHY ONE SHARED GUARD AND NOT PER-FETCH HANDLING: per-fetch handling
+  // already existed here, and it was already wrong. Two live defects, both
+  // found by ticket #9, both in this file until now:
+  //
+  //   1. restoreFilters() caught EVERYTHING, so an expired session fell
+  //      through to /api/rank, which threw, and the page then said "The page
+  //      could not read the game catalogue. Reloading may help" - and a
+  //      reload can never help an expired session. That is the same class of
+  //      lie increment 12's review removed once already, back through another
+  //      door.
+  //   2. Four fetch sites swallowed a 401 entirely, two of them with a bare
+  //      `.catch(() => {})`: saveFilters, paintWishlist, loadDismissals and
+  //      dismissRow's POST.
+  //
+  // The fix is that THE GUARD PAINTS BEFORE IT THROWS. A caller that still
+  // swallows the throw - and two deliberately do, because a badge and a
+  // footer count are never worth a broken page - can no longer swallow the
+  // FACT. The only thing a caller gets to decide is what to do with its own
+  // half-finished work.
+  //
+  // READS AND WRITES DIFFER, AND THAT DIFFERENCE IS THE WHOLE DESIGN:
+  //
+  //   * A READ 401 flips the page to the "your session ended" screen. Every row
+  //     on screen came from the session that just ended, so there is nothing
+  //     worth preserving and plenty worth removing.
+  //   * A WRITE 401 DOES NOT NUKE THE PAGE. It raises the shared toast and
+  //     lets the caller's own failure path run - which for a mark is
+  //     showMarkFailure, springing the toggle back exactly as increment 12.5
+  //     ruled. Nuking the page mid-write throws away the user's unsaved
+  //     intent to tell them something a toast already says.
+  // -------------------------------------------------------------------------
+
+  /** Thrown by `apiFetch` when the server answered 401. It carries no message
+   * for the reader: the guard has already put the honest one on screen. */
+  class SessionEnded extends Error {
+    constructor() { super("session ended"); }
+  }
+
+  const WRITE_SESSION_ENDED = "That didn't save – you are no longer signed in. Sign in again and try it once more.";
+
+  /** EVERY call to an /api/ route on this page goes through here. The one
+   * exception is /api/me itself, which answers 200 `{signedIn:false}` and
+   * never 401 - it is the question this guard's answer depends on. */
+  async function apiFetch(path, options = {}) {
+    const res = await fetch(path, options);
+    if (res.status !== 401) return res;
+    const method = (options.method ?? "GET").toUpperCase();
+    if (method === "GET") showSignedOut(true);
+    else raiseToast(el("div", "toast", WRITE_SESSION_ENDED));
+    throw new SessionEnded();
+  }
+
+  /** Flip the whole screen to the signed-out page: the pitch, or the "your
+   * session ended" variant of it. ONCE ONLY - a burst of 401s from fetches already in
+   * flight must not re-paint the page under someone who is reading it. */
+  let signedOutShown = false;
+  function showSignedOut(ended = false) {
+    if (signedOutShown) return;
+    signedOutShown = true;
+    if (ended) {
+      $("signed-out-title").textContent = "Your session has ended";
+      $("signed-out-lead").textContent = "You are not signed in any more, so this page stopped showing your library. Sign in again to pick up where you left off.";
+      // They were signed in a minute ago, so the invite-only warning is noise.
+      $("signed-out-invite").hidden = true;
+      $("signed-out-basis").hidden = true;
+    }
+    clearTimeout(slowTimer);
+    $("whoami").hidden = true;
+    $("app").hidden = true;
+    $("signed-out").hidden = false;
+  }
+
+  /** Who you are, and the way out (SPEC.md §12.5). The page has no persona
+   * name to show - /api/me answers with the SteamID64 and nothing else - so
+   * the id is what it prints. */
+  function showWhoami(me) {
+    $("whoami-id").textContent = `Signed in as ${me.steamId}`;
+    $("whoami").hidden = false;
+  }
+
+  // -------------------------------------------------------------------------
   // Loading. §10c.3: "Reading the game catalogue…" with NO count – the number
   // only arrives with the payload, so printing one during the load would mean
   // hardcoding a constant that drifts at the next crawl.
@@ -321,7 +467,7 @@
   async function loadPreset(preset) {
     if (state.payloads.has(preset)) return;
     showLoading();
-    const res = await fetch(`/api/rank?preset=${encodeURIComponent(preset)}`);
+    const res = await apiFetch(`/api/rank?preset=${encodeURIComponent(preset)}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const body = await res.json();
     clearTimeout(slowTimer);
@@ -348,6 +494,12 @@
    *     own words follow verbatim as technical detail.
    */
   function showFailure(err) {
+    // SPEC.md §12.3 defect 1. A 401 has ALREADY painted the gate, which says
+    // the true thing. Printing "the page could not read the game catalogue.
+    // Reloading may help" over the top of it would be the exact lie this
+    // increment exists to remove - a reload can never help an expired
+    // session. The guard decides; this function only declines to overwrite it.
+    if (err instanceof SessionEnded) return;
     clearTimeout(slowTimer);
     const box = el("div", "error");
     if (err instanceof RankUnavailable) {
@@ -675,7 +827,7 @@
 
   async function loadDismissals(summary, list, countOnly = false) {
     try {
-      const res = await fetch("/api/dismissals");
+      const res = await apiFetch("/api/dismissals");
       const { dismissals = [] } = await res.json();
       summary.textContent = `Dismissed (${formatCount(dismissals.length)})`;
       if (countOnly) return;
@@ -695,7 +847,7 @@
           // server still held the dismissal.
           let restored = false;
           try {
-            const res = await fetch(`/api/dismissals/${encodeURIComponent(d.appid)}`, { method: "DELETE" });
+            const res = await apiFetch(`/api/dismissals/${encodeURIComponent(d.appid)}`, { method: "DELETE" });
             restored = res.ok && (await res.json())?.restored === true;
           } catch {
             restored = false;
@@ -711,7 +863,9 @@
         list.append(li);
       }
     } catch {
-      // Fail-soft: a footer line is never worth a broken page.
+      // Fail-soft: a footer line is never worth a broken page. A 401 is no
+      // longer swallowed by this catch in the way that matters - apiFetch has
+      // already flipped the screen to signed-out before this line runs.
     }
   }
 
@@ -825,8 +979,8 @@
     let stored = null;
     try {
       const res = clearing
-        ? await fetch(`/api/marks/${encodeURIComponent(row.appid)}`, { method: "DELETE" })
-        : await fetch("/api/marks", {
+        ? await apiFetch(`/api/marks/${encodeURIComponent(row.appid)}`, { method: "DELETE" })
+        : await apiFetch("/api/marks", {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify({ appid: row.appid, name: row.title, ...wanted }),
@@ -834,7 +988,22 @@
       const body = res.ok ? await res.json() : null;
       if (clearing) stored = body?.cleared === true ? { played: 0, finished: 0 } : null;
       else stored = body?.saved === true ? { played: body.played, finished: body.finished } : null;
-    } catch {
+    } catch (err) {
+      // CR-4: A DEAD SESSION MUST NOT WIPE ITS OWN EXPLANATION. `apiFetch` has
+      // already raised WRITE_SESSION_ENDED into the SINGLE SHARED toast host,
+      // and `raiseToast` is a `replaceChildren` - so falling through to
+      // `showMarkFailure` below would overwrite "you are no longer signed in"
+      // with "Couldn't save that" in the same tick. The user would learn the
+      // write failed and never learn why, and would press the toggle again,
+      // and again.
+      //
+      // SPEC.md §12.4's two requirements are both still met on this path:
+      // `renderAll()` springs the toggle back to its unchanged state, and the
+      // page is NOT nuked. Only the second, less true toast is dropped.
+      if (err instanceof SessionEnded) {
+        renderAll();
+        return;
+      }
       stored = null;
     }
 
@@ -901,14 +1070,18 @@
     renderBrowse();
     showToast(row, origin);
     try {
-      await fetch("/api/dismissals", {
+      await apiFetch("/api/dismissals", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ appid: row.appid, name: row.title }),
       });
     } catch {
       // Fail-soft: the row is already gone locally; a failed write means it
-      // returns on the next reload, which is honest rather than silent.
+      // returns on the next reload, which is honest rather than silent. A 401
+      // took the shared toast on the way through apiFetch, so the cheerful
+      // "Dismissed. X won't come back" has already been replaced by a
+      // sentence that says it did not save - the page is not nuked, and the
+      // claim is not left standing either.
     }
   }
 
@@ -925,9 +1098,16 @@
       // the inconsistency.
       let restored = false;
       try {
-        const res = await fetch(`/api/dismissals/${encodeURIComponent(row.appid)}`, { method: "DELETE" });
+        const res = await apiFetch(`/api/dismissals/${encodeURIComponent(row.appid)}`, { method: "DELETE" });
         restored = res.ok && (await res.json())?.restored === true;
-      } catch {
+      } catch (err) {
+        // CR-6: on a 401 the two lines below are DEAD CODE, and reading as if
+        // they are not is the problem. `apiFetch` has already replaced the
+        // toast host with the session-ended sentence, so `line` and `undo` are
+        // detached nodes: relabelling the button and appending to the line
+        // mutates something nobody can see. Return instead, and leave the one
+        // true sentence standing.
+        if (err instanceof SessionEnded) return;
         restored = false;
       }
       if (!restored) {
@@ -979,20 +1159,27 @@
   function saveFilters() {
     clearTimeout(saveTimer);
     saveTimer = setTimeout(() => {
-      fetch("/api/settings", {
+      apiFetch("/api/settings", {
         method: "PUT",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ [RANK_FILTERS_SETTINGS_KEY]: state.filters }),
-      }).catch(() => {});
+      }).catch(() => {});   // still silent - but a 401 has already toasted inside apiFetch
     }, 400);
   }
 
   async function restoreFilters() {
     try {
-      const res = await fetch("/api/settings");
+      const res = await apiFetch("/api/settings");
       const { settings = {} } = await res.json();
       state.filters = normaliseFilters(settings[RANK_FILTERS_SETTINGS_KEY]);
-    } catch {
+    } catch (err) {
+      // THE DEFECT THIS LINE USED TO BE (SPEC.md §12.3). `catch {}` swallowed
+      // everything, including a 401, so boot carried on to /api/rank, which
+      // threw, and the page blamed the game catalogue and offered a reload
+      // that could never work. A dead session STOPS THE BOOT here. Every
+      // other failure still falls back to the defaults, because a saved
+      // filter blob is not worth a blank page.
+      if (err instanceof SessionEnded) throw err;
       state.filters = { ...DEFAULT_RANK_FILTERS };
     }
     restoreControlsFromState();
@@ -1073,9 +1260,11 @@
 
   /** The wishlist badge (SPEC.md §4.7). Fired AFTER the picks paint, never
    * awaited by the render, and a failure is silent – it is a badge, and the
-   * first thing cut if it ever threatens the gate. */
+   * first thing cut if it ever threatens the landing answer. ONE EXCEPTION, and it is
+   * §12.3's: a 401 is a read 401, so apiFetch has flipped the page to "your
+   * session ended" before this bare catch ever sees the throw. */
   function paintWishlist() {
-    fetch("/api/wishlist")
+    apiFetch("/api/wishlist")
       .then((r) => r.json())
       .then(({ wishlist = [] }) => {
         state.wishlist = new Set(wishlist.map((w) => w.appid).filter((id) => id != null));
@@ -1103,6 +1292,34 @@
   // Boot. Nothing here needs a click: the landing state is a fetch and a paint.
   // -------------------------------------------------------------------------
   (async function main() {
+    // SPEC.md §12.1. THE FIRST QUESTION IS "WHO ARE YOU", AND NOTHING ELSE IS
+    // FIRED UNTIL IT IS ANSWERED. Signed out, this function paints the pitch
+    // and RETURNS - no /api/settings, no /api/rank, no /api/wishlist, no
+    // /api/dismissals. The page never guesses at an identity and then
+    // apologises for the consequences.
+    let me;
+    try {
+      // Deliberately NOT apiFetch: /api/me is ungated and answers 200
+      // `{signedIn:false}`, never 401 (SPEC.md §7.2). Running it through the
+      // 401 guard would be asking the guard a question only this call can
+      // answer.
+      const res = await fetch("/api/me");
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      me = await res.json();
+    } catch {
+      // We do not know whether anyone is signed in, so we say that, and
+      // guess at nothing. Painting the pitch here would tell a signed-in
+      // James he is signed out; painting the app would fire nine fetches at
+      // a server that just failed to answer the cheapest question there is.
+      $("picks").replaceChildren(el("p", "error", "The page could not ask the server whether you are signed in, so it has nothing to show yet. Reloading may help; if it does not, the server is not answering properly."));
+      return;
+    }
+    if (!me.signedIn) {
+      showSignedOut();
+      return;
+    }
+    showWhoami(me);
+
     bindChips();
     bindFilters();
     showLoading();

@@ -84,6 +84,22 @@ import {
   normaliseMark,
   derivePlayed,
 } from "./marks.js";
+import {
+  OIDC_STATE_COOKIE,
+  SESSION_COOKIE,
+  clearOidcStateCookie,
+  clearSessionCookie,
+  isAllowedSteamId,
+  isOwnerSteamId,
+  isValidAssertionBody,
+  mintNonce,
+  mintSessionToken,
+  oidcStateCookie,
+  readCookie,
+  sessionCookie,
+  steamIdFromClaimedId,
+  verifySessionToken,
+} from "./auth.js";
 
 const STEAM_API_URL =
   "https://api.steampowered.com/IPlayerService/GetOwnedGames/v1/";
@@ -236,21 +252,63 @@ function trimGame(game) {
  */
 const LIBRARY_CACHE_VERSION = 2;
 
+/**
+ * THE GUARD EVERY PER-USER CACHE KEY RUNS FIRST (SPEC.md §11.1).
+ *
+ * **IT THROWS. THAT IS THE ENTIRE POINT.** Three cache keys in this file
+ * interpolate a SteamID64 straight into a URL. Before this increment all three
+ * read `env.STEAM_ID`, so a caller could not get them wrong; now that the id is
+ * an argument, a caller CAN - and `${undefined}` does not fail. It produces the
+ * perfectly valid key `...?steamid=undefined`, which is ONE SHARED BUCKET that
+ * every buggy caller both reads and writes. That is the cache-layer twin of
+ * `WHERE steam_id = undefined`, except worse: the SQL one matches nothing,
+ * while this one serves one user another user's library.
+ *
+ * Shape is checked, not just presence: a SteamID64 is exactly 17 digits, and it
+ * must be a STRING, because as a JavaScript number it loses its last digit and
+ * two users collide onto one key.
+ */
+/** The shape test on its own, non-throwing. One definition, so a caller that
+ * must NOT throw (getOwnedAppIds, CR-5) tests the same thing the key builders
+ * enforce rather than carrying a second copy of the regex that can drift. */
+function isSteamId(steamId) {
+  return typeof steamId === "string" && /^[0-9]{17}$/.test(steamId);
+}
+
+function requireSteamId(steamId, builder) {
+  if (!isSteamId(steamId)) {
+    throw new Error(
+      `${builder}: a SteamID64 string is required, got ${typeof steamId} ${JSON.stringify(steamId)}`,
+    );
+  }
+  return steamId;
+}
+
 /** Cache key for the trimmed-library response, stable per steamid and
- * independent of ?refresh= so a refresh both bypasses and repopulates it. */
-function libraryCacheKey(env) {
+ * independent of ?refresh= so a refresh both bypasses and repopulates it.
+ *
+ * **`steamId` IS AN ARGUMENT AND THIS NEVER READS `env`** (SPEC.md §11.1,
+ * ticket #15): "a builder that reads `env` internally can be called correctly
+ * from anywhere and still be wrong." */
+function libraryCacheKey(steamId) {
+  requireSteamId(steamId, "libraryCacheKey");
   return new Request(
-    `https://steam-sale-scout.cache/api/library?steamid=${env.STEAM_ID}&v=${LIBRARY_CACHE_VERSION}`,
+    `https://steam-sale-scout.cache/api/library?steamid=${steamId}&v=${LIBRARY_CACHE_VERSION}`,
   );
 }
 
 /** Fetch + trim the owned-games list from the Steam API (no caching here —
  * callers own the cache read/write). Throws an Error with a `.status` on
- * any failure, using the same messages the pre-refactor inline code used. */
-async function fetchOwnedGames(env) {
+ * any failure, using the same messages the pre-refactor inline code used.
+ *
+ * **`steamId` IS THE WHOSE-LIBRARY ARGUMENT AND IS NEVER `env.STEAM_ID`**
+ * (SPEC.md §11.2). `env.STEAM_API_KEY` stays on `env` because it answers a
+ * different question - "can this deployment talk to Steam at all" - and is a
+ * genuine deploy-time constant. */
+async function fetchOwnedGames(env, steamId) {
   const upstreamUrl = new URL(STEAM_API_URL);
   upstreamUrl.searchParams.set("key", env.STEAM_API_KEY);
-  upstreamUrl.searchParams.set("steamid", env.STEAM_ID);
+  upstreamUrl.searchParams.set("steamid", steamId);
   upstreamUrl.searchParams.set("include_appinfo", "1");
   upstreamUrl.searchParams.set("include_played_free_games", "1");
 
@@ -294,7 +352,7 @@ async function fetchOwnedGames(env) {
  * Owned-appid set for /api/deals exclusion, reusing the same library
  * upstream/cache path as /api/library (same cache key, same 24h TTL).
  *
- * Best-effort: if STEAM_API_KEY/STEAM_ID are missing or the Steam API call
+ * Best-effort: if STEAM_API_KEY is missing or the Steam API call
  * fails, this returns an empty set rather than failing the whole deals
  * request — a deals feed with no owned-exclusion is still useful, and a
  * library hiccup shouldn't take it down. (Assumption — spec doesn't say;
@@ -308,11 +366,27 @@ async function fetchOwnedGames(env) {
  * "Refresh prices/owned" button passes it through, since that's the one
  * place this increment's ?refresh=1 is supposed to reach owned status too.
  */
-async function getOwnedAppIds(env, ctx, refresh = false) {
-  if (!env.STEAM_API_KEY || !env.STEAM_ID) return new Set();
+async function getOwnedAppIds(env, ctx, steamId, refresh = false) {
+  // SPEC.md §11.3: `STEAM_ID` IS GONE FROM THIS TEST. The question here is
+  // "can this deployment talk to Steam", which is a question about the API
+  // key alone. Below the gate a session id always exists, so testing for one
+  // was meaningless - and after §11.5 an empty result now means exactly one
+  // thing: the upstream failed. Fail-soft is unchanged and more honest for it.
+  if (!env.STEAM_API_KEY) return new Set();
+
+  // CR-5: THE FAIL-SOFT COVERS THE KEY BUILDER TOO. `libraryCacheKey` THROWS on
+  // an absent or malformed id, which is right and is SPEC.md §11.1's whole
+  // point - but this function's contract with every caller is "returns a Set,
+  // never throws", and it was built above the `try`. A gated read always has a
+  // real session id so it cannot reach here, but `fpmSyncDeps.loadOwnedAppIds`
+  // passes `env.OWNER_STEAM_ID`, which is unset on a half-configured deploy:
+  // the sync lane would have started throwing where it previously got an empty
+  // Set. Refusing early keeps the throw where the spec wants it (a caller that
+  // hands this a bad id gets nothing) without inventing a new failure mode.
+  if (!isSteamId(steamId)) return new Set();
 
   const cache = caches.default;
-  const cacheKey = libraryCacheKey(env);
+  const cacheKey = libraryCacheKey(steamId);
 
   const cached = refresh ? undefined : await cache.match(cacheKey);
   if (cached) {
@@ -325,7 +399,7 @@ async function getOwnedAppIds(env, ctx, refresh = false) {
   }
 
   try {
-    const trimmed = await fetchOwnedGames(env);
+    const trimmed = await fetchOwnedGames(env, steamId);
     const response = new Response(JSON.stringify({ games: trimmed }), {
       status: 200,
       headers: {
@@ -352,13 +426,20 @@ async function getOwnedAppIds(env, ctx, refresh = false) {
  * hiccup here must never break lane rendering (the headline requirement for
  * this increment's persistence work) — it just means nothing gets excluded
  * this request, same as a cold/absent dismissals table.
+ *
+ * `steamId` IS THE SESSION'S, PASSED IN (SPEC.md §7.3, §10). Nothing here
+ * reads an identity out of `env`, and the D1 statement underneath carries
+ * `WHERE steam_id = ?` – without it one user's dismissals would remove rows
+ * from every user's pool.
+ * @param {object} env
+ * @param {string} steamId - the signed-in user's SteamID64, AS A STRING.
  * @returns {Promise<Set<number>>}
  */
-async function getDismissedAppIds(env) {
+async function getDismissedAppIds(env, steamId) {
   if (!env.FPM_DB) return new Set();
   try {
     await ensureDismissalsSchema(env);
-    return await getDismissedAppIdSet(env);
+    return await getDismissedAppIdSet(env, steamId);
   } catch {
     return new Set();
   }
@@ -377,13 +458,19 @@ async function getDismissedAppIds(env) {
  *
  * Fail-soft exactly like getDismissedAppIds: a missing FPM_DB or a D1 hiccup
  * means no annotations this request, never a broken lane.
+ *
+ * `steamId` IS THE SESSION'S, PASSED IN (SPEC.md §7.3, §10) – `game_marks` is
+ * the one table in this project that cannot be re-fetched from anywhere, so a
+ * read that crossed identities would show one person another's play history.
+ * @param {object} env
+ * @param {string} steamId - the signed-in user's SteamID64, AS A STRING.
  * @returns {Promise<Map<number, {played: number, finished: number}>>}
  */
-async function getGameMarks(env) {
+async function getGameMarks(env, steamId) {
   if (!env.FPM_DB) return new Map();
   try {
     await ensureMarksSchema(env);
-    return await getMarksByAppid(env);
+    return await getMarksByAppid(env, steamId);
   } catch {
     return new Map();
   }
@@ -643,11 +730,29 @@ const WISHLIST_TITLE_BATCH_SIZE = 100; // mirrors deckCompat.js's DECK_BATCH_SIZ
  * resolveDeckCompat's shared cached shape, which other lanes depend on. */
 const STORE_BROWSE_GETITEMS_URL = "https://api.steampowered.com/IStoreBrowseService/GetItems/v1/";
 
+/**
+ * THE SHAPE OF BOTH CACHED WISHLIST PAYLOADS, AS A NUMBER. Bump it whenever
+ * either body's shape changes, exactly as LIBRARY_CACHE_VERSION works above.
+ *
+ * 1 – increment 15. **NEW: neither wishlist key carried a version at all**
+ * (SPEC.md §11.1), which meant a bad cached payload could not be evicted by any
+ * code change, only by waiting out the TTL. The keys' shape is changing in this
+ * increment anyway, so the version goes on now rather than being wished for
+ * later.
+ */
+const WISHLIST_CACHE_VERSION = 1;
+
 /** Cache key for the raw parsed wishlist (appid/priority/dateAdded only,
- * pre price-resolution) — its own key, 24h TTL, mirroring libraryCacheKey. */
-function wishlistCacheKey(env) {
+ * pre price-resolution) — its own key, 24h TTL, mirroring libraryCacheKey.
+ *
+ * `steamId` is an argument and this never reads `env`. **The /api/wishlist
+ * route is LIVE and the front end calls it**, which is why ticket #15's audit
+ * listed this as a read site and never recognised it as a per-user CACHE KEY
+ * mattered enough for the spec to correct it. */
+function wishlistCacheKey(steamId) {
+  requireSteamId(steamId, "wishlistCacheKey");
   return new Request(
-    `https://steam-sale-scout.cache/api/wishlist/raw?steamid=${env.STEAM_ID}`,
+    `https://steam-sale-scout.cache/api/wishlist/raw?steamid=${steamId}&v=${WISHLIST_CACHE_VERSION}`,
   );
 }
 
@@ -655,10 +760,14 @@ function wishlistCacheKey(env) {
  * lookup, pre qualify/sort/enrich) — its own key, 6h TTL, mirroring
  * dealsCacheKey's cadence. Qualify/sort/enrich are recomputed fresh on every
  * request on top of this, same relationship enrichDeals has to dealsCacheKey
- * above (see that function's header comment for why). */
-function wishlistPricesCacheKey(env) {
+ * above (see that function's header comment for why).
+ *
+ * `steamId` is an argument and this never reads `env`; `v=` is new here for the
+ * same reason as wishlistCacheKey above. */
+function wishlistPricesCacheKey(steamId) {
+  requireSteamId(steamId, "wishlistPricesCacheKey");
   return new Request(
-    `https://steam-sale-scout.cache/api/wishlist/resolved?steamid=${env.STEAM_ID}`,
+    `https://steam-sale-scout.cache/api/wishlist/resolved?steamid=${steamId}&v=${WISHLIST_CACHE_VERSION}`,
   );
 }
 
@@ -817,9 +926,9 @@ async function buildWishlistCandidates(env, ctx, wishlistItems, refresh) {
 
 /** Load the raw parsed wishlist, cached under its own key (24h TTL,
  * ?refresh=1 bypass), mirroring handleLibrary's cache pattern exactly. */
-async function loadWishlistRaw(env, ctx, refresh) {
+async function loadWishlistRaw(env, ctx, steamId, refresh) {
   const cache = caches.default;
-  const cacheKey = wishlistCacheKey(env);
+  const cacheKey = wishlistCacheKey(steamId);
 
   if (!refresh) {
     const cached = await cache.match(cacheKey);
@@ -829,7 +938,7 @@ async function loadWishlistRaw(env, ctx, refresh) {
     }
   }
 
-  const json = await fetchWishlist(env);
+  const json = await fetchWishlist(env, steamId);
   const items = parseWishlist(json);
   const response = new Response(JSON.stringify({ items }), {
     status: 200,
@@ -845,9 +954,9 @@ async function loadWishlistRaw(env, ctx, refresh) {
 /** Load the price-resolved wishlist candidates, cached under their own key
  * (6h TTL, ?refresh=1 bypass), mirroring loadDealsForRecs/dealsCacheKey's
  * cadence. */
-async function loadWishlistCandidates(env, ctx, refresh) {
+async function loadWishlistCandidates(env, ctx, steamId, refresh) {
   const cache = caches.default;
-  const cacheKey = wishlistPricesCacheKey(env);
+  const cacheKey = wishlistPricesCacheKey(steamId);
 
   if (!refresh) {
     const cached = await cache.match(cacheKey);
@@ -857,7 +966,7 @@ async function loadWishlistCandidates(env, ctx, refresh) {
     }
   }
 
-  const items = await loadWishlistRaw(env, ctx, refresh);
+  const items = await loadWishlistRaw(env, ctx, steamId, refresh);
   const candidates = await buildWishlistCandidates(env, ctx, items, refresh);
   const response = new Response(JSON.stringify({ candidates }), {
     status: 200,
@@ -988,24 +1097,28 @@ function wishlistUnavailableResponse() {
 
 /**
  * ASSUMPTION (flagged for the gate): unlike every other route in this file,
- * missing secrets (STEAM_ID/ITAD_API_KEY) here return the SAME fail-soft 200
+ * a missing ITAD_API_KEY here returns the SAME fail-soft 200
  * `{available: false}` shape as an upstream failure, not a 500 — the spec's
  * headline requirement for this lane is that it never breaks the rest of
  * the app, and a missing-secret 500 would be indistinguishable from any
  * other route's hard failure to the front end. The other routes' 500s are
  * deliberately left untouched.
  */
-async function handleWishlist(request, env, ctx) {
+async function handleWishlist(request, env, ctx, session) {
   const url = new URL(request.url);
   const refresh = url.searchParams.get("refresh") === "1";
 
-  if (!env.STEAM_ID || !env.ITAD_API_KEY) {
+  // SPEC.md §11.3: `STEAM_ID` IS GONE FROM THIS TEST and ONLY the ITAD key is
+  // left. src/wishlist.js's header is right that the Steam wishlist endpoint
+  // needs no API key at all, so ITAD is genuinely the lane's only secret; the
+  // identity now arrives on `session` and is always present below the gate.
+  if (!env.ITAD_API_KEY) {
     return wishlistUnavailableResponse();
   }
 
   let candidates;
   try {
-    candidates = await loadWishlistCandidates(env, ctx, refresh);
+    candidates = await loadWishlistCandidates(env, ctx, session.steamId, refresh);
   } catch {
     return wishlistUnavailableResponse();
   }
@@ -1134,7 +1247,7 @@ function fpmPoolCacheKey() {
  * that omission is the entire point of this pool existing separately from
  * buildBestOfPool's BESTOF_MIN_CUT floor.
  */
-async function buildFpmPool(env, ctx, refresh) {
+async function buildFpmPool(env, ctx, steamId, refresh) {
   const pages = await fetchBestOfPages(env);
   const merged = mergeDealPages(pages, BESTOF_FETCH_CAP);
 
@@ -1148,13 +1261,13 @@ async function buildFpmPool(env, ctx, refresh) {
     return applyHistoricalLow(deal, low ? { price: low } : null);
   });
 
-  const ownedAppIds = await getOwnedAppIds(env, ctx);
+  const ownedAppIds = await getOwnedAppIds(env, ctx, steamId);
   return excludeOwned(deals, ownedAppIds);
 }
 
 /** Load FPM's deal-side candidate pool, cached under its own key (6h TTL,
  * same cadence as the Best-of pool). ?refresh=1 bypasses and repopulates. */
-async function loadFpmPool(env, ctx, refresh) {
+async function loadFpmPool(env, ctx, steamId, refresh) {
   const cache = caches.default;
   const cacheKey = fpmPoolCacheKey();
 
@@ -1166,7 +1279,7 @@ async function loadFpmPool(env, ctx, refresh) {
     }
   }
 
-  const deals = await buildFpmPool(env, ctx, refresh);
+  const deals = await buildFpmPool(env, ctx, steamId, refresh);
   const response = new Response(JSON.stringify({ deals }), {
     status: 200,
     headers: {
@@ -1207,18 +1320,36 @@ function fpmDbUnavailableResponse() {
   });
 }
 
-/** Both sync-trigger routes below share the same deps builder — extracted so
+/**
+ * Both sync-trigger routes below share the same deps builder — extracted so
  * the `?continue=1` auto-continue path (Increment 8) and the original
- * single-batch path drive the identical owned/deal loaders. */
+ * single-batch path drive the identical owned/deal loaders.
+ *
+ * **THIS IS THE ONE PLACE THAT LEGITIMATELY USES THE OWNER'S ID AND NOT THE
+ * SESSION'S, AND THIS COMMENT IS WHY (SPEC.md §11.4).** Without it this reads
+ * as the exact bug §11 exists to remove.
+ *
+ * The sync pipeline fills `fpm_catalog`, which is ONE SHARED CATALOGUE for the
+ * whole deployment, not a per-user view. Its owned-exclusion therefore has to
+ * be a deploy-time constant - whose app this is - or the shared catalogue would
+ * be shaped by whichever invited mate happened to press the button last. That
+ * is a different question from "who is asking", which is what `session`
+ * answers, and this increment splits the two names precisely so the difference
+ * is visible here instead of hidden behind one `STEAM_ID`.
+ *
+ * (The shared snapshot carrying `source_owned` at all is ticket #4, ruled out
+ * of this increment and scheduled for increment 16. Nothing here changes it.)
+ */
 function fpmSyncDeps(env, ctx) {
+  const ownerSteamId = env.OWNER_STEAM_ID;
   return {
-    loadOwnedAppIds: () => getOwnedAppIds(env, ctx),
+    loadOwnedAppIds: () => getOwnedAppIds(env, ctx, ownerSteamId),
     // Top-300 of the rank-sorted deal pool, mirroring the old FPM_POOL_CAP
     // candidate-cap's value — reused here purely as SPEC.md's "current
     // deal-pool floor-passers (loadFpmPool top-300)" union bound, not as a
     // candidate cap (there is no candidate cap anymore).
     loadDealAppIds: async () => {
-      const pool = await loadFpmPool(env, ctx, false);
+      const pool = await loadFpmPool(env, ctx, ownerSteamId, false);
       return pool
         .filter((d) => d.appid != null)
         .slice(0, FPM_POOL_CAP)
@@ -1236,7 +1367,7 @@ function fpmSyncDeps(env, ctx) {
  * the two apart via GET /api/fpm/sync/status's `autoContinue` flag, not this
  * response.
  */
-async function handleFpmSync(request, env, ctx) {
+async function handleFpmSync(request, env, ctx, session) {
   if (!env.FPM_DB) return fpmDbUnavailableResponse();
 
   const url = new URL(request.url);
@@ -1254,7 +1385,7 @@ async function handleFpmSync(request, env, ctx) {
  * a running auto-continue loop to stop after its current batch step
  * finishes. A no-op (not an error) if nothing is auto-continuing; same
  * fpmDbUnavailableResponse fail-soft as the other sync routes. */
-async function handleFpmSyncStop(request, env, ctx) {
+async function handleFpmSyncStop(request, env, ctx, session) {
   // Dedicated fail-soft shape (not fpmDbUnavailableResponse's {started:false}
   // — that's the /api/fpm/sync trigger's own vocabulary, not this route's)
   // so the response body stays honest about which endpoint you're on even
@@ -1272,7 +1403,7 @@ async function handleFpmSyncStop(request, env, ctx) {
   });
 }
 
-async function handleFpmSyncStatus(request, env, ctx) {
+async function handleFpmSyncStatus(request, env, ctx, session) {
   if (!env.FPM_DB) {
     return new Response(
       JSON.stringify({
@@ -1412,10 +1543,12 @@ function parseRankSort(raw) {
  * value) rather than costing correctness. Degrading is the right answer here;
  * refusing would not be.
  */
-async function loadLibraryForRank(env, ctx, refresh) {
-  if (!env.STEAM_API_KEY || !env.STEAM_ID) return [];
+async function loadLibraryForRank(env, ctx, steamId, refresh) {
+  // SPEC.md §11.3: `STEAM_ID` is gone from this test - see getOwnedAppIds'
+  // matching comment. The library fetched here is the SESSION'S, not James's.
+  if (!env.STEAM_API_KEY) return [];
   const cache = caches.default;
-  const cacheKey = libraryCacheKey(env);
+  const cacheKey = libraryCacheKey(steamId);
 
   if (!refresh) {
     try {
@@ -1427,7 +1560,7 @@ async function loadLibraryForRank(env, ctx, refresh) {
   }
 
   try {
-    const trimmed = await fetchOwnedGames(env);
+    const trimmed = await fetchOwnedGames(env, steamId);
     const response = new Response(JSON.stringify({ games: trimmed }), {
       status: 200,
       headers: {
@@ -1503,7 +1636,7 @@ async function buildRankSpyData(env, ownedAppids, catalogTagsByAppid, catalogRow
   return spyDataByAppid;
 }
 
-async function handleRank(request, env, ctx) {
+async function handleRank(request, env, ctx, session) {
   if (!env.FPM_DB) return rankUnavailableResponse("FPM_DB not configured");
 
   // THE METER, INSTALLED ONCE, HERE (SPEC.md §4.1, gates 1 and 3). Every D1
@@ -1559,20 +1692,20 @@ async function handleRank(request, env, ctx) {
   let suppressLowConfidence = true;
   try {
     await ensureSettingsSchema(env);
-    const settings = await getAllSettings(env);
+    const settings = await getAllSettings(env, session.steamId);
     if (settings[SUPPRESS_LOW_CONFIDENCE_KEY] === false) suppressLowConfidence = false;
   } catch {
     // Fail-soft to the safe default: suppress. A settings hiccup must not put
     // a bluffed score on the front page.
   }
 
-  const dismissedAppIds = await getDismissedAppIds(env);
+  const dismissedAppIds = await getDismissedAppIds(env, session.steamId);
   // Increment 12.5. Loaded here, next to the dismissals, so the contrast is
   // visible at the call site: `dismissedAppIds` is consumed by a `continue`
   // in the pool loop below; `marksByAppid` is consumed ONLY in the response
   // row build, never in the loop, never in a score.
-  const marksByAppid = await getGameMarks(env);
-  const libraryGames = await loadLibraryForRank(env, ctx, refresh);
+  const marksByAppid = await getGameMarks(env, session.steamId);
+  const libraryGames = await loadLibraryForRank(env, ctx, session.steamId, refresh);
   const libraryByAppid = new Map(libraryGames.map((game) => [game.appid, game]));
 
   // WHY THE EMPTY LIBRARY IS REPORTED RATHER THAN ABSORBED (round-2 review,
@@ -1588,7 +1721,10 @@ async function handleRank(request, env, ctx) {
   // Credentials PRESENT + empty library is the outage case and earns a
   // notice. Credentials ABSENT is a configuration state, not a fault, and is
   // already visible in `profileAvailable` / `profileGames`.
-  const steamConfigured = Boolean(env.STEAM_API_KEY && env.STEAM_ID);
+  // SPEC.md §11.3: `STEAM_ID` is gone from this test too. What this flag means
+  // is "is this deployment able to talk to Steam", so it is a question about
+  // the API key and nothing else.
+  const steamConfigured = Boolean(env.STEAM_API_KEY);
   const libraryLoadFailed = steamConfigured && libraryGames.length === 0;
 
   const catalogTagsByAppid = new Map();
@@ -1796,7 +1932,20 @@ async function handleRank(request, env, ctx) {
   let dealPool = [];
   if (env.ITAD_API_KEY) {
     try {
-      dealPool = await loadFpmPool(env, ctx, refresh);
+      // THE OWNER ID, DELIBERATELY, NOT `session.steamId` (CR-3). `fpmPoolCacheKey()`
+      // takes no id: one shared key, 6h TTL, two callers. `fpmSyncDeps` writes it with
+      // `env.OWNER_STEAM_ID` and this lane used to be the same id by definition, because
+      // there was only one. Passing the session id here makes whoever asks first decide
+      // whose owned games are stripped from EVERYONE's pool for six hours - a per-identity
+      // answer behind a shared key, which is the exact shape SPEC.md §11.1 exists to
+      // prevent. This restores the pre-auth semantics exactly: the pool is owner-filtered,
+      // always, for every caller.
+      //
+      // The mate-facing inaccuracy that leaves (a signed-in mate sees the OWNER's owned
+      // games excluded from the deal pool) is ticket #4, SPEC.md §15, increment 16.
+      // Per-user-keying the pool is NOT the fix to reach for here: it triples the ITAD
+      // fetch cost and is a scoping decision, not a review one.
+      dealPool = await loadFpmPool(env, ctx, env.OWNER_STEAM_ID, refresh);
     } catch {
       dealPool = [];
     }
@@ -1982,7 +2131,7 @@ async function handleRank(request, env, ctx) {
 // breaks anything, it just means nothing was persisted/restored this time.
 // ---------------------------------------------------------------------------
 
-async function handleGetSettings(request, env, ctx) {
+async function handleGetSettings(request, env, ctx, session) {
   if (!env.FPM_DB) {
     return new Response(JSON.stringify({ settings: {} }), {
       status: 200,
@@ -1991,7 +2140,7 @@ async function handleGetSettings(request, env, ctx) {
   }
   try {
     await ensureSettingsSchema(env);
-    const settings = await getAllSettings(env);
+    const settings = await getAllSettings(env, session.steamId);
     return new Response(JSON.stringify({ settings }), {
       status: 200,
       headers: { "content-type": "application/json" },
@@ -2013,7 +2162,7 @@ async function handleGetSettings(request, env, ctx) {
  * genuine caller error (400), distinct from the fail-soft "D1 hiccup"
  * case below, which reports {saved:false} rather than breaking the caller's
  * flow (the frontend's save is already fire-and-forget/best-effort). */
-async function handlePutSettings(request, env, ctx) {
+async function handlePutSettings(request, env, ctx, session) {
   const unsafe = rejectUnsafeWrite(request);
   if (unsafe) return unsafe;
   if (!env.FPM_DB) {
@@ -2035,7 +2184,7 @@ async function handlePutSettings(request, env, ctx) {
 
   try {
     await ensureSettingsSchema(env);
-    await putSettings(env, body);
+    await putSettings(env, session.steamId, body);
     return new Response(JSON.stringify({ saved: true }), {
       status: 200,
       headers: { "content-type": "application/json" },
@@ -2058,7 +2207,7 @@ async function handlePutSettings(request, env, ctx) {
 // this is just the management surface.
 // ---------------------------------------------------------------------------
 
-async function handleGetDismissals(request, env, ctx) {
+async function handleGetDismissals(request, env, ctx, session) {
   if (!env.FPM_DB) {
     return new Response(JSON.stringify({ dismissals: [] }), {
       status: 200,
@@ -2067,7 +2216,7 @@ async function handleGetDismissals(request, env, ctx) {
   }
   try {
     await ensureDismissalsSchema(env);
-    const dismissals = await listDismissals(env);
+    const dismissals = await listDismissals(env, session.steamId);
     return new Response(JSON.stringify({ dismissals }), {
       status: 200,
       headers: { "content-type": "application/json" },
@@ -2080,7 +2229,7 @@ async function handleGetDismissals(request, env, ctx) {
   }
 }
 
-async function handlePostDismissal(request, env, ctx) {
+async function handlePostDismissal(request, env, ctx, session) {
   const unsafe = rejectUnsafeWrite(request);
   if (unsafe) return unsafe;
   if (!env.FPM_DB) {
@@ -2105,7 +2254,7 @@ async function handlePostDismissal(request, env, ctx) {
 
   try {
     await ensureDismissalsSchema(env);
-    await addDismissal(env, appid, name);
+    await addDismissal(env, session.steamId, appid, name);
     return new Response(JSON.stringify({ dismissed: true }), {
       status: 200,
       headers: { "content-type": "application/json" },
@@ -2120,8 +2269,12 @@ async function handlePostDismissal(request, env, ctx) {
 
 /** DELETE /api/dismissals/:appid — the un-dismiss/restore path. `appid` is
  * parsed off the tail of the URL path (this route is dispatched by prefix,
- * see the fetch() router below). */
-async function handleDeleteDismissal(request, env, ctx, appid) {
+ * see the fetch() router below).
+ *
+ * **`appid` IS THE FIFTH ARGUMENT, NOT THE FOURTH.** `session` went in ahead
+ * of it in increment 15 (SPEC.md §7.3), and a call site that still passes it
+ * fourth hands a session object to something expecting a number. */
+async function handleDeleteDismissal(request, env, ctx, session, appid) {
   const unsafe = rejectCrossSite(request);
   if (unsafe) return unsafe;
   if (!env.FPM_DB) {
@@ -2136,7 +2289,7 @@ async function handleDeleteDismissal(request, env, ctx, appid) {
 
   try {
     await ensureDismissalsSchema(env);
-    await removeDismissal(env, appid);
+    await removeDismissal(env, session.steamId, appid);
     return new Response(JSON.stringify({ restored: true }), {
       status: 200,
       headers: { "content-type": "application/json" },
@@ -2161,7 +2314,7 @@ async function handleDeleteDismissal(request, env, ctx, appid) {
 // all" four ways; public/index.html reverts the toggle and says so).
 // ---------------------------------------------------------------------------
 
-async function handleGetMarks(request, env, ctx) {
+async function handleGetMarks(request, env, ctx, session) {
   if (!env.FPM_DB) {
     return new Response(JSON.stringify({ marks: [] }), {
       status: 200,
@@ -2170,7 +2323,7 @@ async function handleGetMarks(request, env, ctx) {
   }
   try {
     await ensureMarksSchema(env);
-    const marks = await listMarks(env);
+    const marks = await listMarks(env, session.steamId);
     return new Response(JSON.stringify({ marks }), {
       status: 200,
       headers: { "content-type": "application/json" },
@@ -2191,7 +2344,7 @@ async function handleGetMarks(request, env, ctx) {
  * by normaliseMark on the way in, so the impossible row cannot be stored even
  * if something else posts `{played: 0, finished: 1}`.
  */
-async function handlePostMark(request, env, ctx) {
+async function handlePostMark(request, env, ctx, session) {
   const unsafe = rejectUnsafeWrite(request);
   if (unsafe) return unsafe;
   let body;
@@ -2219,7 +2372,7 @@ async function handlePostMark(request, env, ctx) {
 
   try {
     await ensureMarksSchema(env);
-    const stored = await setMark(env, appid, name, state);
+    const stored = await setMark(env, session.steamId, appid, name, state);
     // The STORED state is echoed, not the requested one, so the page renders
     // what the database actually holds – the invariant is visible to the
     // caller rather than something it has to know about.
@@ -2237,8 +2390,12 @@ async function handlePostMark(request, env, ctx) {
 
 /** DELETE /api/marks/:appid – clears the mark. This is the toggles' third
  * state and it REMOVES an assertion; it does not assert "never played". A
- * no-op, not an error, if no mark exists. */
-async function handleDeleteMark(request, env, ctx, appid) {
+ * no-op, not an error, if no mark exists.
+ *
+ * **`appid` IS THE FIFTH ARGUMENT, NOT THE FOURTH.** `session` went in ahead
+ * of it in increment 15 (SPEC.md §7.3), and a call site that still passes it
+ * fourth hands a session object to something expecting a number. */
+async function handleDeleteMark(request, env, ctx, session, appid) {
   const unsafe = rejectCrossSite(request);
   if (unsafe) return unsafe;
   if (!Number.isInteger(appid) || appid <= 0) {
@@ -2252,7 +2409,7 @@ async function handleDeleteMark(request, env, ctx, appid) {
   }
   try {
     await ensureMarksSchema(env);
-    await removeMark(env, appid);
+    await removeMark(env, session.steamId, appid);
     return new Response(JSON.stringify({ cleared: true }), {
       status: 200,
       headers: { "content-type": "application/json" },
@@ -2265,56 +2422,589 @@ async function handleDeleteMark(request, env, ctx, appid) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// The Steam OpenID 2.0 login (Increment 15, SPEC.md §8.1 and §8.2)
+//
+// Hardcoded, and NEVER read from the callback's own `openid.op_endpoint`.
+// Ticket #2 §2.3 item 3 calls that the single worst bug available in this flow:
+// an attacker who names their own op_endpoint gets their own server to answer
+// `is_valid:true` and is logged in as anybody. It is easy to write by accident,
+// because "forward all the fields from the response" and "post to the endpoint
+// in the response" feel like the same instruction. They are not.
+// ---------------------------------------------------------------------------
+const STEAM_OPENID_ENDPOINT = "https://steamcommunity.com/openid/login";
+
+/** The fields whose values the callback reads, and which therefore MUST be
+ * named in `openid.signed` before any of them is read (ticket #2 §2.3 item 4,
+ * OpenID 2.0 §10.1, which requires an OP to sign at least `op_endpoint`,
+ * `return_to`, `response_nonce` and `assoc_handle`, plus `claimed_id` and
+ * `identity` when they are present). UNPREFIXED, because that is the form the
+ * list itself uses. */
+const REQUIRED_SIGNED_FIELDS = ["claimed_id", "identity", "return_to", "response_nonce", "op_endpoint"];
+
+/**
+ * Does the assertion's `openid.return_to` describe the URL this Worker actually
+ * published, and does the request carry everything that URL promised?
+ *
+ * OpenID 2.0 §11.1, in two halves:
+ *   a. scheme, authority and path are identical to `${PUBLIC_ORIGIN}/auth/callback`
+ *   b. every query parameter in `return_to` is present in the received request
+ *      with the same value
+ *
+ * Half (b) is what makes the `state` nonce signature-covered rather than merely
+ * present: `state` rides in `return_to`, Steam signs `return_to`, so an attacker
+ * cannot swap the nonce without breaking the signature.
+ */
+function returnToMatches(requestUrl, returnTo, origin) {
+  if (typeof returnTo !== "string" || !returnTo) return false;
+  let parsed;
+  try {
+    parsed = new URL(returnTo);
+  } catch {
+    return false;
+  }
+  // `URL.origin` covers scheme, host and port together, which is exactly the
+  // "scheme and authority" §11.1 asks about.
+  if (parsed.origin !== origin) return false;
+  if (parsed.pathname !== "/auth/callback") return false;
+  for (const [key, value] of parsed.searchParams) {
+    if (requestUrl.searchParams.get(key) !== value) return false;
+  }
+  return true;
+}
+
+/** The declared origin, or null when it is missing or unparseable. `realm` and
+ * `return_to` come from THIS and never from `new URL(request.url).origin`:
+ * one Worker is reachable on more than one hostname, so a request-derived
+ * realm is partly attacker-influenced (wrangler.toml's own comment,
+ * ticket #2 §1.5). */
+function publicOrigin(env) {
+  const raw = typeof env?.PUBLIC_ORIGIN === "string" ? env.PUBLIC_ORIGIN.trim() : "";
+  if (!raw) return null;
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return null;
+  }
+  // Scheme and host only, no trailing path. A realm MUST NOT carry a fragment
+  // (OpenID 2.0 §9.2) and a `return_to` must sit at or below the realm's path,
+  // so anything with a path here is a misconfiguration, not something to
+  // silently trim.
+  if (raw !== parsed.origin && raw !== `${parsed.origin}/`) return null;
+  return parsed.origin;
+}
+
+/**
+ * A refusal a human reads, not JSON.
+ *
+ * Plain text rather than this file's `jsonError`, because every caller of this
+ * helper is a browser that has just come back from steamcommunity.com and has
+ * a person looking at it. It ALWAYS clears both cookies: SPEC.md §8.2 says
+ * every failure path clears both and shows a plain refusal, so there is no
+ * route out of the callback that leaves a half-set session behind.
+ */
+function authRefusal(message, status) {
+  // nosniff because the `openid.error` path reflects Steam-supplied text into
+  // this body. It is already flattened to printable ASCII and capped, and
+  // text/plain cannot execute, but this is the only place in the auth diff
+  // where untrusted input reaches a response, so the sniffing question is
+  // closed rather than reasoned about.
+  const headers = new Headers({
+    "content-type": "text/plain; charset=utf-8",
+    "x-content-type-options": "nosniff",
+  });
+  headers.append("set-cookie", clearSessionCookie());
+  headers.append("set-cookie", clearOidcStateCookie());
+  return new Response(`${message}\n`, { status, headers });
+}
+
+/** GET /auth/login – mint the nonce, cookie it, and hand the browser to Steam. */
+async function handleAuthLogin(request, env) {
+  // SEC-5: EVERY EXIT FROM THE AUTH ROUTES CLEARS BOTH COOKIES. These two used
+  // to return `jsonError`, which clears nothing. SPEC.md §8.2 states the
+  // invariant without exception, and the browser on the other end of a login
+  // that refuses itself is the one most likely to be holding a half-set
+  // session - a stale nonce cookie from an earlier attempt is exactly what a
+  // misconfigured origin leaves behind. `authRefusal` also answers in plain
+  // text, which is right here: a person is looking at this, not a fetch().
+  const origin = publicOrigin(env);
+  if (!origin) return authRefusal("Sign-in is not available: this deployment has no PUBLIC_ORIGIN configured.", 500);
+
+  // The Host allow-list, of exactly one host. Ruled in wrangler.toml's comment:
+  // the realm, the return_to and the cookie all key to one declared origin, so
+  // a request arriving on any other hostname is refused rather than served a
+  // login that would set a cookie the declared origin never sees.
+  const host = request.headers.get("host") || new URL(request.url).host;
+  if (host !== new URL(origin).host) return authRefusal("Sign-in is not available on this hostname.", 400);
+
+  const nonce = mintNonce();
+  const params = new URLSearchParams({
+    "openid.ns": "http://specs.openid.net/auth/2.0",
+    "openid.mode": "checkid_setup",
+    // `identifier_select` is how OpenID 2.0 says "I do not know who this is
+    // yet, ask them". Both of these and `openid.ns` are http:// namespaces,
+    // not URLs anything fetches (OpenID 2.0 §4.1.2).
+    "openid.identity": "http://specs.openid.net/auth/2.0/identifier_select",
+    "openid.claimed_id": "http://specs.openid.net/auth/2.0/identifier_select",
+    "openid.return_to": `${origin}/auth/callback?state=${encodeURIComponent(nonce)}`,
+    "openid.realm": origin,
+  });
+
+  return new Response(null, {
+    status: 302,
+    headers: {
+      location: `${STEAM_OPENID_ENDPOINT}?${params.toString()}`,
+      "set-cookie": oidcStateCookie(nonce),
+    },
+  });
+}
+
+/**
+ * GET /auth/callback – SPEC.md §8.2's six steps, TIGHTENED by three more of the
+ * OpenID 2.0 relying-party checks ticket #2 §2.3 enumerated (its items 1, 2 and
+ * 4, plus the cheap remaining half of its item 3). James ruled those in on
+ * 2026-09-15. Item 5, replay-proofing `openid.response_nonce`, needs storage and
+ * is its own ticket.
+ *
+ * THE ORDER OF THE NINE STEPS BELOW IS LOAD-BEARING. DO NOT REORDER IT.
+ * Ticket #2 states the constraint in one sentence: "3 and 4 must come before
+ * you read anything, and 6 must come before you trust anything." So the
+ * signature-coverage check sits above every line that reads a signed field's
+ * value, and `check_authentication` sits above every line that acts on one.
+ *
+ * FAIL CLOSED AT EVERY ONE OF THEM. Steam unreachable, a timeout, a non-200, an
+ * unparseable body, an absent `is_valid`: all reject, and every refusal clears
+ * BOTH cookies. This is the one place in the codebase that must invert its
+ * house style, and the comment at the top of src/auth.js says why at length.
+ */
+async function handleAuthCallback(request, env) {
+  const url = new URL(request.url);
+
+  // The declared origin. Everything below compares against THIS and never
+  // against `new URL(request.url).origin` – see handleAuthLogin's comment.
+  const origin = publicOrigin(env);
+  // SEC-5, as in handleAuthLogin above: this is a failure path out of the
+  // callback, so it clears both cookies like every other one. It is also the
+  // path most likely to be reached holding a live nonce cookie, since the
+  // browser only gets here by having been sent to Steam in the first place.
+  if (!origin) return authRefusal("Sign-in could not be completed: this deployment has no PUBLIC_ORIGIN configured.", 500);
+
+  // 1. `state` matches the nonce cookie (SPEC.md §8.2 step 1). Without this an
+  //    attacker can complete a Steam login as themselves, feed James the
+  //    callback URL, and silently sign him into THEIR account (ticket #2 §2.5,
+  //    login CSRF).
+  const state = url.searchParams.get("state");
+  const expectedState = readCookie(request, OIDC_STATE_COOKIE);
+  if (!state || !expectedState || state !== expectedState) {
+    return authRefusal("Sign-in could not be completed: the login did not match this browser. Start again from the app.", 400);
+  }
+
+  // 2. `openid.mode` (ticket #2 §2.3 item 1). `cancel` and `error` are ORDINARY
+  //    OUTCOMES, not failures to hide behind a generic message: someone who
+  //    clicks Cancel on Steam's form has not been attacked and should not be
+  //    told that Steam refused to confirm their login.
+  const mode = url.searchParams.get("openid.mode");
+  if (mode === "cancel") {
+    return authRefusal("Sign-in cancelled. Nothing was changed. Start again from the app whenever you want.", 400);
+  }
+  if (mode === "error") {
+    // Steam's own message, reflected back so it is not lost. Flattened to
+    // printable characters and capped: it is text/plain, so nothing here can
+    // execute, but an attacker-supplied string still does not get to be
+    // unbounded or to smuggle in line noise.
+    const reason = (url.searchParams.get("openid.error") || "no reason given")
+      .replace(/[^\x20-\x7E]/g, " ")
+      .slice(0, 200);
+    return authRefusal(`Steam refused the sign-in: ${reason}`, 400);
+  }
+  if (mode !== "id_res") {
+    return authRefusal("Sign-in could not be completed: that is not a Steam sign-in response.", 400);
+  }
+
+  // 3. `openid.op_endpoint` is Steam's (ticket #2 §2.3 item 3, second half).
+  //    The DANGEROUS half of item 3 is already closed by construction: the
+  //    `check_authentication` POST below goes to the hardcoded constant and
+  //    never to the endpoint named in the callback, which is the difference
+  //    between verifying with Steam and verifying with the attacker's own
+  //    server. This compares the claimed value to that constant as well.
+  //    Reading it here is safe ahead of step 4 because it is only ever
+  //    compared against a constant we control, never trusted as data.
+  if (url.searchParams.get("openid.op_endpoint") !== STEAM_OPENID_ENDPOINT) {
+    return authRefusal("Sign-in could not be completed: that response did not come from Steam.", 403);
+  }
+
+  // 4. EVERY FIELD WE ARE ABOUT TO READ IS NAMED IN `openid.signed`
+  //    (ticket #2 §2.3 item 4). THIS IS AN ACCOUNT-IMPERSONATION HOLE, NOT A
+  //    NICETY. `openid.signed` names which fields Steam's signature actually
+  //    covers, and `check_authentication` verifies the signature over EXACTLY
+  //    those fields and answers `is_valid:true` perfectly honestly. So an
+  //    attacker takes a genuine assertion from their OWN login, edits
+  //    `openid.signed` to drop `claimed_id`, swaps `openid.claimed_id` for
+  //    James's SteamID64, and a callback that skips this check reads a
+  //    claimed_id the signature never covered and logs them in as James.
+  //
+  //    THE NAMES IN THAT LIST ARE UNPREFIXED: `claimed_id`, NOT
+  //    `openid.claimed_id`. Comparing the prefixed form finds nothing, passes
+  //    nothing, and looks like a working check.
+  const signed = (url.searchParams.get("openid.signed") || "").split(",").map((name) => name.trim());
+  if (!REQUIRED_SIGNED_FIELDS.every((name) => signed.includes(name))) {
+    return authRefusal("Sign-in could not be completed: Steam did not sign the parts of that response we rely on.", 403);
+  }
+
+  // 5. `openid.return_to` is the URL we actually published (OpenID 2.0 §11.1:
+  //    "The URL scheme, authority, and path MUST be the same between the two
+  //    URLs. Any query parameters that are present in the openid.return_to URL
+  //    MUST also be present with the same values in the URL of the HTTP request
+  //    the RP received."). Compared against the PUBLIC_ORIGIN-derived URL and
+  //    NOT against the request's own URL, because the request URL is partly
+  //    attacker-influenced – that is the whole reason §8.1 forbids it.
+  //    Without this, an assertion minted for one origin is replayable at
+  //    another, which is live for this project: the Worker is planned onto a
+  //    workers.dev host and possibly a custom domain later.
+  if (!returnToMatches(url, url.searchParams.get("openid.return_to"), origin)) {
+    return authRefusal("Sign-in could not be completed: that login was issued for a different address.", 403);
+  }
+
+  // 6. Every received `openid.*` parameter goes back to Steam verbatim, with
+  //    only `openid.mode` replaced (OpenID 2.0 §11.4.2.1: "exact copies of all
+  //    fields from the authentication response, except for openid.mode").
+  const form = new URLSearchParams();
+  for (const [key, value] of url.searchParams) {
+    if (key.startsWith("openid.")) form.set(key, value);
+  }
+  if (!form.has("openid.claimed_id")) {
+    return authRefusal("Sign-in could not be completed: Steam did not return an identity.", 400);
+  }
+  form.set("openid.mode", "check_authentication");
+
+  //    PARSE THE BODY. DO NOT TRUST THE STATUS CODE. Measured live in ticket #2
+  //    §2.2: an invalid assertion comes back as **HTTP 200** with a body of
+  //    `is_valid:false`, every time. A handler that checks `res.ok` here is a
+  //    complete authentication bypass.
+  let verified = false;
+  try {
+    const res = await fetch(STEAM_OPENID_ENDPOINT, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: form.toString(),
+    });
+    verified = isValidAssertionBody(await res.text());
+  } catch (err) {
+    console.log(`[auth] check_authentication could not reach Steam – refusing: ${err?.message ?? err}`);
+    verified = false;
+  }
+  if (!verified) {
+    return authRefusal("Sign-in could not be completed: Steam did not confirm that login.", 403);
+  }
+
+  // 7. The SteamID64 out of `openid.claimed_id`, as a STRING and only ever a
+  //    string – it loses its last digits as a JavaScript number.
+  const steamId = steamIdFromClaimedId(form.get("openid.claimed_id"));
+  if (!steamId) {
+    return authRefusal("Sign-in could not be completed: that identity is not a Steam account.", 403);
+  }
+
+  // 8. The allow-list, BEFORE the cookie is minted, so a refused stranger gets
+  //    an honest answer instead of looping through Steam forever. This is the
+  //    third state, and it is served from here rather than by the SPA – a
+  //    refused stranger never loads the app (SPEC.md §9, §12.6). The id is
+  //    LOGGED because that is how James gets it to paste into the secret.
+  if (!isAllowedSteamId(env, steamId)) {
+    console.log(`[auth] refused a sign-in: SteamID64 ${steamId} is not on ALLOWED_STEAM_IDS`);
+    return authRefusal(
+      "Steam Sale Scout is invite only.\n\nYour Steam sign-in worked, but this account is not on the invite list, so there is nothing here for you to see. If you expected access, send James this id and ask him to add it:\n\n  " +
+        steamId,
+      403,
+    );
+  }
+
+  // 9. Mint the session, clear the nonce, and go home.
+  let token;
+  try {
+    token = await mintSessionToken(env.SESSION_SECRET, steamId);
+  } catch (err) {
+    console.log(`[auth] could not mint a session – refusing: ${err?.message ?? err}`);
+    return authRefusal("Sign-in could not be completed: this deployment cannot issue a session.", 500);
+  }
+  const headers = new Headers({ location: "/" });
+  headers.append("set-cookie", sessionCookie(token));
+  headers.append("set-cookie", clearOidcStateCookie());
+  return new Response(null, { status: 302, headers });
+}
+
+/** POST /auth/logout – SPEC.md §8.3.
+ *
+ * POST, NEVER GET. A GET logout is fireable from any `<img>` tag on any page
+ * open in the browser, which is the same lesson the `:appid` DELETE comment in
+ * the router below already records in this file. A GET here is a 405.
+ *
+ * IT IS A CLIENT-SIDE ACT ONLY. The token is stateless, so nothing
+ * server-side exists to delete and a captured cookie survives a logout. That
+ * is not a defect to fix here; it is the cost ticket #7 accepted when it
+ * traded the session store away, and rotating SESSION_SECRET remains the only
+ * real revocation (src/auth.js's header says so at length).
+ *
+ * Both cookies are cleared with attributes IDENTICAL to the ones that set
+ * them, because a browser only drops a cookie when they match – hence
+ * clearSessionCookie / clearOidcStateCookie, which share one attribute
+ * constant with their setters rather than repeating the string.
+ */
+function handleAuthLogout() {
+  const headers = new Headers({ location: "/" });
+  headers.append("set-cookie", clearSessionCookie());
+  headers.append("set-cookie", clearOidcStateCookie());
+  return new Response(null, { status: 302, headers });
+}
+
+// ---------------------------------------------------------------------------
+// THE GATE (Increment 15, SPEC.md §7)
+// ---------------------------------------------------------------------------
+
+/**
+ * The gate's one and only failure answer.
+ *
+ * There is deliberately no second shape. A caller cannot tell an expired
+ * cookie from a forged one from a revoked one from a missing SESSION_SECRET,
+ * and that is the point: every one of them means "you are not signed in", and
+ * distinguishing them out loud only helps whoever is probing.
+ */
+function unauthorized() {
+  return jsonError("not signed in", 401);
+}
+
+/**
+ * Who is asking? A session, or null. **THERE IS NO THIRD ANSWER.**
+ *
+ * THIS FUNCTION FAILS CLOSED ON EVERY PATH, AND THAT DELIBERATELY CONTRADICTS
+ * THIS PROJECT'S OWN CONVENTION. src/catalogCache.js:30 says "FAIL-SOFT IS
+ * ABSOLUTE" and nearly every handler in this file argues the same thing:
+ * answer 200 with less data rather than fail. That is right for a cache and
+ * catastrophic for auth. A malformed cookie, a thrown crypto call, a missing
+ * SESSION_SECRET, an unreadable allow-list: all of them return null here and
+ * become a 401 at the call site. **A catch in this function that returns
+ * anything other than null is the front door left open** (SPEC.md §7.1).
+ *
+ * THE ALLOW-LIST IS CHECKED HERE, ON EVERY REQUEST, NOT ONLY AT THE CALLBACK.
+ * This is not belt-and-braces. Ticket #7 traded the session store away ON THE
+ * GROUNDS THAT THIS LIST IS THE REVOCATION, so a login-only check would leave
+ * a removed mate working for the full 180 days of their cookie. Checking it
+ * here is what makes "take them off the list" mean "their next request fails"
+ * (SPEC.md §9).
+ *
+ * @returns {Promise<{steamId: string, owner: boolean, reissuedCookie: string|null}|null>}
+ */
+async function authenticate(request, env) {
+  try {
+    const token = readCookie(request, SESSION_COOKIE);
+    if (!token) return null;
+
+    const verified = await verifySessionToken(env?.SESSION_SECRET, token);
+    if (!verified) return null;
+
+    if (!isAllowedSteamId(env, verified.steamId)) return null;
+
+    // The sliding re-issue (SPEC.md §6.1): 180 days, re-minted once past the
+    // 90-day halfway mark so an active session never expires under its user.
+    //
+    // IT IS MINTED HERE, INSIDE THE GATE'S TRY, AND NOT AFTER DISPATCH. A mint
+    // that throws is an auth failure like any other and gets the gate's one
+    // answer. Doing it below the gate would need a catch down there, and a
+    // catch below the gate that returns anything other than 401 is exactly the
+    // defect §7.1 tells the review to hunt for.
+    const reissuedCookie = verified.needsReissue
+      ? sessionCookie(await mintSessionToken(env.SESSION_SECRET, verified.steamId))
+      : null;
+
+    return {
+      // A STRING, AND IT STAYS ONE, ALL THE WAY DOWN. A SteamID64 loses its
+      // last digits as a JavaScript number, and loses them consistently, so
+      // two users can collide onto one key.
+      steamId: verified.steamId,
+      owner: isOwnerSteamId(env, verified.steamId),
+      reissuedCookie,
+    };
+  } catch {
+    // FAIL CLOSED. See this function's header before changing this line.
+    return null;
+  }
+}
+
+/**
+ * GET /api/me – "am I signed in?" (SPEC.md §7.2)
+ *
+ * **UNGATED, AND IT ANSWERS 200 WITH `{signedIn: false}`, NEVER 401.** It is
+ * the one question a signed-out caller is allowed to ask, and gating it makes
+ * it unable to answer no – which is the whole reason the signed-out page can
+ * exist at all (SPEC.md §12.1).
+ *
+ * `owner` is what increment 16 will use for the sync controls. NOTHING
+ * CONSUMES IT YET, and it is here now because adding a field to a response the
+ * page already fetches is free, while adding a second boot fetch later is not.
+ */
+async function handleMe(request, env) {
+  const session = await authenticate(request, env);
+  if (!session) {
+    return new Response(JSON.stringify({ signedIn: false }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }
+  // A re-issue this call happens to mint is dropped, not sent: /api/me is a
+  // question, not a session-bearing route, and the very next request the page
+  // makes goes through the gate and slides the cookie there.
+  return new Response(
+    JSON.stringify({ signedIn: true, steamId: session.steamId, owner: session.owner }),
+    { status: 200, headers: { "content-type": "application/json" } },
+  );
+}
+
+/** The dispatched response, plus the slid session cookie when one was minted.
+ * Rebuilt rather than mutated because a Response's headers are immutable once
+ * it exists. */
+function withReissuedSession(response, session) {
+  if (!session.reissuedCookie) return response;
+  const headers = new Headers(response.headers);
+  headers.append("set-cookie", session.reissuedCookie);
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+/**
+ * Every route that requires a session.
+ *
+ * **EVERYTHING IN HERE RUNS BELOW THE GATE, SO `session` IS ALWAYS PRESENT.**
+ * There is no "if no session" branch in any handler and there must never be
+ * one: the only way to reach this function is past `authenticate`.
+ *
+ * THE GATE PASSES THE IDENTITY. NO HANDLER AND NO HELPER READS IT OUT OF
+ * `env`. Ticket #15's safety property, and the reason the argument is
+ * positional and explicit: *"a builder that reads `env` internally can be
+ * called correctly from anywhere and still be wrong."*
+ */
+async function dispatch(request, env, ctx, url, session) {
+  if (url.pathname === "/api/wishlist") {
+    return handleWishlist(request, env, ctx, session);
+  }
+  if (url.pathname === "/api/rank") {
+    return handleRank(request, env, ctx, session);
+  }
+  if (url.pathname === "/api/fpm/sync/status") {
+    return handleFpmSyncStatus(request, env, ctx, session);
+  }
+  if (url.pathname === "/api/fpm/sync/stop") {
+    return handleFpmSyncStop(request, env, ctx, session);
+  }
+  if (url.pathname === "/api/fpm/sync") {
+    return handleFpmSync(request, env, ctx, session);
+  }
+  if (url.pathname === "/api/settings") {
+    if (request.method === "PUT") return handlePutSettings(request, env, ctx, session);
+    return handleGetSettings(request, env, ctx, session);
+  }
+  if (url.pathname === "/api/dismissals") {
+    if (request.method === "POST") return handlePostDismissal(request, env, ctx, session);
+    return handleGetDismissals(request, env, ctx, session);
+  }
+  // THE VERB IS PART OF THE ROUTE. Both `/:appid` routes below dispatch by
+  // path PREFIX, and until increment 12.5's security review they ran the
+  // DELETE handler on ANY method - so a plain
+  // `<img src="http://localhost:8787/api/marks/440">` on any page open in
+  // the browser destroyed a mark, with no JS, no CORS and no preflight.
+  // A GET is not allowed to be a write.
+  //
+  // `appid` IS NOW THE FIFTH ARGUMENT, NOT THE FOURTH: `session` went in ahead
+  // of it (SPEC.md §7.3). A call site that still passes it fourth hands a
+  // session object to something expecting a number.
+  if (url.pathname.startsWith("/api/dismissals/")) {
+    if (request.method !== "DELETE") return jsonError("method not allowed", 405);
+    const appid = toAppid(url.pathname.slice("/api/dismissals/".length));
+    return handleDeleteDismissal(request, env, ctx, session, appid);
+  }
+  if (url.pathname === "/api/marks") {
+    if (request.method === "POST") return handlePostMark(request, env, ctx, session);
+    return handleGetMarks(request, env, ctx, session);
+  }
+  if (url.pathname.startsWith("/api/marks/")) {
+    if (request.method !== "DELETE") return jsonError("method not allowed", 405);
+    const appid = toAppid(url.pathname.slice("/api/marks/".length));
+    return handleDeleteMark(request, env, ctx, session, appid);
+  }
+  // The catch-all for routes that no longer exist. IT STAYS BELOW THE GATE
+  // (SPEC.md §7.2): a signed-out caller hitting a deleted route gets 401, not
+  // 501, because "that route is gone" is still an answer about this app's
+  // shape and a stranger is owed nothing.
+  if (url.pathname.startsWith("/api/")) {
+    return jsonError("not implemented", 501);
+  }
+  // Fall back to the static asset handler. Only `/auth/<something we do not
+  // serve>` can get here now – every non-Worker path is handed to ASSETS above
+  // the gate, and every `/api/` path is caught by the 501 just above.
+  return env.ASSETS.fetch(request);
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    if (url.pathname === "/api/wishlist") {
-      return handleWishlist(request, env, ctx);
+
+    // -----------------------------------------------------------------------
+    // ABOVE THE GATE. This list is SPEC.md §7.2's table and nothing else, and
+    // every entry is matched on METHOD AS WELL AS PATH: the path is what lifts
+    // a route above the gate, and the wrong method on one of these paths is
+    // answered 405 HERE rather than falling through to the gate. `POST /api/me`
+    // gets 405, not 401.
+    // -----------------------------------------------------------------------
+
+    // "Am I signed in?" cannot require being signed in.
+    if (url.pathname === "/api/me") {
+      if (request.method !== "GET") return jsonError("method not allowed", 405);
+      return handleMe(request, env);
     }
-    if (url.pathname === "/api/rank") {
-      return handleRank(request, env, ctx);
+    // You cannot be signed in before you sign in.
+    if (url.pathname === "/auth/login") {
+      if (request.method !== "GET") return jsonError("method not allowed", 405);
+      return handleAuthLogin(request, env);
     }
-    if (url.pathname === "/api/fpm/sync/status") {
-      return handleFpmSyncStatus(request, env, ctx);
+    if (url.pathname === "/auth/callback") {
+      if (request.method !== "GET") return jsonError("method not allowed", 405);
+      return handleAuthCallback(request, env);
     }
-    if (url.pathname === "/api/fpm/sync/stop") {
-      return handleFpmSyncStop(request, env, ctx);
+    // Clearing a cookie you do not hold is a no-op.
+    if (url.pathname === "/auth/logout") {
+      if (request.method !== "POST") return jsonError("method not allowed", 405);
+      return handleAuthLogout();
     }
-    if (url.pathname === "/api/fpm/sync") {
-      return handleFpmSync(request, env, ctx);
+
+    // -----------------------------------------------------------------------
+    // THE GATE. DEFAULT DENY (SPEC.md §7).
+    //
+    //   read the cookie -> verify -> check the allow-list -> attach `session`
+    //   -> dispatch. Anything that fails, at any step, returns 401 and
+    //   dispatches NOTHING.
+    //
+    // THE ONE EXEMPTION BELOW THE FOUR ROUTES ABOVE is the static page shell,
+    // which is SPEC.md §7.2's fifth row. Its stated reason - "[assets] serves
+    // public/ before the Worker runs" - is true for every file that exists in
+    // public/, so those requests never reach this line at all. A path with no
+    // matching file DOES reach it, and it is exempted here so that the
+    // signed-out pitch page (SPEC.md §12) is served rather than 401'd. The
+    // shell holds no data: every byte of the library, wishlist, settings,
+    // dismissals and play history is behind an /api/ route, and every one of
+    // those is below this line. Flagged to James for a ruling either way -
+    // review/inc-15/11-one-ruling-needed.md.
+    // -----------------------------------------------------------------------
+    const isWorkerRoute =
+      url.pathname.startsWith("/api/") || url.pathname.startsWith("/auth/");
+    if (!isWorkerRoute) {
+      return env.ASSETS.fetch(request);
     }
-    if (url.pathname === "/api/settings") {
-      if (request.method === "PUT") return handlePutSettings(request, env, ctx);
-      return handleGetSettings(request, env, ctx);
-    }
-    if (url.pathname === "/api/dismissals") {
-      if (request.method === "POST") return handlePostDismissal(request, env, ctx);
-      return handleGetDismissals(request, env, ctx);
-    }
-    // THE VERB IS PART OF THE ROUTE. Both `/:appid` routes below dispatch by
-    // path PREFIX, and until increment 12.5's security review they ran the
-    // DELETE handler on ANY method - so a plain
-    // `<img src="http://localhost:8787/api/marks/440">` on any page open in
-    // the browser destroyed a mark, with no JS, no CORS and no preflight.
-    // A GET is not allowed to be a write.
-    if (url.pathname.startsWith("/api/dismissals/")) {
-      if (request.method !== "DELETE") return jsonError("method not allowed", 405);
-      const appid = toAppid(url.pathname.slice("/api/dismissals/".length));
-      return handleDeleteDismissal(request, env, ctx, appid);
-    }
-    if (url.pathname === "/api/marks") {
-      if (request.method === "POST") return handlePostMark(request, env, ctx);
-      return handleGetMarks(request, env, ctx);
-    }
-    if (url.pathname.startsWith("/api/marks/")) {
-      if (request.method !== "DELETE") return jsonError("method not allowed", 405);
-      const appid = toAppid(url.pathname.slice("/api/marks/".length));
-      return handleDeleteMark(request, env, ctx, appid);
-    }
-    if (url.pathname.startsWith("/api/")) {
-      return jsonError("not implemented", 501);
-    }
-    // Fall back to the static asset handler for everything else.
-    return env.ASSETS.fetch(request);
+
+    const session = await authenticate(request, env);
+    if (!session) return unauthorized();
+
+    return withReissuedSession(await dispatch(request, env, ctx, url, session), session);
   },
 };

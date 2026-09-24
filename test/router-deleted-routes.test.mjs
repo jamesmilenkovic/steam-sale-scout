@@ -24,7 +24,14 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import worker from "../src/worker.js";
+import realWorker from "../src/worker.js";
+import { signedWorker } from "./helpers/session.mjs";
+
+// EVERY CALL IN THIS FILE GOES THROUGH THE DEFAULT-DENY GATE (SPEC.md §7), with
+// a GENUINELY SIGNED session cookie and the matching secret on the env. Nothing
+// is stubbed and the verifier is not bypassed: without this line every
+// `worker.fetch` below would answer 401. See test/helpers/session.mjs.
+const worker = signedWorker(realWorker);
 import { makeOfflineFetchGuard } from "./helpers/offlineFetchGuard.mjs";
 
 const originalCaches = globalThis.caches;
@@ -59,7 +66,8 @@ function makeCtx() {
 function makeEnv(overrides = {}) {
   return {
     STEAM_API_KEY: "test-steam-key",
-    STEAM_ID: "76561198000000000",
+    // Increment 15, SPEC.md §11.6: renamed from STEAM_ID.
+    OWNER_STEAM_ID: "76561198000000000",
     ITAD_API_KEY: "test-itad-key",
     ASSETS: {
       fetch: async () => new Response("static asset", { status: 200 }),
@@ -173,7 +181,7 @@ test("TC-4: the surviving routes are NOT 501 – the table above is not passing 
   // they all still answer; and with no secrets none of them reaches an upstream,
   // which keeps the offline guard's afterEach assertion honest rather than
   // needing a per-route fetch stub that would only obscure the point.
-  const env = makeEnv({ STEAM_API_KEY: undefined, STEAM_ID: undefined, ITAD_API_KEY: undefined });
+  const env = makeEnv({ STEAM_API_KEY: undefined, OWNER_STEAM_ID: undefined, ITAD_API_KEY: undefined });
 
   for (const pathname of survivors) {
     const res = await worker.fetch(new Request(`https://x.test${pathname}`), env, makeCtx());

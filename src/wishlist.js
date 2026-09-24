@@ -27,15 +27,22 @@ export const WISHLIST_URL = "https://api.steampowered.com/IWishlistService/GetWi
 export const WISHLIST_MIN_CUT = 10;
 
 /**
- * Fetch the raw wishlist for env.STEAM_ID. No key required (confirmed live
+ * Fetch the raw wishlist for ONE SteamID64. No key required (confirmed live
  * — see file header). Throws an Error with a `.status` on any network/non-2xx
  * failure, mirroring worker.js's fetchOwnedGames/fetchItadJson.
- * @param {object} env - needs env.STEAM_ID.
+ *
+ * **THE ID IS AN ARGUMENT AND IS NEVER READ OUT OF `env`** (SPEC.md §11.2).
+ * It used to be `env.STEAM_ID`, which meant this function fetched James's
+ * wishlist no matter who was signed in. `env` is still taken because the
+ * signature is the project's convention and a future header/region option
+ * would live there.
+ * @param {object} env
+ * @param {string} steamId - the signed-in user's SteamID64, AS A STRING.
  * @returns {Promise<object>} raw JSON body
  */
-export async function fetchWishlist(env) {
+export async function fetchWishlist(env, steamId) {
   const url = new URL(WISHLIST_URL);
-  url.searchParams.set("steamid", env.STEAM_ID);
+  url.searchParams.set("steamid", steamId);
 
   let res;
   try {

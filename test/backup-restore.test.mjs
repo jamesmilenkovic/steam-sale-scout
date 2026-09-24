@@ -81,54 +81,85 @@ function headerOf(dir) {
   return { text, tables: text.match(/^-- tables:\s*(.+)$/m)[1].trim() };
 }
 
-// The three tables the app always creates, plus two catalogue rows, one of
-// them scored and tagged so the header's other two counters have something to
-// report.
+// The tables the app creates, plus two catalogue rows, one of them scored and
+// tagged so the header's other two counters have something to report.
+//
+// THE PERSONAL TABLES CARRY A `steam_id` HOLDING A REAL-SHAPED SteamID64
+// (increment 15). That is not decoration: SEC-1 is that these two tables were
+// in the COMMITTED dump, and this repository is public, so the fixture has to
+// contain the thing that must not be published or the assertions below are
+// vacuous. `76561198000000001` is a syntactically valid SteamID64 that is not
+// James's.
+const STEAM_ID = "76561198000000001";
+
 const BASE_SQL = `
 create table fpm_catalog (appid integer primary key, name text, experience_score integer, tags text);
 insert into fpm_catalog values (400, 'Portal', 98, 'puzzle'), (440, 'Team Fortress 2', null, null);
-create table settings (key text primary key, value text);
-insert into settings values ('rankFilters', '{}');
-create table dismissals (appid integer primary key, name text);
-insert into dismissals values (620, 'Portal 2');
+create table settings (steam_id text not null, key text not null, value text, updated_at integer,
+  primary key (steam_id, key));
+insert into settings values ('${STEAM_ID}', 'rankFilters', '{}', 1);
+create table dismissals (steam_id text not null, appid integer not null, name text, dismissed_at integer,
+  primary key (steam_id, appid));
+insert into dismissals values ('${STEAM_ID}', 620, 'Portal 2', 1);
 `;
 
 const MARKS_SQL = `
-create table game_marks (appid integer primary key, name text, played integer not null default 0,
-  finished integer not null default 0, marked_at integer, updated_at integer);
-insert into game_marks values (400, 'Portal', 1, 1, 1, 2), (440, 'Team Fortress 2', 1, 0, 1, 2);
+create table game_marks (steam_id text not null, appid integer not null, name text,
+  played integer not null default 0, finished integer not null default 0, marked_at integer,
+  updated_at integer, primary key (steam_id, appid));
+insert into game_marks values ('${STEAM_ID}', 400, 'Portal', 1, 1, 1, 2),
+  ('${STEAM_ID}', 440, 'Team Fortress 2', 1, 0, 1, 2);
 `;
 
-test("SEC-6: game_marks is NOT in the committed dump - James's play history never leaves the machine", () => {
+test("SEC-6 / SEC-1: NO PERSONAL TABLE is in the committed dump - play history, settings and dismissals all stay here", () => {
   requireSqlite3();
   // THE RULING THIS TEST EXISTS FOR (James, 2026-09-06). The repository is
   // PUBLIC and `backups/catalog.sql.gz` is committed on every backup, so
   // anything in it is published. `game_marks` is which games James has played
   // and finished. The table was empty when this was found, so nothing leaked -
   // it would have started publishing the moment he marked a game.
+  //
+  // INCREMENT 15 WIDENED IT (SEC-1). `settings` and `dismissals` were in the
+  // committed dump from day one, harmless for exactly as long as they held a
+  // key and a value. The re-key put a live SteamID64 in every row of both, and
+  // SPEC.md §9 forbids publishing that list in the same words it forbids a
+  // committed `ALLOWED_STEAM_IDS`. So the assertion is no longer "no marks" -
+  // it is "no personal table, and no SteamID64, anywhere in the file".
   const { dir } = makeFakeRepo(BASE_SQL + MARKS_SQL);
 
   run(dir, "backup-catalog.mjs");
   const { text, tables } = headerOf(dir);
-  assert.equal(tables, "fpm_catalog=2 settings=1 dismissals=1", "the committed dump names three tables and no more");
+  assert.equal(tables, "fpm_catalog=2", "the committed dump names ONE table and no more");
   assert.doesNotMatch(text, /game_marks/, "the string does not appear ANYWHERE in the committed dump");
+  assert.doesNotMatch(text, /settings/, "nor does settings, which now carries a SteamID64 in every row");
+  assert.doesNotMatch(text, /dismissals/, "nor dismissals, for the same reason");
+  assert.doesNotMatch(text, /7656119[0-9]{10}/, "and NO SteamID64 - the id resolves to a live profile page");
   assert.doesNotMatch(text, /catalog_meta/, "nor does the version stamp, which is regenerable and must not be restorable");
   assert.doesNotMatch(text, /Portal.*1,\s*1/, "and no mark row survived into it");
 });
 
-test("SEC-6: game_marks IS backed up, locally, to an untracked file beside the committed one", () => {
+test("SEC-6 / SEC-1: the personal tables ARE backed up, locally, to an untracked file beside the committed one", () => {
   requireSqlite3();
   // The other half of the ruling. `game_marks` is still the only genuinely
   // unrecoverable table the project owns - Steam has no "mark as played" and
-  // never returns one - so it is dumped, just not committed.
+  // never returns one - so it is dumped, just not committed. `settings` and
+  // `dismissals` join it there rather than being dropped outright: they are
+  // cheap to lose but free to keep, and the file is already untracked.
+  //
+  // THE FILE IS `private-personal.sql`, NOT `private-marks.sql`. Renamed in
+  // increment 15 because it no longer holds only marks, and a filename that
+  // describes yesterday's contents is how the next private table ends up in
+  // the wrong list.
   const { dir } = makeFakeRepo(BASE_SQL + MARKS_SQL);
 
   const out = run(dir, "backup-catalog.mjs");
-  assert.match(out, /game_marks\s+2 rows -> backups\/private-marks\.sql \(LOCAL ONLY, not committed\)/);
+  assert.match(out, /game_marks\s+2 rows -> backups\/private-personal\.sql \(LOCAL ONLY, not committed\)/);
+  assert.match(out, /settings\s+1 rows -> backups\/private-personal\.sql \(LOCAL ONLY, not committed\)/);
+  assert.match(out, /dismissals\s+1 rows -> backups\/private-personal\.sql \(LOCAL ONLY, not committed\)/);
 
-  const priv = fs.readFileSync(path.join(dir, "backups/private-marks.sql"), "utf8");
+  const priv = fs.readFileSync(path.join(dir, "backups/private-personal.sql"), "utf8");
   assert.match(priv, /NEVER COMMIT THIS FILE/);
-  assert.match(priv, /-- tables: game_marks=2/);
+  assert.match(priv, /-- tables: game_marks=2 settings=1 dismissals=1/);
 
   // And it restores: load it into a throwaway and read the rows back.
   const check = path.join(dir, "marks-check.sqlite");
@@ -152,6 +183,7 @@ test("SEC-10: backups/.gitignore is DENY-BY-DEFAULT, so a future private artifac
     "and the allow-list is exactly the three public files - anything else added here must be a deliberate decision",
   );
   assert.equal(rules.includes("!private-marks.sql"), false, "the play-history dump is never re-admitted");
+  assert.equal(rules.includes("!private-personal.sql"), false, "nor its increment-15 replacement, which also carries SteamID64s");
 });
 
 test("SEC-11: a table matched by `.dump`'s LIKE WILDCARD is REFUSED, not quietly published", () => {
@@ -185,6 +217,20 @@ test("TC-18: the FILE THAT IS ACTUALLY COMMITTED carries no play history and no 
   assert.match(text, /CREATE TABLE fpm_catalog/, "sanity: this is the real catalogue dump, so the assertions below are not vacuous");
   assert.doesNotMatch(text, /game_marks/, "the committed backup names James's play history NOWHERE");
   assert.doesNotMatch(text, /catalog_meta/, "nor the snapshot version stamp, which must not be restorable");
+
+  // SEC-1, increment 15. Every `settings` and `dismissals` row now carries a
+  // live SteamID64 in its primary key, and this repository is PUBLIC - each id
+  // resolves to a `steamcommunity.com/profiles/<id>` page. This is the same
+  // harm SPEC.md §9 forbids for a committed `ALLOWED_STEAM_IDS`, and it was
+  // arriving through the backup instead. A SteamID64 is 17 digits beginning
+  // 7656119, so the pattern is exact rather than a guess.
+  //
+  // THE FILE IN THE TREE TODAY PREDATES THE RE-KEY, so this passes now by
+  // history rather than by design - which is precisely why it is asserted on
+  // the REAL committed bytes and not on a fixture. It fails the moment a
+  // backup taken after the re-key is committed with the personal tables still
+  // in it.
+  assert.doesNotMatch(text, /7656119[0-9]{10}/, "NO SteamID64 - James's or any invited mate's - is published in the committed backup");
 });
 
 test("the committed dump still carries the EXPENSIVE tables - this is a real off-machine backup", () => {
@@ -205,14 +251,24 @@ test("SEC-3: backup SUCCEEDS against a database with NO game_marks table, and st
   // every database that has not served a marks request – and before the fix
   // the backup threw here and wrote nothing at all. It is now in the PRIVATE
   // list rather than the optional one, and absence must still not be an error.
+  //
+  // INCREMENT 15 MADE THIS CASE WIDER AND MORE URGENT, not narrower: SPEC.md
+  // §10 has James DROP all three personal tables by hand before the first
+  // sign-in, so "some personal table is missing" is now a state the database
+  // is GUARANTEED to pass through, not merely allowed to be in.
   const { dir } = makeFakeRepo(BASE_SQL);
 
   const out = run(dir, "backup-catalog.mjs");
   assert.match(out, /fpm_catalog\s+2 rows/);
   assert.match(out, /game_marks\s+0 rows -> \(no such table in this database\)/);
-  assert.equal(fs.existsSync(path.join(dir, "backups/private-marks.sql")), false, "no private dump is written for a table that does not exist");
-  assert.equal(headerOf(dir).tables, "fpm_catalog=2 settings=1 dismissals=1");
+  assert.equal(headerOf(dir).tables, "fpm_catalog=2");
   assert.match(headerOf(dir).text, /-- experience_scored: 1/);
+
+  // The private dump IS written, because `settings` and `dismissals` are
+  // present - and it names only what was actually there.
+  const priv = fs.readFileSync(path.join(dir, "backups/private-personal.sql"), "utf8");
+  assert.match(priv, /-- tables: game_marks=0 settings=1 dismissals=1/);
+  assert.doesNotMatch(priv, /CREATE TABLE game_marks/, "a table that does not exist is not invented in the dump");
 
   // And the other direction: that dump restores and verifies.
   const restored = run(dir, "restore-catalog.mjs", ["--into", path.join(dir, "check.sqlite")]);
@@ -268,24 +324,35 @@ test("13 TC-6: the stamp is minted even when the dump has no catalog_meta at all
 
 test("a REQUIRED table is still a hard stop – the backup refuses to write a half-catalogue", () => {
   requireSqlite3();
+  // The required list is `fpm_catalog` ALONE since increment 15 (SEC-1) -
+  // `settings` and `dismissals` moved to the private list, where absence is
+  // tolerated. So the database this fires on is one with no catalogue at all,
+  // which is the case the hard stop is actually for: a database that is not
+  // the one we think it is, dumped over the good backup.
   const { dir } = makeFakeRepo(`
-    create table fpm_catalog (appid integer primary key, name text, experience_score integer, tags text);
-    create table settings (key text primary key, value text);
+    create table settings (steam_id text not null, key text not null, value text, updated_at integer,
+      primary key (steam_id, key));
   `);
-  assert.throws(() => run(dir, "backup-catalog.mjs"), /expected tables absent from the database/);
+  assert.throws(() => run(dir, "backup-catalog.mjs"), /expected tables absent from the database: fpm_catalog/);
   assert.equal(fs.existsSync(path.join(dir, "backups/catalog.sql.gz")), false, "nothing was written");
 });
 
-test("a pre-12.5 dump, whose header never mentions game_marks, still restores and verifies", () => {
+test("a dump whose header names tables it never CREATED still restores and verifies", () => {
   requireSqlite3();
-  // The restore script iterates the header's own keys, so an older backup is
-  // read on its own terms. Proved rather than assumed, because this is the
-  // path a real recovery would take.
+  // The restore script iterates the header's own keys and counts a missing
+  // table as zero, so an older backup is read on its own terms. Proved rather
+  // than assumed, because this is the path a real recovery would take.
+  //
+  // This used to be phrased as "a pre-12.5 dump, whose header never mentions
+  // game_marks". The same tolerance is being exercised, from the other side:
+  // since increment 15 the committed header names `fpm_catalog` alone, so the
+  // older header is the one carrying EXTRA names - the personal tables, at
+  // zero rows, which this dump quite correctly does not create.
   const { dir } = makeFakeRepo(BASE_SQL + MARKS_SQL);
   run(dir, "backup-catalog.mjs");
   const file = path.join(dir, "backups/catalog.sql.gz");
   const text = gunzipSync(fs.readFileSync(file)).toString("utf8")
-    .replace(/^-- tables: .+$/m, "-- tables: fpm_catalog=2 settings=1 dismissals=1");
+    .replace(/^-- tables: .+$/m, "-- tables: fpm_catalog=2 settings=0 dismissals=0 game_marks=0");
   fs.writeFileSync(file, execFileSync("gzip", ["-c"], { input: Buffer.from(text, "utf8"), maxBuffer: 512e6 }));
 
   const restored = run(dir, "restore-catalog.mjs", ["--into", path.join(dir, "check.sqlite")]);

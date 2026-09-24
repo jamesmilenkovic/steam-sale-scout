@@ -12,7 +12,26 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import worker from "../src/worker.js";
+import realWorker from "../src/worker.js";
+import { signedWorker, TEST_STEAM_ID } from "./helpers/session.mjs";
+
+// EVERY CALL IN THIS FILE GOES THROUGH THE DEFAULT-DENY GATE (SPEC.md §7), with
+// a GENUINELY SIGNED session cookie and the matching secret on the env. Nothing
+// is stubbed and the verifier is not bypassed: without this line every
+// `worker.fetch` below would answer 401. See test/helpers/session.mjs.
+const worker = signedWorker(realWorker);
+
+// Increment 15, SPEC.md §10: the three personal tables are keyed by SteamID64,
+// so a row seeded here has to be seeded AS THE SAME IDENTITY the signed cookie
+// above carries, or the handler correctly cannot see it. Setup only - no
+// assertion below this line changed.
+//
+// Increment 15, SPEC.md §11.1/§11.2: the library cache key and the Steam
+// upstream now both carry the SESSION'S id, so this is the id every per-user
+// fixture in this file is built from. `OWNER_STEAM_ID` below is the other half
+// of SPEC.md §11.6's split - whose app this is, a deploy-time constant - and
+// /api/rank no longer reads it at all.
+const SESSION_STEAM_ID = TEST_STEAM_ID;
 import { makeMockD1 } from "./helpers/mockD1.mjs";
 import { makeOfflineFetchGuard } from "./helpers/offlineFetchGuard.mjs";
 import { ensureCatalogSchema } from "../src/catalog.js";
@@ -72,12 +91,12 @@ function makeCtx() {
   };
 }
 
-const STEAM_ID = "76561198000000000";
+const OWNER_STEAM_ID = "76561198000000000";
 
 function makeEnv(overrides = {}) {
   return {
     STEAM_API_KEY: "test-steam-key",
-    STEAM_ID,
+    OWNER_STEAM_ID,
     // ITAD_API_KEY deliberately omitted — /api/rank must work without it.
     TAG_CACHE: makeMockKv(),
     FPM_DB: makeMockD1(),
@@ -90,7 +109,7 @@ function makeEnv(overrides = {}) {
  * loadLibraryForRank finds it without any fetch. */
 function seedLibrary(cache, games) {
   cache.store.set(
-    `https://steam-sale-scout.cache/api/library?steamid=${STEAM_ID}&v=2`,
+    `https://steam-sale-scout.cache/api/library?steamid=${SESSION_STEAM_ID}&v=2`,
     new Response(JSON.stringify({ games }), { headers: { "content-type": "application/json" } }),
   );
 }
@@ -526,7 +545,7 @@ test("§10.8 the funnel sums EXACTLY to the catalogue row count, with every subt
     { appid: 9, name: "Bluffed", experience_score: 88, experience_confidence: "low", positive: 10, negative: 1 },
   ]);
   await ensureDismissalsSchema(env);
-  await addDismissal(env, 8, "Dismissed Game");
+  await addDismissal(env, SESSION_STEAM_ID, 8, "Dismissed Game");
 
   const { body } = await callRank(env, ctx);
   const f = body.funnel;
@@ -559,7 +578,7 @@ test("§8 a row is charged to exactly ONE funnel line — a dismissed prologue i
     { appid: 1, name: "Something: Prologue", experience_score: 85, experience_confidence: "low", positive: 5, negative: 0 },
   ]);
   await ensureDismissalsSchema(env);
-  await addDismissal(env, 1, "Something: Prologue");
+  await addDismissal(env, SESSION_STEAM_ID, 1, "Something: Prologue");
 
   const { body } = await callRank(env, ctx);
   assert.equal(body.funnel.rankExcluded, 1);
@@ -738,7 +757,7 @@ test("§10.5 / gate 5: an owned, low-confidence, sub-floor row survives with the
     ]);
     if (keyValue !== undefined) {
       await ensureSettingsSchema(env);
-      await putSettings(env, { [SUPPRESS_LOW_CONFIDENCE_KEY]: keyValue });
+      await putSettings(env, SESSION_STEAM_ID, { [SUPPRESS_LOW_CONFIDENCE_KEY]: keyValue });
     }
 
     const { body } = await callRank(env, ctx);
@@ -1021,7 +1040,7 @@ test("§13.5 fail-soft: no Steam credentials means no taste profile, NOT a broke
   // The deliberate difference from /api/recs, which refuses to run without a
   // library. This lane does not exclude owned games, it ranks them, so a
   // Steam outage costs a profile (every row S = 0) rather than correctness.
-  const env = makeEnv({ STEAM_API_KEY: undefined, STEAM_ID: undefined });
+  const env = makeEnv({ STEAM_API_KEY: undefined, OWNER_STEAM_ID: undefined });
   const ctx = makeCtx();
   globalThis.caches = { default: makeMockCache() };
   await seedCatalog(env, [

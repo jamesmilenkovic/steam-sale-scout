@@ -23,9 +23,10 @@
 // also gets a copy off this machine, which a local timestamped folder never does.
 //
 // WHAT IS AND IS NOT IN THE COMMITTED FILE. See the WHAT LEAVES THIS MACHINE
-// block below. In short: the expensive-but-public tables are committed;
-// `game_marks`, which is James's play history, is dumped to an UNTRACKED file
-// beside it and never leaves the machine.
+// block below. In short: `fpm_catalog` - expensive and entirely public - is
+// committed, and the three PERSONAL tables (`game_marks`, `settings`,
+// `dismissals`, all keyed to a SteamID64 since increment 15) are dumped to an
+// UNTRACKED file beside it and never leave the machine.
 //
 // RUN:      npm run backup
 // RESTORE:  npm run restore   (see tools/restore-catalog.mjs)
@@ -54,6 +55,24 @@ const OUT = path.join(REPO, "backups/catalog.sql.gz");
 // today, so nothing has leaked; it would have started publishing the moment he
 // marked a game.
 //
+// `settings` AND `dismissals` JOINED IT IN INCREMENT 15 (SEC-1). They were in
+// the committed dump from the day this tool was written, and that was harmless
+// for exactly as long as they held nothing but a key and a value. Increment 15
+// gave all three personal tables a `steam_id TEXT NOT NULL` leading their
+// primary key, so every row in both now carries a live SteamID64 - James's,
+// and every mate he invites. Each one resolves to a live
+// `steamcommunity.com/profiles/<id>` page, and SPEC.md §9 forbids committing
+// exactly that list for exactly that reason. The next `npm run backup` after
+// the re-key would have published them.
+//
+// WHY THEY MOVE RATHER THAN HAVING THE COLUMN STRIPPED. `fpm_catalog` is the
+// 18,306-row asset this backup exists to protect. `settings` is a handful of
+// UI knob positions and `dismissals` is a short list of "not interested" -
+// both regenerable in a minute of clicking, neither worth a text-rewriting
+// pass over a SQL dump that would produce CREATE TABLEs the app cannot use.
+// The private list already exists, is already tested, and is the mechanism
+// this question has an answer in.
+//
 // `catalog_meta` is dropped for a different reason: the catalogue snapshot
 // version stamp is regenerable in one write, and backing it up creates a
 // restore path that can resurrect a stale-version match - a restored database
@@ -64,10 +83,19 @@ const OUT = path.join(REPO, "backups/catalog.sql.gz");
 // 18,219 rows of LLM judgement and 18,306 rows of SteamSpy tags, neither of
 // which is private and both of which cost hours and real money to rebuild.
 //
-// REQUIRED vs OPTIONAL, and why that split exists. The three below are created
-// on paths every run of the app takes, so their absence means this is not the
+// REQUIRED vs OPTIONAL, and why that split exists. The table below is created
+// on a path every run of the app takes, so its absence means this is not the
 // database we think it is, and stopping is right.
-const REQUIRED_TABLES = ["fpm_catalog", "settings", "dismissals"];
+//
+// It used to also list `settings` and `dismissals`. They are not merely
+// dropped from the committed dump - they moved to PRIVATE_TABLES below, where
+// absence is tolerated, and that tolerance is now REQUIRED rather than merely
+// convenient: SPEC.md §10 has James DROP all three personal tables by hand
+// before the first sign-in, and the app recreates them lazily. A backup run in
+// that window would have refused to write anything at all, taking the 18,306
+// expensive rows down with it - the same regression increment 12.5's review
+// found when `game_marks` was made hard-required.
+const REQUIRED_TABLES = ["fpm_catalog"];
 
 // Nothing optional goes into the committed dump any more. Kept as an explicit
 // empty list rather than deleted, because the next person to add a table needs
@@ -79,8 +107,14 @@ const OPTIONAL_TABLES = [];
 // a hard requirement: ensureMarksSchema creates `game_marks` LAZILY, on the
 // first request that touches a mark, so on a fresh dev state or a `--into`
 // throwaway the table is simply absent and that is not an error.
-const PRIVATE_TABLES = ["game_marks"];
-const PRIVATE_OUT = path.join(REPO, "backups/private-marks.sql");
+const PRIVATE_TABLES = ["game_marks", "settings", "dismissals"];
+// RENAMED from `private-marks.sql` in increment 15, because it no longer holds
+// only marks. A filename that describes yesterday's contents is how the next
+// private table gets added to the wrong list without anyone noticing. Any
+// existing `private-marks.sql` is left where it is - it is a backup, and
+// nothing here deletes one.
+const PRIVATE_OUT = path.join(REPO, "backups/private-personal.sql");
+const PRIVATE_OUT_NAME = path.relative(REPO, PRIVATE_OUT);
 
 function findDb() {
   if (!fs.existsSync(STATE)) throw new Error(`no D1 state at ${STATE} - has the app ever run?`);
@@ -166,6 +200,7 @@ if (privatePresent.length) {
     { encoding: "utf8", maxBuffer: 64e6 });
   fs.writeFileSync(PRIVATE_OUT,
     `-- steam-sale-scout PRIVATE backup - NEVER COMMIT THIS FILE.\n` +
+    `-- Every row here is keyed to a SteamID64. This repository is PUBLIC.\n` +
     `-- tables: ${PRIVATE_TABLES.map((t) => `${t}=${privateCounts[t]}`).join(" ")}\n` +
     privateSql, "utf8");
 } else if (fs.existsSync(PRIVATE_OUT)) {
@@ -181,8 +216,8 @@ for (const t of listed) {
 }
 console.log(`  of which experience-scored: ${scored.toLocaleString()}, tagged: ${tagged.toLocaleString()}`);
 for (const t of PRIVATE_TABLES) {
-  const where = privatePresent.includes(t) ? "backups/private-marks.sql (LOCAL ONLY, not committed)" : "(no such table in this database)";
+  const where = privatePresent.includes(t) ? `${PRIVATE_OUT_NAME} (LOCAL ONLY, not committed)` : "(no such table in this database)";
   console.log(`  ${t.padEnd(12)} ${privateCounts[t].toLocaleString()} rows -> ${where}`);
 }
 console.log(`\nCommit backups/catalog.sql.gz to get a copy off this machine. Restore with: npm run restore`);
-console.log(`Do NOT commit backups/private-marks.sql - it is your play history and this repo is public.`);
+console.log(`Do NOT commit ${PRIVATE_OUT_NAME} - it is your play history and your SteamID64, and this repo is public.`);

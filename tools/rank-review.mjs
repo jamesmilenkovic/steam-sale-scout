@@ -384,7 +384,12 @@ async function buildProbePool() {
   const kv = makeFileKv();
   const cache = makeFileCache();
 
-  const libResponse = await cache.match(`https://steam-sale-scout.cache/api/library?steamid=${process.env.STEAM_ID || readSteamId()}`);
+  // KNOWN BUG, DELIBERATELY NOT FIXED HERE (SPEC.md §11.6, §15). This key
+  // omits the `&v=2` that src/worker.js's libraryCacheKey carries, so it never
+  // matches and this tool silently reads an EMPTY library. Recorded by ticket
+  // #5 and still open. Increment 15 renames the variable on this line and
+  // nothing else - fixing the bug is explicitly out of scope.
+  const libResponse = await cache.match(`https://steam-sale-scout.cache/api/library?steamid=${process.env.OWNER_STEAM_ID || readOwnerSteamId()}`);
   const libraryGames = libResponse ? (await libResponse.json()).games || [] : [];
 
   const catalogTags = new Map();
@@ -449,10 +454,14 @@ async function buildProbePool() {
   return { scored, funnel, libraryGames, profileSize: Object.keys(profile).length, contributions: contributions.length };
 }
 
-function readSteamId() {
+/** The OWNER's SteamID64 out of `.dev.vars`. **Renamed from `readSteamId` /
+ * `STEAM_ID` by SPEC.md §11.6** - this tool is an offline review harness run by
+ * James against his own machine, so the owner constant is the right id here,
+ * unlike the nine request-path sites that now read the session. */
+function readOwnerSteamId() {
   const path = join(REPO, ".dev.vars");
   if (!existsSync(path)) return "";
-  const match = readFileSync(path, "utf8").match(/^STEAM_ID=(.*)$/m);
+  const match = readFileSync(path, "utf8").match(/^OWNER_STEAM_ID=(.*)$/m);
   return match ? match[1].trim() : "";
 }
 
@@ -624,7 +633,7 @@ async function callRank(query, settings = null) {
   const meter = { rowsRead: 0, queries: 0 };
   const env = {
     STEAM_API_KEY: "local-probe",
-    STEAM_ID: readSteamId(),
+    OWNER_STEAM_ID: readOwnerSteamId(),
     TAG_CACHE: makeFileKv(),
     FPM_DB: makeFileD1(db, meter),
   };

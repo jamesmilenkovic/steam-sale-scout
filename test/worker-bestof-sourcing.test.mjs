@@ -28,7 +28,14 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import worker from "../src/worker.js";
+import realWorker from "../src/worker.js";
+import { signedWorker, TEST_STEAM_ID } from "./helpers/session.mjs";
+
+// EVERY CALL IN THIS FILE GOES THROUGH THE DEFAULT-DENY GATE (SPEC.md §7), with
+// a GENUINELY SIGNED session cookie and the matching secret on the env. Nothing
+// is stubbed and the verifier is not bypassed: without this line every
+// `worker.fetch` below would answer 401. See test/helpers/session.mjs.
+const worker = signedWorker(realWorker);
 import { makeMockD1 } from "./helpers/mockD1.mjs";
 import { makeOfflineFetchGuard } from "./helpers/offlineFetchGuard.mjs";
 import { SPY_EMPTY_UNKNOWN_APPID } from "./fixtures/spy-appdetails.mjs";
@@ -117,12 +124,18 @@ function jsonResponse(body, status = 200) {
   });
 }
 
-const STEAM_ID = "76561198000000000";
+// Increment 15, SPEC.md §11.1: the library cache key carries the SESSION'S id
+// now, so the fixture primed below has to be primed under that id or
+// getOwnedAppIds misses it and reaches Steam. `OWNER_STEAM_ID` is the separate
+// deploy-time constant (SPEC.md §11.4/§11.6) and is left on the env for
+// realism; nothing in this file's path reads it.
+const SESSION_STEAM_ID = TEST_STEAM_ID;
+const OWNER_STEAM_ID = "76561198000000000";
 
 function makeEnv(overrides = {}) {
   return {
     STEAM_API_KEY: "test-steam-key",
-    STEAM_ID,
+    OWNER_STEAM_ID,
     ITAD_API_KEY: "test-itad-key",
     TAG_CACHE: makeMockKv(),
     FPM_DB: makeMockD1(),
@@ -136,7 +149,7 @@ function makeEnv(overrides = {}) {
  * cold – that is the whole point of this file. */
 function primeLibrary(cache, games) {
   cache.store.set(
-    `https://steam-sale-scout.cache/api/library?steamid=${STEAM_ID}&v=2`,
+    `https://steam-sale-scout.cache/api/library?steamid=${SESSION_STEAM_ID}&v=2`,
     jsonResponse({ games }),
   );
 }

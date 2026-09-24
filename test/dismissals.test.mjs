@@ -6,6 +6,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { makeMockD1 } from "./helpers/mockD1.mjs";
+import { TEST_STEAM_ID } from "./helpers/session.mjs";
 import {
   ensureDismissalsSchema,
   listDismissals,
@@ -19,21 +20,27 @@ function makeEnv() {
   return { FPM_DB: makeMockD1() };
 }
 
+// Increment 15, SPEC.md §10: the four D1 functions take the identity
+// explicitly now, so every call below gains one argument. THE ASSERTIONS ARE
+// UNTOUCHED - this is a setup change only. `excludeDismissed` is pure and its
+// tests are byte-identical.
+const STEAM_ID = TEST_STEAM_ID;
+
 test("ensureDismissalsSchema is idempotent — safe to call repeatedly", async () => {
   const env = makeEnv();
   await ensureDismissalsSchema(env);
   await ensureDismissalsSchema(env);
-  assert.deepEqual(await listDismissals(env), []);
+  assert.deepEqual(await listDismissals(env, STEAM_ID), []);
 });
 
 test("addDismissal + listDismissals round-trips appid/name/dismissed_at, newest first", async () => {
   const env = makeEnv();
   await ensureDismissalsSchema(env);
 
-  await addDismissal(env, 100, "Old Shovelware", 1000);
-  await addDismissal(env, 200, "Newer Shovelware", 2000);
+  await addDismissal(env, STEAM_ID, 100, "Old Shovelware", 1000);
+  await addDismissal(env, STEAM_ID, 200, "Newer Shovelware", 2000);
 
-  const list = await listDismissals(env);
+  const list = await listDismissals(env, STEAM_ID);
   assert.equal(list.length, 2);
   assert.equal(list[0].appid, 200); // most recently dismissed first
   assert.equal(list[0].name, "Newer Shovelware");
@@ -44,18 +51,18 @@ test("addDismissal + listDismissals round-trips appid/name/dismissed_at, newest 
 test("addDismissal with no name stores null, not a throw", async () => {
   const env = makeEnv();
   await ensureDismissalsSchema(env);
-  await addDismissal(env, 42, null, 1000);
-  const list = await listDismissals(env);
+  await addDismissal(env, STEAM_ID, 42, null, 1000);
+  const list = await listDismissals(env, STEAM_ID);
   assert.equal(list[0].name, null);
 });
 
 test("addDismissal is idempotent — dismissing the same appid twice updates it, not duplicates it", async () => {
   const env = makeEnv();
   await ensureDismissalsSchema(env);
-  await addDismissal(env, 42, "First Name", 1000);
-  await addDismissal(env, 42, "Renamed", 2000);
+  await addDismissal(env, STEAM_ID, 42, "First Name", 1000);
+  await addDismissal(env, STEAM_ID, 42, "Renamed", 2000);
 
-  const list = await listDismissals(env);
+  const list = await listDismissals(env, STEAM_ID);
   assert.equal(list.length, 1);
   assert.equal(list[0].name, "Renamed");
   assert.equal(list[0].dismissed_at, 2000);
@@ -64,28 +71,28 @@ test("addDismissal is idempotent — dismissing the same appid twice updates it,
 test("removeDismissal un-dismisses — the appid no longer appears in the list or the Set", async () => {
   const env = makeEnv();
   await ensureDismissalsSchema(env);
-  await addDismissal(env, 42, "Some Game", 1000);
-  await removeDismissal(env, 42);
+  await addDismissal(env, STEAM_ID, 42, "Some Game", 1000);
+  await removeDismissal(env, STEAM_ID, 42);
 
-  assert.deepEqual(await listDismissals(env), []);
-  const set = await getDismissedAppIdSet(env);
+  assert.deepEqual(await listDismissals(env, STEAM_ID), []);
+  const set = await getDismissedAppIdSet(env, STEAM_ID);
   assert.equal(set.has(42), false);
 });
 
 test("removeDismissal on an appid that was never dismissed is a safe no-op", async () => {
   const env = makeEnv();
   await ensureDismissalsSchema(env);
-  await removeDismissal(env, 999); // never dismissed — should not throw
-  assert.deepEqual(await listDismissals(env), []);
+  await removeDismissal(env, STEAM_ID, 999); // never dismissed — should not throw
+  assert.deepEqual(await listDismissals(env, STEAM_ID), []);
 });
 
 test("getDismissedAppIdSet returns exactly the dismissed appids as a Set", async () => {
   const env = makeEnv();
   await ensureDismissalsSchema(env);
-  await addDismissal(env, 1, "A", 1000);
-  await addDismissal(env, 2, "B", 1000);
+  await addDismissal(env, STEAM_ID, 1, "A", 1000);
+  await addDismissal(env, STEAM_ID, 2, "B", 1000);
 
-  const set = await getDismissedAppIdSet(env);
+  const set = await getDismissedAppIdSet(env, STEAM_ID);
   assert.equal(set.size, 2);
   assert.equal(set.has(1), true);
   assert.equal(set.has(2), true);
