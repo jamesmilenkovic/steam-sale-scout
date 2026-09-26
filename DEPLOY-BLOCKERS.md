@@ -158,12 +158,34 @@ tier and get the app's IP throttled by three upstreams. **That part is unchanged
 
 - **Anonymous triggering is gone.** `POST /api/fpm/sync` sits below the default-deny gate and
   answers **401** without a valid signed cookie, proven live. A stranger cannot start a sync at all.
-- **SEC-1, the cross-site trigger increment 14 left open, dies as a side effect.** That finding was
-  an `<img src=".../api/fpm/sync">` on any page James had open. An `<img>` is a **subresource**
-  request, and `SameSite=Lax` attaches the session cookie only to top-level navigations, so the
-  cookie is simply absent and the gate returns 401. Verified by the security lane rather than
-  assumed. The two `:appid` prefix routes additionally hard-405 anything that is not DELETE, and
-  cross-site JSON POST is blocked because no CORS headers exist anywhere in this app.
+- **SEC-1, the cross-site trigger increment 14 left open, is closed - but NOT by the gate, and this
+  entry said otherwise for three days. Read the correction.**
+
+  SEC-1 named an `<img src=".../api/fpm/sync">` on any page James had open. **That exact vector is
+  dead**, and the gate is why: an `<img>` is a **subresource** request, `SameSite=Lax` withholds the
+  cookie from it, and the gate returns 401.
+
+  **The first version of this entry stopped there and concluded the whole finding "dies as a side
+  effect". That was wrong.** `SameSite=Lax` withholds the cookie from a subresource and
+  **deliberately ATTACHES it to a top-level GET navigation** - that is the entire difference between
+  `Lax` and `Strict`, and it is why `Lax` is mandatory for the Steam callback. Meanwhile all three
+  sync routes dispatched on **path alone**: neither the router nor any of the three handlers looked
+  at `request.method`. So a plain link in an email or a chat message, clicked by the signed-in owner,
+  arrived with a valid session and **started a multi-hour crawl of SteamSpy, ITAD and Steam.**
+
+  Measured live at `47d9c67`, with a real cookie: `GET /api/fpm/sync/stop` returned **200** and the
+  handler ran. All 909 tests passed with the hole open.
+
+  **Closed 2026-09-25** by a 405 verb guard on each of the three routes - `POST` for `/api/fpm/sync`
+  and `/api/fpm/sync/stop`, `GET` for `/api/fpm/sync/status` - plus 14 tests. Proven by sabotage:
+  removing one guard turns 4 tests red, and removing all three **hangs the test runner**, because
+  the pipeline genuinely starts.
+
+  **The lesson, because this project already learned it once.** `src/worker.js`'s `/:appid` comment
+  records a GET destroying a mark at increment 12.5 and concludes **"THE VERB IS PART OF THE ROUTE"**.
+  The two `:appid` routes got the fix then. These three never did, and nobody re-checked them.
+  **A 401 gate answers "who are you". It cannot answer "should a GET be allowed to do that."**
+  Cross-site JSON POST remains blocked because no CORS headers exist anywhere in this app.
 
 **What is left, and who owns it.**
 

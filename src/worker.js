@@ -2892,13 +2892,33 @@ async function dispatch(request, env, ctx, url, session) {
   if (url.pathname === "/api/rank") {
     return handleRank(request, env, ctx, session);
   }
+  // THE VERB IS PART OF THE ROUTE. See the comment on the `/:appid` routes
+  // below, written after a GET destroyed a mark at increment 12.5. These three
+  // did not get that fix at the time and ran their handler on ANY method.
+  //
+  // WHY THE GATE DOES NOT COVER THIS, which is the part that fooled a document.
+  // DEPLOY-BLOCKERS.md claimed increment 14's SEC-1 "dies as a side effect" of
+  // `SameSite=Lax`. That is true of the vector SEC-1 actually named - an
+  // `<img src=".../api/fpm/sync">` is a SUBRESOURCE request and Lax withholds
+  // the cookie, so the gate 401s it. It is NOT true in general: **Lax
+  // deliberately ATTACHES the cookie to a top-level GET navigation.** So a
+  // plain link in an email or a chat message, clicked by a signed-in owner,
+  // reached `handleFpmSync` with a valid session and started a multi-hour crawl
+  // of SteamSpy, ITAD and Steam. Measured live at 47d9c67:
+  // `GET /api/fpm/sync/stop` returned 200 and the handler ran.
+  //
+  // A 401 gate answers "who are you". It cannot answer "should a GET be allowed
+  // to do that", and nothing else was answering it here.
   if (url.pathname === "/api/fpm/sync/status") {
+    if (request.method !== "GET") return jsonError("method not allowed", 405);
     return handleFpmSyncStatus(request, env, ctx, session);
   }
   if (url.pathname === "/api/fpm/sync/stop") {
+    if (request.method !== "POST") return jsonError("method not allowed", 405);
     return handleFpmSyncStop(request, env, ctx, session);
   }
   if (url.pathname === "/api/fpm/sync") {
+    if (request.method !== "POST") return jsonError("method not allowed", 405);
     return handleFpmSync(request, env, ctx, session);
   }
   if (url.pathname === "/api/settings") {

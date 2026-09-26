@@ -635,3 +635,98 @@ test("sync's deal-pool union actually slices to FPM_POOL_CAP (top 300 of the ran
     assert.ok(!flaggedAppids.has(6000 + i), `appid ${6000 + i} (beyond top ${FPM_POOL_CAP}) should NOT be flagged`);
   }
 });
+
+// ---------------------------------------------------------------------------
+// THE VERB IS PART OF THE ROUTE (increment 15 follow-up, 2026-09-25)
+//
+// These three routes dispatched on PATH ALONE and ran their handler on any
+// method. Neither the router nor any of the three handlers looked at
+// `request.method`, so `GET /api/fpm/sync` started a multi-hour crawl of
+// SteamSpy, ITAD and Steam.
+//
+// THE GATE DOES NOT COVER THIS, and DEPLOY-BLOCKERS.md wrongly said it did.
+// `SameSite=Lax` withholds the cookie from a SUBRESOURCE, which is why
+// increment 14's SEC-1 `<img>` vector really is dead. But Lax DELIBERATELY
+// ATTACHES the cookie to a top-level GET navigation, so a plain link in an
+// email or a chat message, clicked by the signed-in owner, arrived with a valid
+// session. A 401 gate answers "who are you"; it cannot answer "should a GET be
+// allowed to do that".
+//
+// Measured live at 47d9c67 before the fix: `GET /api/fpm/sync/stop` -> 200,
+// handler ran. All 909 tests passed with the hole open, which is why these
+// exist. This is the same lesson `src/worker.js`'s `/:appid` comment records
+// after a GET destroyed a mark at increment 12.5 - these three routes simply
+// never got the fix.
+// ---------------------------------------------------------------------------
+
+for (const method of ["GET", "PUT", "DELETE", "HEAD", "PATCH"]) {
+  test(`VERB GUARD: ${method} /api/fpm/sync -> 405, and the sync does NOT start`, async () => {
+    const env = makeEnv();
+    const ctx = makeCtx();
+    // A real fetch would mean the crawl began. If the guard fails, this throws
+    // rather than quietly spending an afternoon of upstream requests.
+    const fetchCalls = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (...args) => {
+      fetchCalls.push(String(args[0]));
+      throw new Error("the sync pipeline ran on a non-POST - the verb guard failed");
+    };
+    try {
+      const res = await worker.fetch(
+        new Request("https://x/api/fpm/sync", { method }),
+        env,
+        ctx,
+      );
+      assert.equal(res.status, 405, `${method} must be refused, not dispatched`);
+      assert.deepEqual(await res.json(), { error: "method not allowed" });
+      assert.deepEqual(fetchCalls, [], "no upstream call may be made");
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+}
+
+for (const method of ["GET", "PUT", "DELETE", "PATCH"]) {
+  test(`VERB GUARD: ${method} /api/fpm/sync/stop -> 405`, async () => {
+    const res = await worker.fetch(
+      new Request("https://x/api/fpm/sync/stop", { method }),
+      makeEnv(),
+      makeCtx(),
+    );
+    assert.equal(res.status, 405);
+    assert.deepEqual(await res.json(), { error: "method not allowed" });
+  });
+}
+
+for (const method of ["POST", "PUT", "DELETE", "PATCH"]) {
+  test(`VERB GUARD: ${method} /api/fpm/sync/status -> 405 (status is a READ)`, async () => {
+    const res = await worker.fetch(
+      new Request("https://x/api/fpm/sync/status", { method }),
+      makeEnv(),
+      makeCtx(),
+    );
+    assert.equal(res.status, 405);
+    assert.deepEqual(await res.json(), { error: "method not allowed" });
+  });
+}
+
+test("VERB GUARD: the correct verb still works on all three - the guard refuses, it does not break", async () => {
+  const env = makeEnv();
+  // GET status is the one of the three that is safe to actually run: it reads
+  // counters and starts nothing.
+  const status = await worker.fetch(
+    new Request("https://x/api/fpm/sync/status"),
+    env,
+    makeCtx(),
+  );
+  assert.equal(status.status, 200, "GET /api/fpm/sync/status must still answer");
+  assert.equal(typeof (await status.json()), "object");
+
+  // POST stop is also safe - stopping a sync that is not running is a no-op.
+  const stop = await worker.fetch(
+    new Request("https://x/api/fpm/sync/stop", { method: "POST" }),
+    env,
+    makeCtx(),
+  );
+  assert.notEqual(stop.status, 405, "POST /api/fpm/sync/stop must not be refused");
+});
